@@ -1219,7 +1219,13 @@ def doctor(path: Optional[Path] = PathArg) -> None:
             edges = stats.get("total_edges", 0)
             ok(f"Graph DB accessible — {nodes:,} nodes, {edges:,} edges")
     except Exception as e:
-        fail("Graph DB error", str(e))
+        err_str = str(e)
+        if "Could not set lock" in err_str or "lock" in err_str.lower():
+            warn("Graph DB locked — MCP server already has it open (this is normal)")
+            console.print("       [dim]Stop the MCP server first if you need a full doctor check.[/dim]")
+            # Treat as non-fatal: DB is working, just busy
+        else:
+            fail("Graph DB error", err_str)
 
     # ── 4. MCP Tool smoke tests ───────────────────────────────────────────────
     section("MCP Tools")
@@ -1258,6 +1264,7 @@ def doctor(path: Optional[Path] = PathArg) -> None:
                 from laravelgraph.mcp.explain import read_source_snippet
                 node = sample_nodes[0]
                 fp, ls, le = node.get("fp"), node.get("ls"), node.get("le")
+                le = le or (ls + 50 if ls else None)  # line_end may be None for some nodes
                 snippet = read_source_snippet(fp, ls, le, root) if fp and ls else None
                 if snippet and snippet.strip():
                     ok(f"Source injection working [dim]({len(snippet.splitlines())} lines from {Path(fp).name})[/dim]")
