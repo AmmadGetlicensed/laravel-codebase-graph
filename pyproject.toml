@@ -1,0 +1,119 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "laravelgraph"
+version = "0.1.0"
+description = "Graph-powered code intelligence engine for Laravel/PHP codebases"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "LaravelGraph Contributors" },
+]
+keywords = ["laravel", "php", "code-intelligence", "graph", "mcp", "static-analysis"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+dependencies = [
+    # Core graph database
+    "kuzu>=0.6.0",
+    # PHP AST parsing
+    "tree-sitter>=0.23.0",
+    "tree-sitter-php>=0.23.0",
+    # Graph algorithms
+    "python-igraph>=0.11.0",
+    "leidenalg>=0.10.0",
+    # Embeddings (ONNX, local, no cloud)
+    "fastembed>=0.3.0",
+    # Search
+    "rank-bm25>=0.2.2",
+    "rapidfuzz>=3.6.0",
+    # MCP server
+    "fastmcp>=2.0.0",
+    # CLI
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    # File watching
+    "watchfiles>=0.21.0",
+    # Git integration
+    "gitpython>=3.1.40",
+    # Utilities
+    "pydantic>=2.5.0",
+    "httpx>=0.27.0",
+    "anyio>=4.3.0",
+    "python-dotenv>=1.0.0",
+    "pathspec>=0.12.0",  # gitignore parsing
+    "orjson>=3.9.0",
+    "structlog>=24.1.0",
+    # LLM providers for semantic summaries
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+]
+
+[project.optional-dependencies]
+dashboard = [
+    "starlette>=0.36.0",
+    "uvicorn>=0.27.0",
+    "jinja2>=3.1.3",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-benchmark>=4.0.0",
+    "syrupy>=4.6.0",  # snapshot testing
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",
+    "types-pygments",
+]
+
+[project.scripts]
+laravelgraph = "laravelgraph.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/laravelgraph/laravelgraph"
+Documentation = "https://laravelgraph.dev/docs"
+Repository = "https://github.com/laravelgraph/laravelgraph"
+Issues = "https://github.com/laravelgraph/laravelgraph/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["laravelgraph"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "--cov=laravelgraph",
+    "--cov-report=term-missing",
+    "--cov-report=html:htmlcov",
+    "--cov-fail-under=80",
+    "-v",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

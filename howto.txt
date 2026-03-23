@@ -1,0 +1,513 @@
+================================================================================
+  LARAVELGRAPH — HOW TO USE
+  Graph-powered code intelligence for Laravel codebases
+================================================================================
+
+QUICK START
+-----------
+  1. Index your project (one time, takes ~40 min on large codebases):
+       laravelgraph analyze /path/to/your/laravel-app
+
+  2. Ask questions about your code:
+       laravelgraph query "booking payment"
+       laravelgraph context "App\Models\Booking"
+       laravelgraph routes /path/to/your/laravel-app
+
+  3. Connect to Claude / Cursor / Windsurf (optional):
+       laravelgraph setup /path/to/your/laravel-app --claude
+
+
+================================================================================
+  COMMAND REFERENCE
+================================================================================
+
+--------------------------------------------------------------------------------
+  analyze  —  Index a Laravel project (builds the knowledge graph)
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph analyze [PATH]
+    laravelgraph analyze                          # uses current directory
+    laravelgraph analyze ~/Development/my-app     # explicit path
+
+  Options:
+    --full            Delete the existing index first and rebuild everything
+                      from scratch. Use this when you have made breaking
+                      changes to the schema or want a clean slate.
+                      Without this flag: runs on top of existing data (faster
+                      for incremental updates, but can mix old and new data).
+
+    --no-embeddings   Skip vector embedding generation (Phase 12).
+                      Makes indexing significantly faster.
+                      Without embeddings: search uses BM25 keyword matching
+                        + fuzzy name matching only.
+                      With embeddings: search also understands meaning, so
+                        "payment declined" finds "processRefund()" even if
+                        the words don't match. Requires 'pip install fastembed'
+                        and adds ~10-20 min to indexing time.
+
+    --phases TEXT     Run only specific pipeline phases (comma-separated numbers).
+                      Useful for debugging or re-running a single phase.
+                      Example: --phases 14,15  (runs only Route Analysis and
+                      Middleware Resolution)
+                      Phases:
+                        1  File Discovery
+                        2  Structure (folders/files)
+                        3  AST Parsing (classes, methods, functions)
+                        4  Import/Namespace Resolution
+                        5  Call Graph Tracing
+                        6  Heritage Analysis (extends, implements, traits)
+                        7  Type Analysis
+                        8  Community Detection
+                        9  Execution Flow Detection
+                       10  Dead Code Detection
+                       11  Change Coupling (Git history)
+                       12  Embeddings (vector search)
+                       13  Eloquent Relationships
+                       14  Route Analysis
+                       15  Middleware Resolution
+                       16  Service Container Bindings
+                       17  Event/Listener/Job Graph
+                       18  Blade Template Graph
+                       19  Database Schema (migrations)
+                       20  Config/Env Dependencies
+                       21  Dependency Injection
+                       22  API Contract Analysis
+                       23  Scheduled Tasks
+
+  Examples:
+    laravelgraph analyze ~/my-app                 # normal first-time index
+    laravelgraph analyze ~/my-app --full          # wipe and rebuild from scratch
+    laravelgraph analyze ~/my-app --no-embeddings # fast index, no semantic search
+    laravelgraph analyze ~/my-app --full --no-embeddings  # fast clean rebuild
+
+
+--------------------------------------------------------------------------------
+  status  —  Show index status and stats for a project
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph status [PATH]
+    laravelgraph status                           # current directory
+    laravelgraph status ~/Development/my-app
+
+  Shows: Laravel version, PHP version, indexed-at timestamp, counts of all
+  parsed symbols (classes, methods, routes, models, etc.), and DB file size.
+
+  No options beyond --help.
+
+
+--------------------------------------------------------------------------------
+  list  —  List all indexed repositories
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph list
+
+  Shows a table of all projects you have ever indexed with laravelgraph,
+  their Laravel version, and when they were last indexed.
+
+  No options beyond --help.
+
+
+--------------------------------------------------------------------------------
+  query  —  Search across all indexed symbols
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph query QUERY_STR [OPTIONS] -p PATH
+
+  Arguments:
+    QUERY_STR   What to search for. Can be natural language or keywords.
+                Examples: "booking payment", "send email to trainee",
+                          "stripe webhook handler"
+
+  Options:
+    -p, --project PATH    Path to the Laravel project (required if not
+                          running from inside the project directory).
+
+    -n, --limit INTEGER   Maximum number of results to show.
+                          Default: 20
+
+    -r, --role TEXT       Filter results to a specific Laravel role.
+                          Roles: controller, model, middleware, job, command,
+                                 listener, policy, request, resource, event,
+                                 migration, seeder, factory, test
+
+  Examples:
+    laravelgraph query "booking payment" -p ~/my-app
+    laravelgraph query "send email" -p ~/my-app -n 10
+    laravelgraph query "handle" -p ~/my-app -r job
+    laravelgraph query "user auth" -p ~/my-app -r controller
+
+
+--------------------------------------------------------------------------------
+  context  —  360° view of a single symbol
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph context SYMBOL -p PATH
+
+  Arguments:
+    SYMBOL   The symbol to inspect. Can be:
+               - A class name:          Booking
+               - A fully qualified name: App\Models\Booking
+               - A node ID:             class:App\Models\Booking
+               - A method name:         store
+
+  Options:
+    -p, --project PATH    Path to the Laravel project.
+
+  Shows: file location, type, callers (who calls this), callees (what this
+  calls), and which community/module it belongs to.
+
+  Examples:
+    laravelgraph context "App\Models\Booking" -p ~/my-app
+    laravelgraph context "Booking" -p ~/my-app
+    laravelgraph context "BookingController::store" -p ~/my-app
+
+
+--------------------------------------------------------------------------------
+  impact  —  Blast radius analysis (what breaks if you change this?)
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph impact SYMBOL [OPTIONS] -p PATH
+
+  Arguments:
+    SYMBOL   The symbol you are thinking of changing (class, method, etc.)
+
+  Options:
+    -p, --project PATH    Path to the Laravel project.
+
+    -d, --depth INTEGER   How many hops through the call graph to follow.
+                          Default: 3
+                          1 = direct callers only
+                          2 = callers of callers
+                          3 = three levels deep (recommended)
+
+  Shows: Direct (will break), Indirect (may break), Transitive (review)
+  symbols, each with their file location.
+
+  Examples:
+    laravelgraph impact "App\Models\Booking" -p ~/my-app
+    laravelgraph impact "BookingController::store" -p ~/my-app -d 5
+
+
+--------------------------------------------------------------------------------
+  dead-code  —  Find unreachable / unused symbols
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph dead-code [PATH]
+    laravelgraph dead-code ~/my-app
+
+  Options:
+    -r, --role TEXT   Filter dead code report to a specific Laravel role.
+                      Example: -r controller  (shows only dead controller methods)
+
+  Shows methods and functions that have no callers in the codebase.
+  Laravel-aware: automatically exempts route handlers, job handle() methods,
+  command handle() methods, event listeners, etc. — things that are called
+  by the framework, not directly by your code.
+
+  Examples:
+    laravelgraph dead-code ~/my-app
+    laravelgraph dead-code ~/my-app -r controller
+
+
+--------------------------------------------------------------------------------
+  routes  —  Route table with middleware and controller info
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph routes [PATH]
+    laravelgraph routes ~/my-app
+
+  Options:
+    -m, --method TEXT     Filter by HTTP method.
+                          Example: -m GET  or  -m POST
+
+    -u, --uri TEXT        Filter by URI fragment (partial match).
+                          Example: -u booking  (shows all routes with "booking" in URI)
+
+    -n, --limit INTEGER   Max routes to show. Default: 50
+
+  Examples:
+    laravelgraph routes ~/my-app
+    laravelgraph routes ~/my-app -m POST
+    laravelgraph routes ~/my-app -u /api/booking
+    laravelgraph routes ~/my-app -m GET -n 100
+
+
+--------------------------------------------------------------------------------
+  models  —  Eloquent model relationship map
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph models [PATH]
+    laravelgraph models ~/my-app
+
+  Options:
+    -m, --model TEXT   Filter to a specific model name.
+                       Example: -m Booking  (shows only Booking and its relations)
+
+  Shows all Eloquent models with their table names and hasMany / belongsTo /
+  hasOne / belongsToMany / etc. relationships.
+
+  Examples:
+    laravelgraph models ~/my-app
+    laravelgraph models ~/my-app -m Booking
+
+
+--------------------------------------------------------------------------------
+  events  —  Event → listener → job dispatch map
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph events [PATH]
+    laravelgraph events ~/my-app
+
+  Shows all events in the codebase, which listeners handle them, and which
+  jobs they dispatch. Requires events to be registered via EventServiceProvider
+  (in Laravel 11, this means AppServiceProvider or a dedicated provider).
+
+  No filter options.
+
+
+--------------------------------------------------------------------------------
+  bindings  —  Service container binding map
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph bindings [PATH]
+    laravelgraph bindings ~/my-app
+
+  Shows all $this->app->bind(), singleton(), and instance() calls found in
+  service providers, mapping interfaces to their implementations.
+
+  No filter options.
+
+
+--------------------------------------------------------------------------------
+  schema  —  Database schema from migrations
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph schema [PATH]
+    laravelgraph schema ~/my-app
+
+  Options:
+    -t, --table TEXT   Filter to a specific table name.
+                       Example: -t bookings  (shows only the bookings table)
+
+  Shows all tables parsed from your migration files, with column names,
+  types, and nullable status.
+
+  Examples:
+    laravelgraph schema ~/my-app
+    laravelgraph schema ~/my-app -t bookings
+
+
+--------------------------------------------------------------------------------
+  cypher  —  Run a raw Cypher query against the graph
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph cypher "QUERY" -p PATH
+
+  Arguments:
+    QUERY_STR   A read-only Cypher query (SELECT-equivalent for graph DBs).
+                Write operations (CREATE, DELETE, SET) are not allowed.
+
+  Options:
+    -p, --project PATH   Path to the Laravel project.
+
+  The graph database uses KuzuDB with Cypher query language (similar to
+  Neo4j). Node labels and relationship types available:
+    Nodes:    Class_, Method, Function_, Interface_, Trait_, Route,
+              EloquentModel, Command, BladeTemplate, DatabaseTable,
+              DatabaseColumn, ConfigKey, EnvVariable, Process, Community,
+              File, Folder, and more.
+    Rels:     CALLS, EXTENDS_CLASS, IMPLEMENTS_INTERFACE, USES_TRAIT,
+              ROUTES_TO, HAS_RELATIONSHIP, DEFINES, CONTAINS, IMPORTS,
+              INJECTS, USES_CONFIG, USES_ENV, STEP_IN_PROCESS, and more.
+
+  Examples:
+    laravelgraph cypher "MATCH (n:Class_ {name: 'Booking'}) RETURN n.fqn, n.file_path" -p ~/my-app
+    laravelgraph cypher "MATCH (r:Route) RETURN r.http_method, r.uri LIMIT 10" -p ~/my-app
+    laravelgraph cypher "MATCH (a:Method)-[:CALLS]->(b:Method) RETURN a.fqn, b.fqn LIMIT 20" -p ~/my-app
+
+
+--------------------------------------------------------------------------------
+  serve  —  Start the MCP server for AI agent integration
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph serve [PATH]
+    laravelgraph serve ~/my-app
+
+  Options:
+    -w, --watch       Also watch for file changes and re-index incrementally
+                      while the server is running.
+
+    --http            Use HTTP/SSE transport instead of stdio.
+                      Default is stdio (used by Claude Code, Cursor, etc.)
+                      Use --http when connecting from a browser or custom client.
+
+    --port INTEGER    Port to listen on when using --http. Default: 3000
+
+    --host TEXT       Host to bind to when using --http. Default: 127.0.0.1
+                      Use 0.0.0.0 to allow connections from other machines.
+
+  Examples:
+    laravelgraph serve ~/my-app                    # stdio (for Claude/Cursor)
+    laravelgraph serve ~/my-app --http             # HTTP on localhost:3000
+    laravelgraph serve ~/my-app --http --port 4000
+    laravelgraph serve ~/my-app --watch            # re-index on file save
+
+
+--------------------------------------------------------------------------------
+  watch  —  Live re-indexing on file changes
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph watch [PATH]
+    laravelgraph watch ~/my-app
+
+  Watches your PHP files for changes and re-indexes affected files
+  automatically. Useful during active development so the graph stays current.
+
+  No filter options. Run in a separate terminal window while you code.
+
+
+--------------------------------------------------------------------------------
+  diff  —  Structural branch comparison
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph diff REVISION -p PATH
+
+  Arguments:
+    REVISION   A git revision range. Examples:
+                 HEAD~1          (compare current to 1 commit ago)
+                 HEAD~5          (last 5 commits)
+                 main            (compare current branch to main)
+                 main..feature   (range between two branches)
+
+  Options:
+    -p, --project PATH   Path to the Laravel project.
+
+  Shows which PHP symbols (classes, methods) were added, modified, or removed
+  between the current state and the given git revision.
+
+  Examples:
+    laravelgraph diff HEAD~1 -p ~/my-app
+    laravelgraph diff main -p ~/my-app
+    laravelgraph diff main..feature-branch -p ~/my-app
+
+
+--------------------------------------------------------------------------------
+  setup  —  Print MCP config JSON for connecting to AI agents
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph setup [PATH]
+    laravelgraph setup ~/my-app --claude
+
+  Options:
+    --claude     Output format for Claude Code (claude_desktop_config.json)
+    --cursor     Output format for Cursor (.cursor/mcp.json)
+    --windsurf   Output format for Windsurf
+
+  Prints the JSON snippet you need to paste into your AI editor's config file
+  to connect it to laravelgraph via MCP.
+
+  Examples:
+    laravelgraph setup ~/my-app --claude    # copy output into Claude config
+    laravelgraph setup ~/my-app --cursor    # copy output into Cursor config
+
+
+--------------------------------------------------------------------------------
+  export  —  Export the graph in various formats
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph export [PATH]
+    laravelgraph export ~/my-app --format json
+
+  Options:
+    -f, --format TEXT   Output format. Options: json, dot, graphml
+                        Default: json
+                        json    — nodes and edges as JSON (good for scripts)
+                        dot     — Graphviz DOT format (good for diagrams)
+                        graphml — GraphML XML (good for Gephi, yEd)
+
+    -o, --output PATH   Write output to a file instead of printing to stdout.
+                        Example: -o graph.json
+
+  Examples:
+    laravelgraph export ~/my-app                            # JSON to stdout
+    laravelgraph export ~/my-app -o graph.json             # JSON to file
+    laravelgraph export ~/my-app --format dot -o graph.dot # Graphviz format
+
+
+--------------------------------------------------------------------------------
+  clean  —  Delete the index for a project
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph clean [PATH]
+    laravelgraph clean ~/my-app
+
+  Options:
+    -f, --force   Skip the "are you sure?" confirmation prompt.
+
+  Deletes the .laravelgraph/graph.kuzu file and removes the project from
+  the registry. You will need to run 'analyze' again to re-index.
+
+  Examples:
+    laravelgraph clean ~/my-app           # asks for confirmation
+    laravelgraph clean ~/my-app --force   # deletes without asking
+
+
+--------------------------------------------------------------------------------
+  version  —  Print version information
+--------------------------------------------------------------------------------
+  Usage:
+    laravelgraph version
+
+  Prints the installed version of laravelgraph.
+
+
+================================================================================
+  COMMON WORKFLOWS
+================================================================================
+
+--- First time setup ---
+  laravelgraph analyze ~/Development/my-laravel-app --no-embeddings
+  laravelgraph status ~/Development/my-laravel-app
+
+--- "What does this class do?" ---
+  laravelgraph context "App\Models\Booking" -p ~/my-app
+
+--- "Is it safe to change this method?" ---
+  laravelgraph impact "App\Services\PaymentService::charge" -p ~/my-app
+
+--- "Find everything related to payments" ---
+  laravelgraph query "payment stripe charge" -p ~/my-app
+
+--- "What routes exist for bookings?" ---
+  laravelgraph routes ~/my-app -u booking
+
+--- "What unused code can I delete?" ---
+  laravelgraph dead-code ~/my-app
+
+--- "Show me the bookings table columns" ---
+  laravelgraph schema ~/my-app -t bookings
+
+--- "Connect Claude Code to this project" ---
+  laravelgraph setup ~/my-app --claude
+  # paste the output into ~/.claude/claude_desktop_config.json
+
+--- "Re-index after lots of code changes" ---
+  laravelgraph analyze ~/my-app --full --no-embeddings
+
+--- "Re-index with semantic search enabled" ---
+  laravelgraph analyze ~/my-app --full
+  # (requires: pip install fastembed)
+
+
+================================================================================
+  PATH RULES
+================================================================================
+
+Most commands accept an optional PATH argument pointing to the Laravel project
+root (the folder that contains composer.json, artisan, app/, routes/, etc.).
+
+  - If you are already inside the project directory: PATH can be omitted.
+  - For commands with -p / --project: same rule applies.
+  - PATH can be absolute (/Users/you/projects/my-app) or relative (../my-app).
+
+================================================================================
