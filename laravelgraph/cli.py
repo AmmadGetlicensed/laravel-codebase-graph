@@ -26,14 +26,17 @@ app = typer.Typer(
     name="laravelgraph",
     help=(
         "Graph-powered code intelligence for Laravel codebases.\n\n"
-        "Indexes your Laravel project into a local knowledge graph (KuzuDB), "
-        "then exposes it via an MCP server so AI agents can understand routes, "
-        "models, events, and code relationships.\n\n"
-        "[bold]Quick start:[/bold]\n"
-        "  laravelgraph analyze          # Index the current project\n"
-        "  laravelgraph serve            # Start MCP server (stdio for Claude Code)\n"
-        "  laravelgraph serve --http     # Start MCP server (HTTP for EC2/shared)\n"
-        "  laravelgraph doctor           # Full health check\n"
+        "Indexes your Laravel project into a local knowledge graph, then exposes it\n"
+        "via an MCP server so AI agents (Claude Code, Cursor, Windsurf) can understand\n"
+        "your routes, models, events, and code relationships.\n\n"
+        "[bold]Typical workflow:[/bold]\n"
+        "  1. laravelgraph analyze          [dim]# one-time: index your project[/dim]\n"
+        "  2. laravelgraph serve            [dim]# start MCP server for your AI agent[/dim]\n"
+        "  3. laravelgraph doctor           [dim]# verify everything is working[/dim]\n\n"
+        "[bold]Run any command with --help for full options and examples:[/bold]\n"
+        "  laravelgraph analyze --help\n"
+        "  laravelgraph routes --help\n\n"
+        "[dim]Full reference: laravelgraph guide[/dim]"
     ),
     add_completion=True,
     rich_markup_mode="rich",
@@ -58,7 +61,7 @@ def _project_root(path: Optional[Path]) -> Path:
 
 # ── analyze ───────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="1. Setup & Indexing")
 def analyze(
     path: Optional[Path] = PathArg,
     full: bool = typer.Option(False, "--full", help="Force full rebuild. Use on first run or after major refactors. Default: incremental update."),
@@ -187,7 +190,7 @@ def analyze(
 
 # ── status ────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="1. Setup & Indexing")
 def status(path: Optional[Path] = PathArg) -> None:
     """Show index status for the current project.
 
@@ -240,7 +243,7 @@ def status(path: Optional[Path] = PathArg) -> None:
 
 # ── list ──────────────────────────────────────────────────────────────────────
 
-@app.command(name="list")
+@app.command(name="list", rich_help_panel="1. Setup & Indexing")
 def list_repos() -> None:
     """List all projects indexed by laravelgraph on this machine.
 
@@ -273,7 +276,7 @@ def list_repos() -> None:
 
 # ── clean ─────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="1. Setup & Indexing")
 def clean(
     path: Optional[Path] = PathArg,
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt and delete immediately"),
@@ -310,7 +313,7 @@ def clean(
 
 # ── query ─────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="2. Explore Your Codebase")
 def query(
     query_str: str = typer.Argument(..., help="Natural-language or keyword search query (e.g. 'user authentication', 'PostController', 'send welcome email')"),
     path: Optional[Path] = ProjectOpt,
@@ -374,7 +377,7 @@ def query(
 
 # ── context ───────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="2. Explore Your Codebase")
 def context(
     symbol: str = typer.Argument(..., help="Symbol FQN, class name, or node_id to look up (e.g. 'PostController', 'App\\Http\\Controllers\\PostController')"),
     path: Optional[Path] = ProjectOpt,
@@ -499,7 +502,7 @@ def context(
 
 # ── impact ────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="3. Code Analysis")
 def impact(
     symbol: str = typer.Argument(..., help="Symbol to analyze (FQN, class name, or method e.g. 'PostController@store')"),
     path: Optional[Path] = ProjectOpt,
@@ -567,7 +570,7 @@ def impact(
 
 # ── dead-code ─────────────────────────────────────────────────────────────────
 
-@app.command(name="dead-code")
+@app.command(name="dead-code", rich_help_panel="3. Code Analysis")
 def dead_code(
     path: Optional[Path] = PathArg,
     role: str = typer.Option("", "--role", "-r", help="Filter results by Laravel role. Values: controller, model, event, listener, job, middleware, command, provider, request"),
@@ -624,7 +627,7 @@ def dead_code(
 
 # ── routes ────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="2. Explore Your Codebase")
 def routes(
     path: Optional[Path] = PathArg,
     method: str = typer.Option("", "--method", "-m", help="Filter by HTTP method. Values: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS"),
@@ -712,7 +715,7 @@ def routes(
 
 # ── models ────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="2. Explore Your Codebase")
 def models(
     path: Optional[Path] = PathArg,
     model_name: str = typer.Option("", "--model", "-m", help="Filter by model name (partial match, e.g. 'User' shows User, UserProfile, etc.)"),
@@ -771,7 +774,7 @@ def models(
 
 # ── events ────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="2. Explore Your Codebase")
 def events(path: Optional[Path] = PathArg) -> None:
     """Event → listener → job dispatch chain for the entire codebase.
 
@@ -830,7 +833,7 @@ def events(path: Optional[Path] = PathArg) -> None:
 
 # ── bindings ──────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="2. Explore Your Codebase")
 def bindings(path: Optional[Path] = PathArg) -> None:
     """Service container binding map — interface-to-implementation mappings.
 
@@ -885,7 +888,7 @@ def bindings(path: Optional[Path] = PathArg) -> None:
 
 # ── schema ────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="2. Explore Your Codebase")
 def schema(
     path: Optional[Path] = PathArg,
     table_filter: str = typer.Option("", "--table", "-t", help="Filter by table name (partial match, e.g. 'user' shows users, user_profiles, etc.)"),
@@ -952,7 +955,7 @@ def schema(
 
 # ── cypher ────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="3. Code Analysis")
 def cypher(
     query_str: str = typer.Argument(..., help="Read-only Cypher query. MATCH/RETURN patterns only — CREATE/DELETE/SET are blocked. Use LIMIT to avoid large result sets."),
     path: Optional[Path] = ProjectOpt,
@@ -1013,7 +1016,7 @@ def cypher(
 
 # ── serve ─────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="4. Server & Agent Integration")
 def serve(
     path: Optional[Path] = PathArg,
     watch: bool = typer.Option(False, "--watch", "-w", help="Enable live file watching"),
@@ -1091,7 +1094,7 @@ def serve(
 
 # ── watch ─────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="4. Server & Agent Integration")
 def watch(path: Optional[Path] = PathArg) -> None:
     """Watch mode — live re-indexing on file changes (no MCP server).
 
@@ -1125,7 +1128,7 @@ def watch(path: Optional[Path] = PathArg) -> None:
 
 # ── diff ──────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="3. Code Analysis")
 def diff(
     base: str = typer.Argument("HEAD", help="Base git revision to compare from. Examples: 'HEAD', 'main', 'HEAD~3', 'abc1234'"),
     head: str = typer.Argument("HEAD", help="Head git revision (default: working tree / current branch tip)"),
@@ -1189,7 +1192,7 @@ def diff(
 
 # ── providers ─────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="4. Server & Agent Integration")
 def providers(path: Optional[Path] = PathArg) -> None:
     """Show which of the 18+ supported LLM providers are configured and active.
 
@@ -1276,7 +1279,7 @@ def providers(path: Optional[Path] = PathArg) -> None:
 
 # ── configure ─────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="4. Server & Agent Integration")
 def configure(
     path: Optional[Path] = PathArg,
     global_: bool = typer.Option(False, "--global", "-g", help="Save to global config (~/.laravelgraph/config.json) rather than project-level (.laravelgraph/config.json)"),
@@ -1425,7 +1428,7 @@ def configure(
 
 # ── setup ─────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="4. Server & Agent Integration")
 def setup(
     path: Optional[Path] = PathArg,
     claude: bool = typer.Option(False, "--claude", help="Print config for Claude Code"),
@@ -1491,7 +1494,7 @@ def setup(
 
 # ── export ────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="5. Utilities")
 def export(
     path: Optional[Path] = PathArg,
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output file (default: stdout)"),
@@ -1542,9 +1545,121 @@ def export(
         print(result)
 
 
+# ── guide ─────────────────────────────────────────────────────────────────────
+
+@app.command(rich_help_panel="5. Utilities")
+def guide() -> None:
+    """Full command reference with examples — start here if you're new."""
+    from rich.text import Text
+
+    console.print()
+    console.print(Panel(
+        "[bold white]LaravelGraph — Command Reference[/bold white]\n"
+        "[dim]Every command also has its own --help page with full option details.[/dim]",
+        border_style="cyan",
+    ))
+
+    sections = [
+        (
+            "1. Setup & Indexing",
+            "Run these once to get started, then again when your code changes.",
+            [
+                ("analyze",          "laravelgraph analyze",                                    "Index the current directory (incremental)"),
+                ("analyze --full",   "laravelgraph analyze /path/to/project --full",            "Force full rebuild — use on first run or after major changes"),
+                ("analyze --phases", "laravelgraph analyze --phases 14",                        "Re-run only route analysis (phase 14) — fast targeted update"),
+                ("status",           "laravelgraph status",                                     "Show when the project was last indexed and how many nodes/edges"),
+                ("list",             "laravelgraph list",                                       "List every project indexed on this machine"),
+                ("clean",            "laravelgraph clean",                                      "Delete the index — useful to start fresh (re-analyze to rebuild)"),
+            ],
+        ),
+        (
+            "2. Explore Your Codebase",
+            "Inspect routes, models, events, and any symbol directly from the terminal.",
+            [
+                ("query",            "laravelgraph query \"user authentication\"",              "Search for any symbol using natural language or a class name"),
+                ("query --role",     "laravelgraph query Post --role model",                    "Narrow search to a specific Laravel role (model, controller, event…)"),
+                ("context",          "laravelgraph context PostController",                     "See everything that calls/is called by a symbol, its routes, events, models"),
+                ("context (FQN)",    "laravelgraph context \"App\\Http\\Controllers\\PostController::store\"", "Use full FQN for exact match"),
+                ("routes",           "laravelgraph routes",                                     "Show all routes with HTTP method, URI, controller, and middleware"),
+                ("routes --filter",  "laravelgraph routes --method GET --uri /api",             "Filter routes by HTTP method and URI pattern"),
+                ("models",           "laravelgraph models",                                     "Show all Eloquent models and their hasMany/belongsTo relationships"),
+                ("events",           "laravelgraph events",                                     "Show the full event → listener → queued-job dispatch chain"),
+                ("bindings",         "laravelgraph bindings",                                   "Show service container bindings (which class implements which interface)"),
+                ("schema",           "laravelgraph schema",                                     "Show database tables and columns parsed from migration files"),
+                ("schema --table",   "laravelgraph schema --table users",                       "Show columns for a specific table only"),
+            ],
+        ),
+        (
+            "3. Code Analysis",
+            "Understand the impact of changes and find code quality issues.",
+            [
+                ("impact",           "laravelgraph impact PostController",                      "Find every symbol that would break if you changed PostController"),
+                ("impact --depth",   "laravelgraph impact PostController --depth 2",            "Control how many hops deep the blast radius search goes (default: 3)"),
+                ("dead-code",        "laravelgraph dead-code",                                  "Find methods with no callers (excludes controllers/listeners/jobs by default)"),
+                ("diff",             "laravelgraph diff main HEAD",                             "Show which symbols were added/changed/removed between two git branches"),
+                ("diff (commits)",   "laravelgraph diff HEAD~5 HEAD",                           "Compare the last 5 commits"),
+                ("cypher",           "laravelgraph cypher \"MATCH (r:Route) RETURN r.uri, r.controller_fqn LIMIT 10\"", "Run a raw Cypher query against the graph — read-only"),
+            ],
+        ),
+        (
+            "4. Server & Agent Integration",
+            "Connect AI agents (Claude Code, Cursor, Windsurf) to your codebase.",
+            [
+                ("serve",            "laravelgraph serve",                                      "Start the MCP server over stdio — Claude Code auto-starts this"),
+                ("serve --http",     "laravelgraph serve --http --host 0.0.0.0 --port 3000",   "Start HTTP/SSE server — for EC2 or shared team server"),
+                ("serve --api-key",  "laravelgraph serve --http --api-key your-secret",         "Require Bearer token auth on the HTTP server"),
+                ("watch",            "laravelgraph watch",                                      "Re-index automatically whenever a PHP file changes (no MCP server)"),
+                ("serve --watch",    "laravelgraph serve --watch",                              "Run MCP server + live re-indexing together"),
+                ("setup",            "laravelgraph setup --claude",                             "Print the MCP config JSON to paste into Claude Code settings"),
+                ("setup --http",     "laravelgraph setup --http --url http://server:3000/sse", "Print remote HTTP config for EC2/shared server"),
+                ("configure",        "laravelgraph configure",                                  "Interactive wizard to set up an LLM provider for semantic summaries"),
+                ("providers",        "laravelgraph providers",                                  "Show which of the 18+ LLM providers are configured and active"),
+            ],
+        ),
+        (
+            "5. Utilities",
+            "Health checks, exports, and version info.",
+            [
+                ("doctor",           "laravelgraph doctor",                                     "Full health check — config, DB, source injection, routes, LLM, transport"),
+                ("export",           "laravelgraph export --output graph.json",                 "Export the full graph as JSON (nodes + edges + stats)"),
+                ("version",          "laravelgraph version",                                    "Print the installed version"),
+                ("guide",            "laravelgraph guide",                                      "This reference page"),
+            ],
+        ),
+    ]
+
+    for section_title, section_desc, commands in sections:
+        console.print()
+        console.print(f"[bold cyan]{section_title}[/bold cyan]")
+        console.print(f"[dim]{section_desc}[/dim]")
+        console.print()
+
+        table = Table(
+            show_header=False,
+            box=None,
+            padding=(0, 2),
+            show_edge=False,
+        )
+        table.add_column("Example", style="bold green", no_wrap=False)
+        table.add_column("What it does", style="dim")
+
+        for _cmd, example, description in commands:
+            table.add_row(example, description)
+
+        console.print(table)
+
+    console.print()
+    console.print(Panel(
+        "[dim]All commands accept [bold]--help[/bold] for full options.\n"
+        "Most commands default to the current directory — pass a path to target another project.[/dim]",
+        border_style="dim",
+    ))
+    console.print()
+
+
 # ── version ───────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="5. Utilities")
 def version() -> None:
     """Print version information."""
     from laravelgraph import __version__
@@ -1553,7 +1668,7 @@ def version() -> None:
 
 # ── doctor ────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command(rich_help_panel="5. Utilities")
 def doctor(path: Optional[Path] = PathArg) -> None:
     """Full health check across all 9 system sections.
 
