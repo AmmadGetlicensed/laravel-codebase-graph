@@ -24,7 +24,17 @@ def _fmt_sec(seconds: float) -> str:
 
 app = typer.Typer(
     name="laravelgraph",
-    help="Graph-powered code intelligence for Laravel codebases",
+    help=(
+        "Graph-powered code intelligence for Laravel codebases.\n\n"
+        "Indexes your Laravel project into a local knowledge graph (KuzuDB), "
+        "then exposes it via an MCP server so AI agents can understand routes, "
+        "models, events, and code relationships.\n\n"
+        "[bold]Quick start:[/bold]\n"
+        "  laravelgraph analyze          # Index the current project\n"
+        "  laravelgraph serve            # Start MCP server (stdio for Claude Code)\n"
+        "  laravelgraph serve --http     # Start MCP server (HTTP for EC2/shared)\n"
+        "  laravelgraph doctor           # Full health check\n"
+    ),
     add_completion=True,
     rich_markup_mode="rich",
 )
@@ -51,11 +61,28 @@ def _project_root(path: Optional[Path]) -> Path:
 @app.command()
 def analyze(
     path: Optional[Path] = PathArg,
-    full: bool = typer.Option(False, "--full", help="Force full rebuild (skip incremental)"),
-    no_embeddings: bool = typer.Option(False, "--no-embeddings", help="Skip vector embedding generation"),
-    phases: Optional[str] = typer.Option(None, "--phases", help="Comma-separated phase numbers to run (e.g. 1,2,3)"),
+    full: bool = typer.Option(False, "--full", help="Force full rebuild. Use on first run or after major refactors. Default: incremental update."),
+    no_embeddings: bool = typer.Option(False, "--no-embeddings", help="Skip vector embedding generation. Speeds up indexing; disables semantic (vector) search. BM25 and fuzzy search still work."),
+    phases: Optional[str] = typer.Option(None, "--phases", help="Re-run specific pipeline phases only (e.g. '14' or '1,2,14'). Phase 14 = route analysis. Skips all other phases for faster targeted updates."),
 ) -> None:
-    """Index a Laravel project — builds the knowledge graph."""
+    """Index a Laravel project — builds or updates the KuzuDB knowledge graph.
+
+    Parses all PHP, Blade, and config files and stores the result as a graph
+    of nodes (classes, methods, routes, models, events) and edges (calls,
+    relationships, dispatches).
+
+    Use --full on the first run or after major refactors to guarantee a clean
+    rebuild. Subsequent runs are incremental by default.
+
+    Use --phases to re-run only specific pipeline phases without a full
+    rebuild. Useful for targeted updates (e.g. '--phases 14' to refresh only
+    route analysis after adding new routes).
+
+    Examples:
+      laravelgraph analyze
+      laravelgraph analyze /path/to/project --full
+      laravelgraph analyze --phases 14
+    """
     root = _project_root(path)
 
     selected_phases = None
@@ -162,7 +189,12 @@ def analyze(
 
 @app.command()
 def status(path: Optional[Path] = PathArg) -> None:
-    """Show index status for the current project."""
+    """Show index status for the current project.
+
+    Displays last-indexed timestamp, laravelgraph version used to index,
+    node and edge counts, and the on-disk size of the KuzuDB graph database.
+    Exits with code 1 if the project has not been indexed yet.
+    """
     root = _project_root(path)
 
     from laravelgraph.config import index_dir
@@ -210,7 +242,11 @@ def status(path: Optional[Path] = PathArg) -> None:
 
 @app.command(name="list")
 def list_repos() -> None:
-    """List all indexed repositories."""
+    """List all projects indexed by laravelgraph on this machine.
+
+    Reads the global registry at ~/.laravelgraph/repos.json and shows each
+    project name, Laravel version, last-indexed timestamp, and path.
+    """
     from laravelgraph.core.registry import Registry
     import datetime
 
@@ -240,9 +276,17 @@ def list_repos() -> None:
 @app.command()
 def clean(
     path: Optional[Path] = PathArg,
-    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt and delete immediately"),
 ) -> None:
-    """Delete the index for the current project."""
+    """Remove the .laravelgraph/ index directory for the current project.
+
+    Deletes the KuzuDB graph database, summary cache, and project config
+    stored in <project>/.laravelgraph/. Also removes the entry from the
+    global registry (~/.laravelgraph/repos.json).
+
+    The index is re-created from scratch on the next `laravelgraph analyze`.
+    Use --force to skip the confirmation prompt.
+    """
     root = _project_root(path)
 
     if not force:
@@ -268,12 +312,25 @@ def clean(
 
 @app.command()
 def query(
-    query_str: str = typer.Argument(..., help="Search query"),
+    query_str: str = typer.Argument(..., help="Natural-language or keyword search query (e.g. 'user authentication', 'PostController', 'send welcome email')"),
     path: Optional[Path] = ProjectOpt,
-    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
-    role: str = typer.Option("", "--role", "-r", help="Filter by Laravel role"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Maximum results to return (default: 20, max recommended: 100)"),
+    role: str = typer.Option("", "--role", "-r", help="Filter by Laravel role. Values: controller, model, event, listener, job, middleware, command, provider, request, resource, policy, observer, exception, rule, cast, channel, notification"),
 ) -> None:
-    """Hybrid search across all indexed Laravel symbols."""
+    """Hybrid search across all indexed Laravel symbols.
+
+    Combines BM25 (keyword), vector (semantic), and fuzzy (typo-tolerant)
+    search with Reciprocal Rank Fusion (RRF) to rank results. Works even
+    without an LLM provider configured — vector search requires fastembed.
+
+    Use --role to narrow results to a specific Laravel role (e.g. 'model',
+    'controller'). Use --limit to control how many results are returned.
+
+    Examples:
+      laravelgraph query "user authentication"
+      laravelgraph query PostController --role controller
+      laravelgraph query "send email" --limit 5
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -319,10 +376,24 @@ def query(
 
 @app.command()
 def context(
-    symbol: str = typer.Argument(..., help="Symbol FQN, name, or node_id"),
+    symbol: str = typer.Argument(..., help="Symbol FQN, class name, or node_id to look up (e.g. 'PostController', 'App\\Http\\Controllers\\PostController')"),
     path: Optional[Path] = ProjectOpt,
 ) -> None:
-    """360° view of a symbol: callers, callees, relationships, community."""
+    """CLI view of a symbol's 360° relationships: callers, callees, routes, events, models.
+
+    Shows everything that calls this symbol (callers), everything this symbol
+    calls (callees), any routes that point to it, events it dispatches, and
+    models it uses. Each section is omitted when there are no results.
+
+    This is the CLI equivalent of the MCP tool laravelgraph_context, which
+    provides a richer AI-readable format including source code and semantic
+    summaries. Use the MCP tool for AI agent workflows; use this command for
+    quick human inspection at the terminal.
+
+    Examples:
+      laravelgraph context PostController
+      laravelgraph context "App\\Http\\Controllers\\PostController@store"
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -340,6 +411,7 @@ def context(
 
     fqn = node.get("fqn", node.get("name", symbol))
     label = node.get("_label", "?")
+    node_id = node.get("node_id", "")
 
     console.print(Panel(
         f"[bold]{fqn}[/bold]\n"
@@ -352,7 +424,7 @@ def context(
         callers = db.execute(
             "MATCH (caller)-[r:CALLS]->(target) WHERE target.node_id = $id "
             "RETURN caller.fqn AS fqn, r.confidence AS conf LIMIT 10",
-            {"id": node.get("node_id", "")},
+            {"id": node_id},
         )
         if callers:
             tree = Tree("[bold]Callers[/bold]")
@@ -362,16 +434,94 @@ def context(
     except Exception:
         pass
 
+    # Callees
+    try:
+        callees = db.execute(
+            "MATCH (target)-[r:CALLS]->(callee) WHERE target.node_id = $id "
+            "RETURN callee.fqn AS fqn LIMIT 10",
+            {"id": node_id},
+        )
+        if callees:
+            tree = Tree("[bold]Callees[/bold]")
+            for c in callees:
+                tree.add(f"[cyan]{c.get('fqn', '?')}[/cyan]")
+            console.print(tree)
+    except Exception:
+        pass
+
+    # Routes pointing to this symbol
+    try:
+        route_rows = db.execute(
+            "MATCH (r:Route)-[:ROUTES_TO]->(target) WHERE target.node_id = $id "
+            "RETURN r.http_method AS method, r.uri AS uri LIMIT 5",
+            {"id": node_id},
+        )
+        if route_rows:
+            tree = Tree("[bold]Routes[/bold]")
+            for r in route_rows:
+                method = r.get("method", "?")
+                uri = r.get("uri", "?")
+                tree.add(f"[green]{method}[/green] {uri}")
+            console.print(tree)
+    except Exception:
+        pass
+
+    # Events dispatched
+    try:
+        ev_rows = db.execute(
+            "MATCH (target)-[:DISPATCHES]->(e) WHERE target.node_id = $id "
+            "RETURN e.fqn AS fqn LIMIT 5",
+            {"id": node_id},
+        )
+        if ev_rows:
+            tree = Tree("[bold]Events Dispatched[/bold]")
+            for e in ev_rows:
+                tree.add(f"[blue]{e.get('fqn', '?')}[/blue]")
+            console.print(tree)
+    except Exception:
+        pass
+
+    # Models used
+    try:
+        model_rows = db.execute(
+            "MATCH (target)-[:USES_MODEL]->(m) WHERE target.node_id = $id "
+            "RETURN m.fqn AS fqn LIMIT 5",
+            {"id": node_id},
+        )
+        if model_rows:
+            tree = Tree("[bold]Models Used[/bold]")
+            for m in model_rows:
+                tree.add(f"[yellow]{m.get('fqn', '?')}[/yellow]")
+            console.print(tree)
+    except Exception:
+        pass
+
 
 # ── impact ────────────────────────────────────────────────────────────────────
 
 @app.command()
 def impact(
-    symbol: str = typer.Argument(..., help="Symbol to analyze"),
+    symbol: str = typer.Argument(..., help="Symbol to analyze (FQN, class name, or method e.g. 'PostController@store')"),
     path: Optional[Path] = ProjectOpt,
-    depth: int = typer.Option(3, "--depth", "-d", help="BFS depth (default 3)"),
+    depth: int = typer.Option(3, "--depth", "-d", help="How many relationship hops to traverse. 1=direct callers only, 2=callers of callers, 3=full transitive blast radius (default)"),
 ) -> None:
-    """Blast radius analysis — all symbols affected by changing this one."""
+    """Blast radius analysis — all symbols transitively affected by changing this one.
+
+    Traverses the call graph outward from the target symbol to find everything
+    that would break or need review if you changed it. Results are grouped by
+    depth: depth 1 = direct callers (will break), depth 2 = indirect (may break),
+    depth 3+ = transitive (review before releasing).
+
+    Use --depth to control traversal breadth. Depth 1 is fast; depth 3 is the
+    default full blast radius. Depth > 4 may be slow on large codebases.
+
+    For the full AI-readable analysis (with source and explanations), use the
+    MCP tool laravelgraph_impact from within Claude Code.
+
+    Examples:
+      laravelgraph impact PostController
+      laravelgraph impact "App\\Http\\Controllers\\PostController@store" --depth 2
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -420,9 +570,26 @@ def impact(
 @app.command(name="dead-code")
 def dead_code(
     path: Optional[Path] = PathArg,
-    role: str = typer.Option("", "--role", "-r", help="Filter by Laravel role"),
+    role: str = typer.Option("", "--role", "-r", help="Filter results by Laravel role. Values: controller, model, event, listener, job, middleware, command, provider, request"),
 ) -> None:
-    """Dead code report — unreachable symbols with Laravel-aware exemptions."""
+    """Dead code report — unreachable symbols with Laravel-aware exemptions.
+
+    Finds methods and classes that have no incoming call edges in the graph,
+    meaning nothing in the codebase calls them directly. Uses Laravel-aware
+    heuristics to avoid false positives: controllers, event listeners, jobs,
+    Artisan commands, and observers are automatically exempted because they
+    are called by the Laravel framework at runtime via conventions, not by
+    explicit PHP method calls.
+
+    Use --role to narrow results to a specific Laravel role.
+
+    Note: this is a static analysis tool — it cannot detect dynamic calls
+    made via $this->dispatch(), event(), or string-based magic invocation.
+
+    Examples:
+      laravelgraph dead-code
+      laravelgraph dead-code /path/to/project --role model
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -460,11 +627,26 @@ def dead_code(
 @app.command()
 def routes(
     path: Optional[Path] = PathArg,
-    method: str = typer.Option("", "--method", "-m", help="Filter by HTTP method"),
-    uri: str = typer.Option("", "--uri", "-u", help="Filter by URI fragment"),
-    limit: int = typer.Option(50, "--limit", "-n"),
+    method: str = typer.Option("", "--method", "-m", help="Filter by HTTP method. Values: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS"),
+    uri: str = typer.Option("", "--uri", "-u", help="Filter routes by URI pattern (partial match, e.g. '/api/users')"),
+    limit: int = typer.Option(50, "--limit", "-n", help="Maximum routes to show (default: 50)"),
 ) -> None:
-    """Route intelligence table — all routes with middleware and controllers."""
+    """Route intelligence table — all routes with middleware and controllers.
+
+    Shows a formatted table of all indexed routes including HTTP method, URI,
+    controller class and action method, route name, and middleware stack.
+
+    Use --method to filter by HTTP verb (GET, POST, etc.). Use --uri to filter
+    routes by a partial URI match. Use --limit to cap the number of results.
+
+    For deep route exploration (full request lifecycle, middleware chain,
+    controller source), use the MCP tool laravelgraph_routes from Claude Code.
+
+    Examples:
+      laravelgraph routes
+      laravelgraph routes --method GET --uri /api
+      laravelgraph routes /path/to/project --limit 100
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -533,9 +715,24 @@ def routes(
 @app.command()
 def models(
     path: Optional[Path] = PathArg,
-    model_name: str = typer.Option("", "--model", "-m", help="Filter to a specific model"),
+    model_name: str = typer.Option("", "--model", "-m", help="Filter by model name (partial match, e.g. 'User' shows User, UserProfile, etc.)"),
 ) -> None:
-    """Eloquent model relationship map."""
+    """Eloquent model relationship map — all models and their relationships.
+
+    Displays each Eloquent model along with its hasMany, belongsTo, hasOne,
+    belongsToMany, and other relationship methods as a tree. Shows the
+    related model and relationship type for each association.
+
+    Use --model to filter to a specific model by name (partial match).
+
+    For richer model exploration including fillable attributes, casts,
+    and scopes, use the MCP tool laravelgraph_models from Claude Code.
+
+    Examples:
+      laravelgraph models
+      laravelgraph models --model User
+      laravelgraph models /path/to/project --model Post
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -576,7 +773,22 @@ def models(
 
 @app.command()
 def events(path: Optional[Path] = PathArg) -> None:
-    """Event → listener → job dispatch map."""
+    """Event → listener → job dispatch chain for the entire codebase.
+
+    Shows the full event dispatch graph: each Event class, the Listeners
+    registered to handle it, whether each listener is queued, and any Jobs
+    that the listener dispatches downstream.
+
+    This gives a complete picture of async/queued side-effects triggered
+    by each event in your application.
+
+    For event dispatch analysis with source code and AI explanations, use
+    the MCP tool laravelgraph_events from Claude Code.
+
+    Examples:
+      laravelgraph events
+      laravelgraph events /path/to/project
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -620,7 +832,25 @@ def events(path: Optional[Path] = PathArg) -> None:
 
 @app.command()
 def bindings(path: Optional[Path] = PathArg) -> None:
-    """Service container binding map."""
+    """Service container binding map — interface-to-implementation mappings.
+
+    Shows all bindings registered in Laravel's service container via
+    ServiceProvider classes. Each binding maps an abstract interface (or
+    string key) to a concrete implementation class and shows the binding
+    type (bind, singleton, instance, scoped) and the provider that
+    registered it.
+
+    Service container bindings are how Laravel resolves dependencies via
+    constructor injection. Understanding them is essential for tracing
+    which concrete class is used behind an interface.
+
+    For bindings with full source and AI explanations, use the MCP tool
+    laravelgraph_bindings from Claude Code.
+
+    Examples:
+      laravelgraph bindings
+      laravelgraph bindings /path/to/project
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -658,9 +888,27 @@ def bindings(path: Optional[Path] = PathArg) -> None:
 @app.command()
 def schema(
     path: Optional[Path] = PathArg,
-    table_filter: str = typer.Option("", "--table", "-t", help="Filter to a specific table"),
+    table_filter: str = typer.Option("", "--table", "-t", help="Filter by table name (partial match, e.g. 'user' shows users, user_profiles, etc.)"),
 ) -> None:
-    """Database schema from migrations."""
+    """Database schema extracted from Laravel migration files.
+
+    Parses all migration files and displays the resulting table structure:
+    table names, column names, types, and nullability. Columns added by
+    multiple migrations are merged into one view of the current schema.
+
+    Use --table to filter to tables matching a partial name.
+
+    Note: the schema is derived from static migration analysis. If you have
+    manual DB changes not reflected in migrations, they won't appear here.
+
+    For schema exploration with model relationship context, use the MCP tool
+    laravelgraph_schema from Claude Code.
+
+    Examples:
+      laravelgraph schema
+      laravelgraph schema --table user
+      laravelgraph schema /path/to/project --table post
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -706,10 +954,25 @@ def schema(
 
 @app.command()
 def cypher(
-    query_str: str = typer.Argument(..., help="Cypher query (read-only)"),
+    query_str: str = typer.Argument(..., help="Read-only Cypher query. MATCH/RETURN patterns only — CREATE/DELETE/SET are blocked. Use LIMIT to avoid large result sets."),
     path: Optional[Path] = ProjectOpt,
 ) -> None:
-    """Execute a read-only Cypher query against the knowledge graph."""
+    """Execute a read-only Cypher query against the KuzuDB knowledge graph.
+
+    Runs an arbitrary MATCH/RETURN Cypher query against the graph database.
+    Mutation keywords (CREATE, MERGE, DELETE, SET, REMOVE, DROP) are blocked
+    for safety. Results are displayed as a Rich table (first 50 rows shown).
+
+    Node labels include: Class_, Method, Route, EloquentModel, Event, Listener,
+    Job, ServiceBinding, DatabaseTable, DatabaseColumn, and more.
+
+    Edge types include: CALLS, ROUTES_TO, DISPATCHES, LISTENS_TO, HAS_RELATIONSHIP,
+    USES_MODEL, HAS_COLUMN, and more.
+
+    Examples:
+      laravelgraph cypher "MATCH (n:Route) RETURN n.uri, n.controller_fqn LIMIT 10"
+      laravelgraph cypher "MATCH (c:Class_)-[:CALLS]->(m:Method) RETURN c.name, m.name LIMIT 20"
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -830,7 +1093,23 @@ def serve(
 
 @app.command()
 def watch(path: Optional[Path] = PathArg) -> None:
-    """Watch mode — live re-indexing on file changes."""
+    """Watch mode — live re-indexing on file changes (no MCP server).
+
+    Monitors the project directory for PHP, Blade, and config file changes
+    and automatically re-runs the analysis pipeline when files are modified.
+
+    Unlike `laravelgraph serve --watch` (which starts the MCP server AND
+    watches for changes), this command only does re-indexing. Use it when
+    you want the graph kept up to date in the background without running
+    an MCP server — for example, during active development with a separate
+    MCP server already running.
+
+    Requires watchfiles: pip install watchfiles
+
+    Examples:
+      laravelgraph watch
+      laravelgraph watch /path/to/project
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -848,29 +1127,53 @@ def watch(path: Optional[Path] = PathArg) -> None:
 
 @app.command()
 def diff(
-    revision: str = typer.Argument(..., help="Git revision range (e.g. main..feature or HEAD~3)"),
+    base: str = typer.Argument("HEAD", help="Base git revision to compare from. Examples: 'HEAD', 'main', 'HEAD~3', 'abc1234'"),
+    head: str = typer.Argument("HEAD", help="Head git revision (default: working tree / current branch tip)"),
     path: Optional[Path] = ProjectOpt,
 ) -> None:
-    """Structural branch comparison — symbols added, modified, removed."""
+    """Structural branch comparison — files changed between two git revisions.
+
+    Compares two git revisions and shows which files were added, modified,
+    or deleted. Useful for understanding the scope of a branch or PR before
+    running impact analysis.
+
+    Pass a single revision (e.g. 'main') to compare that revision against
+    HEAD. Pass two revisions to compare them directly (e.g. 'main' 'HEAD').
+
+    For a deeper analysis that maps changed files to affected graph symbols,
+    use the MCP tool laravelgraph_detect_changes from Claude Code.
+
+    Examples:
+      laravelgraph diff                        # HEAD~1..HEAD
+      laravelgraph diff main                   # main..HEAD
+      laravelgraph diff main HEAD~3            # main..HEAD~3
+      laravelgraph diff HEAD~3 HEAD            # last 3 commits
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
-    console.print(f"[bold]Branch diff:[/bold] {revision}")
+    # If both args are "HEAD" (defaults), use HEAD~1..HEAD
+    if base == "HEAD" and head == "HEAD":
+        _base = "HEAD~1"
+        _head = "HEAD"
+    else:
+        _base = base
+        _head = head
+
+    console.print(f"[bold]Branch diff:[/bold] {_base}..{_head}")
 
     try:
         from git import Repo
         repo = Repo(str(root))
 
-        if ".." in revision:
-            base, head = revision.split("..", 1)
-        else:
-            base = "HEAD~1"
-            head = revision
-
-        diff_obj = repo.commit(base).diff(repo.commit(head))
+        diff_obj = repo.commit(_base).diff(repo.commit(_head))
         changed = [(d.a_path, d.change_type) for d in diff_obj]
 
-        table = Table(title=f"Changed files: {base}..{head}", header_style="bold")
+        if not changed:
+            console.print("No changed files.")
+            return
+
+        table = Table(title=f"Changed files: {_base}..{_head}", header_style="bold")
         table.add_column("Change", width=8)
         table.add_column("File")
 
@@ -888,7 +1191,24 @@ def diff(
 
 @app.command()
 def providers(path: Optional[Path] = PathArg) -> None:
-    """Show all LLM providers — which are configured, active, or available."""
+    """Show which of the 18+ supported LLM providers are configured and active.
+
+    Displays two tables: cloud providers (OpenAI, Anthropic, Gemini, etc.)
+    and local providers (Ollama, LM Studio, etc.). For each provider shows
+    whether it is configured (has an API key or base URL), which model is
+    selected, and whether it is the currently active provider.
+
+    Configured = has API key or base URL set (via env var or config file).
+    Active = the provider that will be used for generating semantic summaries
+    on the next query.
+
+    Use `laravelgraph configure` to set up a provider.
+    Use `laravelgraph doctor` to run a live test of the active provider.
+
+    Examples:
+      laravelgraph providers
+      laravelgraph providers /path/to/project
+    """
     root = _project_root(path)
 
     from laravelgraph.config import Config
@@ -959,9 +1279,30 @@ def providers(path: Optional[Path] = PathArg) -> None:
 @app.command()
 def configure(
     path: Optional[Path] = PathArg,
-    global_: bool = typer.Option(False, "--global", "-g", help="Save to global config (~/.laravelgraph/config.json)"),
+    global_: bool = typer.Option(False, "--global", "-g", help="Save to global config (~/.laravelgraph/config.json) rather than project-level (.laravelgraph/config.json)"),
 ) -> None:
-    """Interactive wizard to configure an LLM provider for semantic summaries."""
+    """Interactive wizard to configure an LLM provider for semantic summaries.
+
+    Walks you through selecting one of 18+ supported LLM providers (cloud or
+    local) and saves the API key and model selection to config. Config is
+    written to either:
+      - Global:  ~/.laravelgraph/config.json  (all projects on this machine)
+      - Project: <project>/.laravelgraph/config.json  (this project only)
+
+    Project-level config overrides global config. Global config is the best
+    default for most setups. Use project-level if you want different providers
+    per project.
+
+    Summaries are generated lazily on first query and cached — no cost until
+    used. If no provider is set, laravelgraph works fine without summaries.
+
+    After configuring, use `laravelgraph providers` to verify and
+    `laravelgraph doctor` to run a live test.
+
+    Examples:
+      laravelgraph configure           # Interactive — project-level config
+      laravelgraph configure --global  # Save to ~/.laravelgraph/config.json
+    """
     import json as _json
     root = _project_root(path)
 
@@ -1153,10 +1494,21 @@ def setup(
 @app.command()
 def export(
     path: Optional[Path] = PathArg,
-    fmt: str = typer.Option("json", "--format", "-f", help="Output format: json|dot|graphml"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output file (default: stdout)"),
 ) -> None:
-    """Export the graph in various formats."""
+    """Export the graph as JSON.
+
+    Exports nodes (classes, methods, routes, Eloquent models) from the
+    KuzuDB knowledge graph as a JSON document. The output includes graph
+    stats and a flat list of nodes with their label and key identifiers.
+
+    Output is written to stdout by default, or to a file with --output.
+
+    Examples:
+      laravelgraph export                          # JSON to stdout
+      laravelgraph export --output graph.json      # JSON to file
+      laravelgraph export /path/to/project --output /tmp/graph.json
+    """
     root = _project_root(path)
     _ensure_indexed(root)
 
@@ -1166,31 +1518,28 @@ def export(
     db = GraphDB(index_dir(root) / "graph.kuzu")
     stats = db.stats()
 
-    if fmt == "json":
-        data: dict = {"stats": stats, "nodes": [], "edges": []}
+    data: dict = {"stats": stats, "nodes": [], "edges": []}
 
-        # Route nodes use uri instead of fqn
-        _label_queries: dict[str, str] = {
-            "Class_":        "MATCH (n:Class_) RETURN n.node_id AS id, n.fqn AS fqn, n.name AS name LIMIT 1000",
-            "Method":        "MATCH (n:Method) RETURN n.node_id AS id, n.fqn AS fqn, n.name AS name LIMIT 1000",
-            "Route":         "MATCH (n:Route) RETURN n.node_id AS id, n.uri AS fqn, n.name AS name LIMIT 1000",
-            "EloquentModel": "MATCH (n:EloquentModel) RETURN n.node_id AS id, n.fqn AS fqn, n.name AS name LIMIT 1000",
-        }
-        for label in ["Class_", "Method", "Route", "EloquentModel"]:
-            try:
-                nodes = db.execute(_label_queries[label])
-                data["nodes"].extend([{"label": label, **n} for n in nodes])
-            except Exception:
-                pass
+    # Route nodes use uri instead of fqn
+    _label_queries: dict[str, str] = {
+        "Class_":        "MATCH (n:Class_) RETURN n.node_id AS id, n.fqn AS fqn, n.name AS name LIMIT 1000",
+        "Method":        "MATCH (n:Method) RETURN n.node_id AS id, n.fqn AS fqn, n.name AS name LIMIT 1000",
+        "Route":         "MATCH (n:Route) RETURN n.node_id AS id, n.uri AS fqn, n.name AS name LIMIT 1000",
+        "EloquentModel": "MATCH (n:EloquentModel) RETURN n.node_id AS id, n.fqn AS fqn, n.name AS name LIMIT 1000",
+    }
+    for label in ["Class_", "Method", "Route", "EloquentModel"]:
+        try:
+            nodes = db.execute(_label_queries[label])
+            data["nodes"].extend([{"label": label, **n} for n in nodes])
+        except Exception:
+            pass
 
-        result = json.dumps(data, indent=2, default=str)
-        if output:
-            output.write_text(result)
-            console.print(f"[green]✓[/green] Exported to {output}")
-        else:
-            print(result)
+    result = json.dumps(data, indent=2, default=str)
+    if output:
+        output.write_text(result)
+        console.print(f"[green]✓[/green] Exported to {output}")
     else:
-        console.print(f"[yellow]Format '{fmt}' not yet implemented.[/yellow]")
+        print(result)
 
 
 # ── version ───────────────────────────────────────────────────────────────────
@@ -1206,7 +1555,27 @@ def version() -> None:
 
 @app.command()
 def doctor(path: Optional[Path] = PathArg) -> None:
-    """Full health check — config, graph DB, LLM provider, and MCP tools."""
+    """Full health check across all 9 system sections.
+
+    Runs a comprehensive diagnostic and reports pass/warn/fail for each check:
+
+      1. Config         — load config from all sources, check for errors
+      2. Dependencies   — required packages (kuzu, fastmcp) and optional SDKs
+      3. Graph DB       — verify KuzuDB is accessible, report node/edge counts
+      4. MCP Tools      — smoke-test all key MCP tool queries against the graph
+      5. Context Quality — source injection, summary cache read/write, route resolution
+      6. Recent Changes  — verify fixes for known issues (snippet limits, route upsert)
+      7. Transport & Server — binary in PATH, HTTP server reachability, config snippets
+      8. LLM Provider   — active provider, model selection, live summary test
+      9. Optional Features — watchfiles (watch mode), fastembed (vector search)
+
+    Exits with code 1 if any check fails. Use this to verify your setup after
+    install, after upgrade, or when something seems wrong.
+
+    Examples:
+      laravelgraph doctor
+      laravelgraph doctor /path/to/project
+    """
     import time
     root = _project_root(path)
 
