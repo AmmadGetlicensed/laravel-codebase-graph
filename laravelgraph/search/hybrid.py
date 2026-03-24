@@ -36,6 +36,65 @@ except ImportError:
     _VECTOR_AVAILABLE = False
     logger.warning("fastembed/numpy not installed; vector search disabled. Install with: pip install fastembed")
 
+def _load_embedder(model_name: str) -> Any:
+    """Load a fastembed TextEmbedding model, auto-healing corrupt cache on failure.
+
+    macOS clears /tmp between reboots, leaving behind HuggingFace metadata but
+    deleting the actual ONNX model file. This causes a NO_SUCH_FILE error on the
+    next run. We detect this, wipe the broken cache entry, and retry once so the
+    model re-downloads automatically — no user action required.
+    """
+    if not _VECTOR_AVAILABLE:
+        return None
+
+    def _try_load() -> Any:
+        return TextEmbedding(model_name_or_path=model_name)
+
+    try:
+        return _try_load()
+    except Exception as first_exc:
+        err = str(first_exc)
+        # ONNXRuntimeError: file missing / corrupt cache
+        if "NO_SUCH" not in err and ".onnx" not in err and "File doesn't exist" not in err:
+            raise  # unrelated error — don't swallow
+
+        # Find and remove the corrupt model directory
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        cache_base = Path(os.environ.get("FASTEMBED_CACHE_PATH", tempfile.gettempdir())) / "fastembed_cache"
+        # Model dir name: "models--<org>--<name>" derived from model_name
+        model_dir_name = "models--" + model_name.replace("/", "--").replace(".", "-").lower()
+        # Find any directory under cache_base that matches (case-insensitive prefix)
+        deleted = False
+        if cache_base.exists():
+            for candidate in cache_base.iterdir():
+                if candidate.is_dir() and candidate.name.lower().startswith(model_dir_name.lower()[:20]):
+                    logger.warning(
+                        "Corrupt fastembed model cache detected — deleting and re-downloading",
+                        path=str(candidate),
+                        model=model_name,
+                    )
+                    shutil.rmtree(candidate, ignore_errors=True)
+                    deleted = True
+                    break
+
+        if not deleted:
+            logger.warning("fastembed ONNX load failed — could not locate cache to clean", error=err)
+            raise
+
+        # Retry — fastembed will re-download the model
+        try:
+            embedder = _try_load()
+            logger.info("fastembed model re-downloaded successfully", model=model_name)
+            return embedder
+        except Exception as retry_exc:
+            logger.warning("fastembed model re-download failed", error=str(retry_exc))
+            raise
+
+
 # Node labels that are indexed for search
 _SEARCHABLE_LABELS = [
     "Class_", "Method", "Function_", "Route",
@@ -397,7 +456,7 @@ class HybridSearch:
                 self._embeddings = np.array(vectors, dtype=np.float32)
                 # Load embedder for query-time embedding
                 model_name = getattr(self._config, "embedding_model", "BAAI/bge-small-en-v1.5")
-                self._embedder = TextEmbedding(model_name_or_path=model_name)
+                self._embedder = _load_embedder(model_name)
                 logger.info("Vector index built", vectors=len(vectors))
             except Exception as exc:
                 logger.warning("Vector index build failed", error=str(exc))
