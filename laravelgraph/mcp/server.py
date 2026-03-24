@@ -616,13 +616,36 @@ saving you from making 10+ individual tool calls.
         start = time.perf_counter()
         db = _db()
 
-        # Find the route
+        # Find the route — strip optional "METHOD /uri" prefix (e.g. "POST /v1/booking" → "/v1/booking")
+        _http_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+        route_parts = route.strip().split(None, 1)
+        if len(route_parts) == 2 and route_parts[0].upper() in _http_methods:
+            route_uri = route_parts[1]
+            route_method = route_parts[0].upper()
+        else:
+            route_uri = route
+            route_method = None
+
         try:
-            routes = db.execute(
-                "MATCH (r:Route) WHERE r.name = $q OR r.uri = $q OR r.uri CONTAINS $q "
-                "RETURN r.* LIMIT 1",
-                {"q": route},
-            )
+            if route_method:
+                routes = db.execute(
+                    "MATCH (r:Route) WHERE (r.name = $q OR r.uri = $q OR r.uri CONTAINS $q) "
+                    "AND r.http_method = $method RETURN r.* LIMIT 1",
+                    {"q": route_uri, "method": route_method},
+                )
+                # Fall back without method filter if nothing found
+                if not routes:
+                    routes = db.execute(
+                        "MATCH (r:Route) WHERE r.name = $q OR r.uri = $q OR r.uri CONTAINS $q "
+                        "RETURN r.* LIMIT 1",
+                        {"q": route_uri},
+                    )
+            else:
+                routes = db.execute(
+                    "MATCH (r:Route) WHERE r.name = $q OR r.uri = $q OR r.uri CONTAINS $q "
+                    "RETURN r.* LIMIT 1",
+                    {"q": route_uri},
+                )
         except Exception as e:
             return f"Error: {e}"
 
