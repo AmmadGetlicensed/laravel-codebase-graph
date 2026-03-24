@@ -2,6 +2,15 @@
 
 Parse Laravel route files (routes/web.php, routes/api.php, etc.) and build
 Route nodes with ROUTES_TO relationships to controller methods.
+
+Closure route delegation is resolved by scanning the closure body for all
+known dispatch patterns:
+  1. (new Controller())->method(...)
+  2. new Controller()->method(...)
+  3. app(Controller::class)->method(...)  /  resolve(...)
+  4. $app->make(Controller::class)->method(...)
+  5. DI-injected param: function(..., Ctrl $c) { $c->method(...) }
+  6. Static dispatch: Controller::method(...)
 """
 
 from __future__ import annotations
@@ -28,7 +37,7 @@ _API_RESOURCE_ACTIONS = ["index", "store", "show", "update", "destroy"]  # no cr
 _ROUTE_SIMPLE_PATTERN = re.compile(
     r"Route\s*::\s*(" + "|".join(_HTTP_METHODS) + r")\s*\(\s*"
     r"['\"]([^'\"]+)['\"]\s*,\s*"  # URI
-    r"([^)]+)\)",  # handler
+    r"([^)]+)\)",  # handler (for closures: captures up to first ')' in params)
     re.IGNORECASE,
 )
 
@@ -60,6 +69,253 @@ _USE_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+# ─── Closure-body controller detection ───────────────────────────────────────
+
+# Detects that the handler is a closure/arrow-function
+_CLOS_HANDLER = re.compile(r'^\s*(?:function|fn)\s*\(', re.IGNORECASE)
+
+# Pattern 1a: (new Controller()) -> method(   or   (new Controller) -> method(
+_CLOS_NEW_PAREN = re.compile(
+    r'\(\s*new\s+([A-Za-z_][\w\\]*)\s*(?:\([^)]*\))?\s*\)\s*->\s*(\w+)\s*\('
+)
+# Pattern 1b: new Controller() -> method(   (no surrounding parens)
+_CLOS_NEW_CALL = re.compile(
+    r'\bnew\s+([A-Za-z_][\w\\]*)\s*(?:\([^)]*\))?\s*->\s*(\w+)\s*\('
+)
+# Pattern 2: app(Ctrl::class)->method(   or   resolve(Ctrl::class)->method(
+_CLOS_APP = re.compile(
+    r'\b(?:app|resolve)\s*\(\s*'
+    r'(?:([A-Za-z_][\w\\]*)::class|[\'"]([A-Za-z_\\][\w\\]*)[\'"])'
+    r'[^)]*\)\s*->\s*(\w+)\s*\('
+)
+# Pattern 3: app()->make(Ctrl::class)->method(   or   $app->make(Ctrl::class)->method(
+_CLOS_MAKE = re.compile(
+    r'(?:app\s*\(\s*\)|\$\w+)\s*->\s*make\s*\(\s*'
+    r'(?:([A-Za-z_][\w\\]*)::class|[\'"]([A-Za-z_\\][\w\\]*)[\'"])'
+    r'\s*\)\s*->\s*(\w+)\s*\('
+)
+# Pattern 4: Static dispatch — Controller::method(
+_CLOS_STATIC = re.compile(r'\b([A-Za-z_][\w\\]*)\s*::\s*(\w+)\s*\(')
+# Pattern 5a: Type-hinted closure param — function(…, ClassName $var, …)
+_CLOS_PARAM = re.compile(r'\b([A-Za-z_][\w\\]*)\s+\$(\w+)')
+# Pattern 5b: Variable method call — $var->method(
+_CLOS_VAR_CALL = re.compile(r'\$(\w+)\s*->\s*(\w+)\s*\(')
+
+# Class names to skip when identifying controller delegation
+# (Laravel facades, helpers, base classes, framework internals)
+_SKIP_CLASSES = frozenset({
+    # HTTP / Response
+    'Request', 'Response', 'JsonResponse', 'StreamedResponse',
+    'Redirect', 'RedirectResponse',
+    # View / template
+    'View',
+    # Facades
+    'Route', 'Auth', 'Session', 'Cache', 'DB', 'Log', 'Event',
+    'Mail', 'Queue', 'Storage', 'Validator', 'Hash', 'Str', 'Arr',
+    'Config', 'Facade', 'Gate', 'Bus', 'Crypt', 'Cookie', 'File',
+    'Lang', 'URL', 'Password', 'RateLimiter', 'Artisan',
+    'Broadcast', 'Notification', 'Pipeline',
+    # Base classes
+    'Model', 'Controller', 'FormRequest', 'Middleware',
+    'ServiceProvider', 'Job', 'Listener', 'Observer',
+    # Collection / utilities
+    'Collection', 'Carbon', 'Closure', 'Exception',
+    # Framework namespaces (partial prefix match)
+    'Illuminate', 'Laravel',
+    # Container (used in make() calls — the receiver, not the target)
+    'App', 'Container',
+    # Misc
+    'Observable', 'Scope', 'Builder', 'Relation',
+    'HasMany', 'BelongsTo', 'BelongsToMany', 'HasOne',
+    'Http', 'Console',
+})
+
+
+def _is_delegated_class(name: str) -> bool:
+    """Return True if this class name looks like a controller/service, not a facade/helper."""
+    base = name.split('\\')[-1]
+    return (
+        bool(base)
+        and base[0].isupper()
+        and base not in _SKIP_CLASSES
+        and not base.startswith('Illuminate')
+        and not base.startswith('Laravel')
+    )
+
+
+def _extract_braced_body(source: str, brace_start: int, max_size: int = 10_000) -> str:
+    """Return the content between balanced braces, starting at the opening `{`.
+
+    Correctly skips over string literals and comments to avoid false brace counts.
+    Returns best-effort content if max_size is exceeded.
+    """
+    depth = 0
+    i = brace_start
+    limit = min(len(source), brace_start + max_size)
+
+    while i < limit:
+        ch = source[i]
+
+        # Skip string literals (single or double quoted)
+        if ch in ('"', "'"):
+            q = ch
+            i += 1
+            while i < limit:
+                c = source[i]
+                if c == '\\':
+                    i += 2
+                    continue
+                if c == q:
+                    break
+                i += 1
+
+        # Skip single-line comments  //  and  #
+        elif ch == '#' or (ch == '/' and i + 1 < limit and source[i + 1] == '/'):
+            while i < limit and source[i] != '\n':
+                i += 1
+
+        # Skip block comments  /* … */
+        elif ch == '/' and i + 1 < limit and source[i + 1] == '*':
+            end = source.find('*/', i + 2)
+            i = (end + 2) if end != -1 else limit
+            continue
+
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return source[brace_start + 1: i]
+
+        i += 1
+
+    return source[brace_start + 1: min(i, limit)]  # best-effort if truncated
+
+
+def _extract_arrow_expr(source: str, expr_start: int, max_size: int = 600) -> str:
+    """Return a PHP arrow-function expression (everything up to `;` or unmatched `)`)."""
+    depth = 0
+    i = expr_start
+    limit = min(len(source), expr_start + max_size)
+
+    while i < limit:
+        ch = source[i]
+        if ch in ('(', '[', '{'):
+            depth += 1
+        elif ch in (')', ']', '}'):
+            if depth == 0:
+                return source[expr_start: i]
+            depth -= 1
+        elif ch == ';' and depth == 0:
+            return source[expr_start: i]
+        i += 1
+
+    return source[expr_start: limit]
+
+
+def _find_closure_body(source: str, after_match_end: int) -> str:
+    """Locate and return the body of a PHP closure or arrow-function.
+
+    ``after_match_end`` should be the position in ``source`` right after the
+    regex consumed the route definition (i.e. past the closing ``)`` of the
+    function parameter list).
+
+    Handles:
+    - Regular function: ``function(…) { body }``
+    - Arrow function:   ``fn(…) => expr``
+    """
+    window = source[after_match_end: after_match_end + 400]
+
+    arrow_m = re.search(r'\s*=>\s*', window)
+    brace_m = re.search(r'\{', window)
+
+    # Prefer arrow if it appears before any brace
+    if arrow_m and (not brace_m or arrow_m.start() < brace_m.start()):
+        return _extract_arrow_expr(source, after_match_end + arrow_m.end())
+
+    if brace_m:
+        return _extract_braced_body(source, after_match_end + brace_m.start())
+
+    return ""
+
+
+def _find_closure_controller(
+    body: str,
+    params_raw: str,
+    use_map: dict[str, str],
+    class_map: dict[str, Path],
+    composer_namespace: str,
+) -> tuple[str, str, float]:
+    """Scan a closure/arrow-function body for controller-delegation patterns.
+
+    Patterns tried in order (highest confidence first):
+      1. (new Controller())->method(…)        conf 0.85
+      2. new Controller()->method(…)          conf 0.85
+      3. app(Ctrl::class)->method(…)          conf 0.90
+      4. $app->make(Ctrl::class)->method(…)   conf 0.85
+      5. DI-injected param $ctrl->method(…)   conf 0.90
+      6. Static dispatch Ctrl::method(…)      conf 0.70  (class must be in class_map)
+
+    Returns ``(controller_fqn, action_method, confidence)`` — all empty + 0.0
+    if no delegation is found.
+    """
+    if not body:
+        return "", "", 0.0
+
+    def resolve(short: str) -> str:
+        return _resolve_controller_fqn(short, use_map, class_map, composer_namespace)
+
+    # 1 – (new Ctrl(…)) -> method(
+    for m in _CLOS_NEW_PAREN.finditer(body):
+        cls, method = m.group(1), m.group(2)
+        if _is_delegated_class(cls):
+            return resolve(cls), method, 0.85
+
+    # 2 – new Ctrl(…) -> method(  (no outer parens)
+    for m in _CLOS_NEW_CALL.finditer(body):
+        cls, method = m.group(1), m.group(2)
+        if _is_delegated_class(cls):
+            return resolve(cls), method, 0.85
+
+    # 3 – app(Ctrl::class)->method(  /  resolve(Ctrl::class)->method(
+    for m in _CLOS_APP.finditer(body):
+        cls = m.group(1) or m.group(2) or ""
+        method = m.group(3)
+        if cls and _is_delegated_class(cls):
+            return resolve(cls), method, 0.90
+
+    # 4 – $app->make(Ctrl::class)->method(  /  app()->make(…)->method(
+    for m in _CLOS_MAKE.finditer(body):
+        cls = m.group(1) or m.group(2) or ""
+        method = m.group(3)
+        if cls and _is_delegated_class(cls):
+            return resolve(cls), method, 0.85
+
+    # 5 – DI-injected parameter: function(…, BookingCtrl $ctrl) { $ctrl->create(…) }
+    param_types: dict[str, str] = {}
+    for pm in _CLOS_PARAM.finditer(params_raw):
+        cls, var = pm.group(1), pm.group(2)
+        if _is_delegated_class(cls):
+            param_types[var] = cls
+
+    if param_types:
+        for vm in _CLOS_VAR_CALL.finditer(body):
+            var_name, method = vm.group(1), vm.group(2)
+            if var_name in param_types and method not in ('__construct',):
+                return resolve(param_types[var_name]), method, 0.90
+
+    # 6 – Static dispatch Ctrl::method(  — only when class is confirmed in class_map
+    for m in _CLOS_STATIC.finditer(body):
+        cls, method = m.group(1), m.group(2)
+        if _is_delegated_class(cls) and method not in ('class', 'make', 'getInstance'):
+            fqn = resolve(cls)
+            if fqn in class_map:
+                return fqn, method, 0.70
+
+    return "", "", 0.0
+
+
+# ─── Existing helpers ─────────────────────────────────────────────────────────
 
 def _parse_use_statements(source: str) -> dict[str, str]:
     """Return a dict mapping short name (or alias) → fully-qualified class name."""
@@ -73,9 +329,7 @@ def _parse_use_statements(source: str) -> dict[str, str]:
 
 def _extract_middleware_list(raw: str) -> list[str]:
     """Parse a raw middleware() argument into a list of middleware strings."""
-    # Strip surrounding brackets/quotes
     raw = raw.strip()
-    # Array style: ['auth', 'throttle:60,1']
     if raw.startswith("["):
         raw = raw[1:].rstrip("]")
     items = []
@@ -93,20 +347,16 @@ def _resolve_controller_fqn(
     composer_namespace: str,
 ) -> str:
     """Resolve a short class name or partial FQN to a fully-qualified name."""
-    # Already fully qualified
     if "\\" in short_name and short_name.startswith("\\"):
         return short_name.lstrip("\\")
 
-    # Check use statements
     short = short_name.split("\\")[-1]
     if short in use_map:
         return use_map[short]
 
-    # Try direct lookup in class_map
     if short_name in class_map:
         return short_name
 
-    # Try common controller namespace
     for ns in [
         f"App\\Http\\Controllers\\{short_name}",
         f"{composer_namespace}Http\\Controllers\\{short_name}",
@@ -172,7 +422,6 @@ def _get_group_context_for_pos(contexts: list[dict[str, Any]], pos: int) -> dict
     result: dict[str, Any] = {"prefix": "", "middleware": [], "domain": ""}
     for ctx in contexts:
         if ctx.get("start", 0) <= pos:
-            # Merge: later contexts override earlier
             if ctx.get("prefix"):
                 result["prefix"] = ctx["prefix"]
             if ctx.get("middleware"):
@@ -218,7 +467,7 @@ def _parse_routes_from_file(
         if not prefix:
             full_uri = uri
 
-        # Resolve handler
+        # ── Resolve handler ───────────────────────────────────────────────────
         controller_fqn = ""
         action_method = ""
 
@@ -236,8 +485,28 @@ def _parse_routes_from_file(
             controller_fqn = resolve(invokable_m.group(1))
             action_method = "__invoke"
 
-        # Extract name and middleware from chain after the route definition
-        # Look at up to 3 lines after the match for chained calls
+        # ── Closure delegation: scan body for controller dispatch ─────────────
+        if not controller_fqn and _CLOS_HANDLER.match(handler_raw.lstrip()):
+            # handler_raw has the params (truncated at first ')' by the regex).
+            # Extract the full closure body from source, starting after the match.
+            body = _find_closure_body(source, m.end())
+            params_raw = handler_raw  # contains the type-hinted params
+
+            ctrl_fqn, ctrl_method, conf = _find_closure_controller(
+                body, params_raw, use_map, class_map, composer_namespace
+            )
+            if ctrl_fqn and conf >= 0.70:
+                controller_fqn = ctrl_fqn
+                action_method = ctrl_method
+                logger.debug(
+                    "Resolved closure controller",
+                    route=f"{http_method} {full_uri}",
+                    controller=controller_fqn,
+                    method=action_method,
+                    confidence=conf,
+                )
+
+        # ── Chain metadata (name, inline middleware) ──────────────────────────
         after_chunk = source[pos: pos + 400]
         name_m = _ROUTE_NAME_PATTERN.search(after_chunk)
         route_name = name_m.group(1) if name_m else ""
@@ -306,12 +575,12 @@ def _parse_routes_from_file(
         resource_name = full_prefix.strip("/").replace("/", ".")
 
         _METHOD_MAP = {
-            "index": ("GET", full_prefix),
-            "create": ("GET", full_prefix + "/create"),
-            "store": ("POST", full_prefix),
-            "show": ("GET", full_prefix + "/{id}"),
-            "edit": ("GET", full_prefix + "/{id}/edit"),
-            "update": ("PUT", full_prefix + "/{id}"),
+            "index":   ("GET",    full_prefix),
+            "create":  ("GET",    full_prefix + "/create"),
+            "store":   ("POST",   full_prefix),
+            "show":    ("GET",    full_prefix + "/{id}"),
+            "edit":    ("GET",    full_prefix + "/{id}/edit"),
+            "update":  ("PUT",    full_prefix + "/{id}"),
             "destroy": ("DELETE", full_prefix + "/{id}"),
         }
 
@@ -343,7 +612,6 @@ def run(ctx: PipelineContext) -> None:
     class_map = ctx.class_map
     composer_namespace = ""
     if ctx.composer and hasattr(ctx.composer, "autoload_psr4"):
-        # Find the main app namespace
         for ns, path in ctx.composer.autoload_psr4.items():
             if path in ("app/", "app"):
                 composer_namespace = ns
@@ -352,10 +620,8 @@ def run(ctx: PipelineContext) -> None:
     routes_parsed = 0
     all_routes: list[dict[str, Any]] = []
 
-    # Determine which route files to parse
     route_files = list(ctx.route_files)
     if not route_files:
-        # Fallback: scan routes/ directory
         routes_dir = ctx.project_root / "routes"
         if routes_dir.exists():
             route_files = list(routes_dir.glob("*.php"))
@@ -395,37 +661,29 @@ def run(ctx: PipelineContext) -> None:
             logger.debug("Route node insert failed", route=route["node_id"], error=str(exc))
             continue
 
-        # Create ROUTES_TO → Method node if controller/action are known
         controller_fqn = route["controller_fqn"]
         action_method = route["action_method"]
 
         if controller_fqn and action_method:
-            method_fqn = f"{controller_fqn}::{action_method}"
             method_nid = make_node_id("method", controller_fqn, action_method)
 
-            # Try Method node first
             try:
                 db.upsert_rel(
                     "ROUTES_TO",
-                    "Route",
-                    route["node_id"],
-                    "Method",
-                    method_nid,
+                    "Route", route["node_id"],
+                    "Method", method_nid,
                     {
                         "http_method": route["http_method"],
                         "uri": route["uri"],
                     },
                 )
             except Exception:
-                # Try Class_ as fallback (invokable controllers)
                 controller_nid = make_node_id("class", controller_fqn)
                 try:
                     db.upsert_rel(
                         "ROUTES_TO",
-                        "Route",
-                        route["node_id"],
-                        "Class_",
-                        controller_nid,
+                        "Route", route["node_id"],
+                        "Class_", controller_nid,
                         {
                             "http_method": route["http_method"],
                             "uri": route["uri"],
@@ -441,7 +699,6 @@ def run(ctx: PipelineContext) -> None:
 
         routes_parsed += 1
 
-    # Store in ctx for subsequent phases (middleware resolution, flow detection)
     ctx.route_nodes = all_routes
     ctx.stats["routes_parsed"] = routes_parsed
 
