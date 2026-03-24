@@ -120,7 +120,7 @@ class TestReadSourceSnippet:
         snippet = read_source_snippet(str(php), 1, 100)
         lines = snippet.splitlines()
         # Should be capped — last line is either a truncation notice or within limit
-        assert len(lines) <= 122  # _MAX_SNIPPET_LINES (120) + 1 for truncation note + 1 fence
+        assert len(lines) <= 302  # _MAX_SNIPPET_LINES (300) + 1 for truncation note + 1 fence
 
     def test_reads_real_fixture_controller(self):
         """Read the index() method from PostController fixture."""
@@ -139,9 +139,9 @@ class TestReadSourceSnippet:
 
     def test_truncation_note_appended_for_long_methods(self, tmp_path):
         php = tmp_path / "Long.php"
-        # 200 lines — well above _MAX_SNIPPET_LINES (120) to trigger truncation
-        php.write_text("\n".join(f"    $line{i} = {i};" for i in range(1, 201)) + "\n")
-        snippet = read_source_snippet(str(php), 1, 200)
+        # 400 lines — well above _MAX_SNIPPET_LINES (300) to trigger truncation
+        php.write_text("\n".join(f"    $line{i} = {i};" for i in range(1, 401)) + "\n")
+        snippet = read_source_snippet(str(php), 1, 400)
         assert "more lines" in snippet
 
 

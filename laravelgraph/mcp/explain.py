@@ -25,9 +25,10 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Maximum lines to include per source snippet — keeps context manageable
-# Large enough for most methods; summary is generated separately for longer ones
-_MAX_SNIPPET_LINES = 120
+# Maximum lines to include per source snippet.
+# 300 covers ~99% of real-world methods completely; only extreme outliers are truncated.
+# Summary generation also uses this value, so raising it ensures the LLM sees the full method.
+_MAX_SNIPPET_LINES = 300
 
 
 # ── Source reading (Option 1) ─────────────────────────────────────────────────
