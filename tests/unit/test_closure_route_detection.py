@@ -428,3 +428,117 @@ Route::post('/book', function(Request $request, BookingController $ctrl) {
         routes = _parse_routes_from_file(f, False, self._class_map(), "App\\")
         assert routes[0]["controller_fqn"] == "App\\Http\\Controllers\\BookingController"
         assert routes[0]["action_method"] == "createBooking"
+
+
+# ── Laravel 9+ group controller syntax ───────────────────────────────────────
+
+
+class TestGroupControllerSyntax:
+    """Route::group(['controller' => Ctrl::class], fn) and fluent Route::controller(Ctrl)."""
+
+    def _write_route_file(self, tmp_path, content):
+        from pathlib import Path
+        f = tmp_path / "routes" / "api.php"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content, encoding="utf-8")
+        return f
+
+    def _class_map(self):
+        return {
+            "App\\Http\\Controllers\\BookingController": Path("/app/BookingController.php"),
+            "App\\Http\\Controllers\\PostController": Path("/app/PostController.php"),
+        }
+
+    def test_array_group_controller(self, tmp_path):
+        f = self._write_route_file(tmp_path, """<?php
+use App\\Http\\Controllers\\BookingController;
+use Illuminate\\Support\\Facades\\Route;
+
+Route::group(['controller' => BookingController::class], function() {
+    Route::post('bookings/create', 'createBooking');
+    Route::get('bookings', 'index');
+});
+""")
+        routes = _parse_routes_from_file(f, False, self._class_map(), "App\\")
+        assert len(routes) == 2
+        create = next(r for r in routes if "create" in r["uri"])
+        index_r = next(r for r in routes if r["action_method"] == "index")
+        assert create["controller_fqn"] == "App\\Http\\Controllers\\BookingController"
+        assert create["action_method"] == "createBooking"
+        assert index_r["controller_fqn"] == "App\\Http\\Controllers\\BookingController"
+
+    def test_array_group_with_prefix_and_controller(self, tmp_path):
+        f = self._write_route_file(tmp_path, """<?php
+use App\\Http\\Controllers\\BookingController;
+use Illuminate\\Support\\Facades\\Route;
+
+Route::group(['prefix' => 'v1', 'controller' => BookingController::class], function() {
+    Route::post('booking', 'createBooking');
+});
+""")
+        routes = _parse_routes_from_file(f, True, self._class_map(), "App\\")
+        assert len(routes) == 1
+        assert routes[0]["controller_fqn"] == "App\\Http\\Controllers\\BookingController"
+        assert routes[0]["action_method"] == "createBooking"
+
+    def test_fluent_controller_group(self, tmp_path):
+        f = self._write_route_file(tmp_path, """<?php
+use App\\Http\\Controllers\\BookingController;
+use Illuminate\\Support\\Facades\\Route;
+
+Route::controller(BookingController::class)->group(function() {
+    Route::post('/bookings/create', 'createBooking');
+    Route::get('/bookings', 'index');
+});
+""")
+        routes = _parse_routes_from_file(f, False, self._class_map(), "App\\")
+        fqns = {r["controller_fqn"] for r in routes}
+        assert "App\\Http\\Controllers\\BookingController" in fqns
+        methods = {r["action_method"] for r in routes}
+        assert "createBooking" in methods
+        assert "index" in methods
+
+    def test_fluent_prefix_then_controller(self, tmp_path):
+        f = self._write_route_file(tmp_path, """<?php
+use App\\Http\\Controllers\\BookingController;
+use Illuminate\\Support\\Facades\\Route;
+
+Route::prefix('v1')->controller(BookingController::class)->group(function() {
+    Route::post('booking', 'createBooking');
+});
+""")
+        routes = _parse_routes_from_file(f, True, self._class_map(), "App\\")
+        assert len(routes) == 1
+        assert routes[0]["controller_fqn"] == "App\\Http\\Controllers\\BookingController"
+        assert routes[0]["action_method"] == "createBooking"
+
+    def test_bare_string_without_group_controller_stays_empty(self, tmp_path):
+        f = self._write_route_file(tmp_path, """<?php
+use Illuminate\\Support\\Facades\\Route;
+
+Route::post('/orphan', 'orphanMethod');
+""")
+        routes = _parse_routes_from_file(f, False, self._class_map(), "App\\")
+        assert len(routes) == 1
+        assert routes[0]["controller_fqn"] == ""
+
+    def test_two_groups_different_controllers(self, tmp_path):
+        f = self._write_route_file(tmp_path, """<?php
+use App\\Http\\Controllers\\BookingController;
+use App\\Http\\Controllers\\PostController;
+use Illuminate\\Support\\Facades\\Route;
+
+Route::group(['controller' => BookingController::class], function() {
+    Route::post('/bookings', 'createBooking');
+});
+
+Route::group(['controller' => PostController::class], function() {
+    Route::get('/posts', 'index');
+});
+""")
+        routes = _parse_routes_from_file(f, False, self._class_map(), "App\\")
+        assert len(routes) == 2
+        booking = next(r for r in routes if "booking" in r["uri"])
+        post = next(r for r in routes if "post" in r["uri"])
+        assert booking["controller_fqn"] == "App\\Http\\Controllers\\BookingController"
+        assert post["controller_fqn"] == "App\\Http\\Controllers\\PostController"

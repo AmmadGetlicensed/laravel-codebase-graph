@@ -74,6 +74,10 @@ _USE_PATTERN = re.compile(
 # Detects that the handler is a closure/arrow-function
 _CLOS_HANDLER = re.compile(r'^\s*(?:function|fn)\s*\(', re.IGNORECASE)
 
+# Detects a plain method-name string: 'createBooking'  or  "createBooking"
+# Used by Laravel 9+ group controller syntax inside Route::group(['controller'=>Ctrl::class])
+_METHOD_STRING_PATTERN = re.compile(r"""^['"](\w+)['"]$""")
+
 # Pattern 1a: (new Controller()) -> method(   or   (new Controller) -> method(
 _CLOS_NEW_PAREN = re.compile(
     r'\(\s*new\s+([A-Za-z_][\w\\]*)\s*(?:\([^)]*\))?\s*\)\s*->\s*(\w+)\s*\('
@@ -368,30 +372,55 @@ def _resolve_controller_fqn(
 
 
 def _parse_route_group_context(source: str) -> list[dict[str, Any]]:
-    """Return context dicts for route groups (prefix, middleware, domain).
+    """Return context dicts for route groups (prefix, middleware, domain, controller).
 
-    This is a simplified parser that handles common patterns. Nested groups are
-    flattened. Each context applies to the line range within the group closure.
+    Handles three group forms:
+      - Route::group(['controller' => Ctrl::class, 'prefix' => '...'], function() {...})
+      - Route::controller(Ctrl::class)->prefix('...')->group(function() {...})
+      - Route::prefix('...')->controller(Ctrl::class)->group(function() {...})
+
+    Nested groups are flattened. Each context applies to everything after its
+    opening position in the file.
     """
     contexts = []
+
+    # Match all three group forms
     group_pattern = re.compile(
-        r"Route\s*::\s*(?:group\s*\(\s*\[([^\]]*)\]\s*,|"
-        r"((?:prefix|middleware|domain)\s*\([^)]*\)(?:\s*->\s*(?:prefix|middleware|domain)\s*\([^)]*\))*)\s*->group\s*\()"
+        r"Route\s*::\s*(?:"
+        # Form 1: Route::group(['key' => val, ...], function
+        r"group\s*\(\s*\[([^\]]*)\]\s*,|"
+        # Form 2/3: Route::controller/prefix/middleware/domain chains ending in ->group(
+        r"((?:(?:controller|prefix|middleware|domain)\s*\([^)]*\)"
+        r"(?:\s*->\s*(?:controller|prefix|middleware|domain)\s*\([^)]*\))*)"
+        r"\s*->group\s*\("
+        r"))"
         r"\s*function\s*\(\s*\)\s*\{",
         re.DOTALL,
     )
 
+    # Array-style key patterns
     prefix_pat = re.compile(r"['\"]prefix['\"]\s*=>\s*['\"]([^'\"]+)['\"]")
     mw_pat = re.compile(r"['\"]middleware['\"]\s*=>\s*(\[[^\]]*\]|['\"][^'\"]*['\"])")
     domain_pat = re.compile(r"['\"]domain['\"]\s*=>\s*['\"]([^'\"]+)['\"]")
+    # 'controller' => ClassName::class  or  'controller' => 'ClassName'
+    ctrl_arr_pat = re.compile(
+        r"['\"]controller['\"]\s*=>\s*(?:([A-Za-z_\\]+)::class|['\"]([A-Za-z_\\]+)['\"])"
+    )
 
+    # Fluent-chain patterns
     inline_prefix_pat = re.compile(r"->prefix\s*\(\s*['\"]([^'\"]+)['\"]\s*\)")
     inline_mw_pat = re.compile(r"->middleware\s*\(\s*([^)]+)\)")
+    # ->controller(ClassName::class)  or  controller(ClassName::class)  (-> is optional
+    # because Route::controller(...) strips the "Route::" leaving just "controller(...)")
+    inline_ctrl_pat = re.compile(
+        r"(?:->)?controller\s*\(\s*(?:([A-Za-z_\\]+)::class|['\"]([A-Za-z_\\]+)['\"])\s*\)"
+    )
 
     for m in group_pattern.finditer(source):
         ctx_raw = m.group(1) or m.group(2) or ""
-        ctx: dict[str, Any] = {"prefix": "", "middleware": [], "domain": ""}
+        ctx: dict[str, Any] = {"prefix": "", "middleware": [], "domain": "", "controller": ""}
 
+        # ── prefix ────────────────────────────────────────────────────────────
         prefix_m = prefix_pat.search(ctx_raw)
         if prefix_m:
             ctx["prefix"] = prefix_m.group(1)
@@ -400,6 +429,7 @@ def _parse_route_group_context(source: str) -> list[dict[str, Any]]:
             if inline_prefix_m:
                 ctx["prefix"] = inline_prefix_m.group(1)
 
+        # ── middleware ────────────────────────────────────────────────────────
         mw_m = mw_pat.search(ctx_raw)
         if mw_m:
             ctx["middleware"] = _extract_middleware_list(mw_m.group(1))
@@ -407,9 +437,19 @@ def _parse_route_group_context(source: str) -> list[dict[str, Any]]:
             for inline_mw_m in inline_mw_pat.finditer(ctx_raw):
                 ctx["middleware"].extend(_extract_middleware_list(inline_mw_m.group(1)))
 
+        # ── domain ────────────────────────────────────────────────────────────
         domain_m = domain_pat.search(ctx_raw)
         if domain_m:
             ctx["domain"] = domain_m.group(1)
+
+        # ── controller (Laravel 9+ group controller syntax) ───────────────────
+        ctrl_m = ctrl_arr_pat.search(ctx_raw)
+        if ctrl_m:
+            ctx["controller"] = ctrl_m.group(1) or ctrl_m.group(2) or ""
+        else:
+            inline_ctrl_m = inline_ctrl_pat.search(ctx_raw)
+            if inline_ctrl_m:
+                ctx["controller"] = inline_ctrl_m.group(1) or inline_ctrl_m.group(2) or ""
 
         ctx["start"] = m.start()
         contexts.append(ctx)
@@ -418,8 +458,8 @@ def _parse_route_group_context(source: str) -> list[dict[str, Any]]:
 
 
 def _get_group_context_for_pos(contexts: list[dict[str, Any]], pos: int) -> dict[str, Any]:
-    """Return the innermost group context that contains pos, or empty context."""
-    result: dict[str, Any] = {"prefix": "", "middleware": [], "domain": ""}
+    """Return the merged group context that covers pos, or an empty context."""
+    result: dict[str, Any] = {"prefix": "", "middleware": [], "domain": "", "controller": ""}
     for ctx in contexts:
         if ctx.get("start", 0) <= pos:
             if ctx.get("prefix"):
@@ -428,6 +468,8 @@ def _get_group_context_for_pos(contexts: list[dict[str, Any]], pos: int) -> dict
                 result["middleware"] = ctx["middleware"]
             if ctx.get("domain"):
                 result["domain"] = ctx["domain"]
+            if ctx.get("controller"):
+                result["controller"] = ctx["controller"]
     return result
 
 
@@ -484,6 +526,21 @@ def _parse_routes_from_file(
         elif invokable_m:
             controller_fqn = resolve(invokable_m.group(1))
             action_method = "__invoke"
+
+        # ── Laravel 9+ group controller: Route::group(['controller'=>Ctrl::class]) ──
+        # Handler is a plain method-name string, e.g. 'createBooking'
+        if not controller_fqn:
+            method_str_m = _METHOD_STRING_PATTERN.match(handler_raw.strip())
+            group_ctrl = group_ctx.get("controller", "")
+            if method_str_m and group_ctrl:
+                controller_fqn = resolve(group_ctrl)
+                action_method = method_str_m.group(1)
+                logger.debug(
+                    "Resolved group-controller route",
+                    route=f"{http_method} {full_uri}",
+                    controller=controller_fqn,
+                    method=action_method,
+                )
 
         # ── Closure delegation: scan body for controller dispatch ─────────────
         if not controller_fqn and _CLOS_HANDLER.match(handler_raw.lstrip()):
