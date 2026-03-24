@@ -61,6 +61,7 @@ class MCPConfig(BaseModel):
     transport: str = "stdio"  # "stdio" | "http"
     host: str = "127.0.0.1"
     port: int = 3000
+    api_key: str = ""         # Bearer token for HTTP transport; empty = no auth
     log_requests: bool = True
 
 
@@ -131,6 +132,8 @@ class Config(BaseModel):
             base.setdefault("log", {})["level"] = lvl
         if port := os.environ.get("LARAVELGRAPH_PORT"):
             base.setdefault("mcp", {})["port"] = int(port)
+        if key := os.environ.get("LARAVELGRAPH_API_KEY"):
+            base.setdefault("mcp", {})["api_key"] = key
 
         return cls.model_validate(base)
 

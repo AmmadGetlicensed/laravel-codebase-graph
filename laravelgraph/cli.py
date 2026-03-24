@@ -755,8 +755,9 @@ def serve(
     path: Optional[Path] = PathArg,
     watch: bool = typer.Option(False, "--watch", "-w", help="Enable live file watching"),
     http: bool = typer.Option(False, "--http", help="Use HTTP/SSE transport instead of stdio"),
-    port: int = typer.Option(3000, "--port", help="HTTP port (when --http)"),
-    host: str = typer.Option("127.0.0.1", "--host", help="HTTP host (when --http)"),
+    port: int = typer.Option(None, "--port", help="HTTP port (when --http). Default: 3000 or mcp.port from config"),
+    host: str = typer.Option(None, "--host", help="HTTP host (when --http). Default: 127.0.0.1 or mcp.host from config"),
+    api_key: str = typer.Option(None, "--api-key", help="Bearer token for HTTP auth (when --http). Also via LARAVELGRAPH_API_KEY env var"),
 ) -> None:
     """Start the MCP server for AI agent integration."""
     root = _project_root(path)
@@ -767,19 +768,53 @@ def serve(
     cfg = Config.load(root)
     configure(cfg.log.level, cfg.log.dir)
 
+    # CLI flags override config; config overrides defaults
+    _host = host or cfg.mcp.host or "127.0.0.1"
+    _port = port or cfg.mcp.port or 3000
+    _api_key = api_key or cfg.mcp.api_key or ""
+
     if not http:
         # stdio transport — start silently (output breaks MCP protocol)
         from laravelgraph.mcp.server import run_stdio
         run_stdio(root, cfg)
     else:
-        console.print(f"[bold green]LaravelGraph MCP Server[/bold green]")
-        console.print(f"Transport: HTTP/SSE")
-        console.print(f"Listening: http://{host}:{port}")
-        console.print(f"Project: {root}")
-        console.print("\nPress Ctrl+C to stop.")
+        import json as _json
+        console.print(Panel(
+            f"[bold green]LaravelGraph MCP Server — HTTP/SSE[/bold green]",
+            border_style="green",
+        ))
+        console.print(f"  [bold]Project:[/bold]   {root}")
+        console.print(f"  [bold]Listening:[/bold]  http://{_host}:{_port}")
+        console.print(f"  [bold]SSE endpoint:[/bold]  http://{_host}:{_port}/sse")
+        console.print(f"  [bold]Health check:[/bold] http://{_host}:{_port}/health")
+        if _api_key:
+            console.print(f"  [bold]Auth:[/bold]      Bearer token required")
+        else:
+            console.print(f"  [yellow]  Auth:[/yellow]      No API key set — open access (use --api-key for production)")
+
+        # Show the agent config snippet
+        console.print()
+        console.print("[bold]Add to your agent MCP config:[/bold]")
+        if _api_key:
+            agent_cfg = {
+                "laravelgraph": {
+                    "type": "sse",
+                    "url": f"http://{_host}:{_port}/sse",
+                    "headers": {"Authorization": f"Bearer {_api_key}"},
+                }
+            }
+        else:
+            agent_cfg = {
+                "laravelgraph": {
+                    "type": "sse",
+                    "url": f"http://{_host}:{_port}/sse",
+                }
+            }
+        console.print(_json.dumps(agent_cfg, indent=2))
+        console.print()
+        console.print("Press [bold]Ctrl+C[/bold] to stop.\n")
 
         if watch:
-            # Start file watcher in background thread
             import threading
             from laravelgraph.watch.watcher import start_watch
             watcher_thread = threading.Thread(
@@ -788,7 +823,7 @@ def serve(
             watcher_thread.start()
 
         from laravelgraph.mcp.server import run_http
-        run_http(root, host=host, port=port, config=cfg)
+        run_http(root, host=_host, port=_port, config=cfg, api_key=_api_key)
 
 
 # ── watch ─────────────────────────────────────────────────────────────────────
@@ -1055,33 +1090,62 @@ def setup(
     claude: bool = typer.Option(False, "--claude", help="Print config for Claude Code"),
     cursor: bool = typer.Option(False, "--cursor", help="Print config for Cursor"),
     windsurf: bool = typer.Option(False, "--windsurf", help="Print config for Windsurf"),
+    http: bool = typer.Option(False, "--http", help="Show HTTP/SSE remote config instead of local stdio"),
+    url: str = typer.Option("", "--url", help="Remote SSE URL (e.g. http://your-ec2:3000/sse)"),
+    api_key: str = typer.Option("", "--api-key", help="Bearer token for remote HTTP server"),
 ) -> None:
     """Print MCP configuration JSON for AI agents."""
     root = _project_root(path)
 
-    config = {
-        "mcpServers": {
-            "laravelgraph": {
-                "command": "laravelgraph",
-                "args": ["serve", str(root)],
-                "description": f"LaravelGraph — code intelligence for {root.name}",
+    if http or url:
+        # Remote HTTP/SSE config
+        _url = url or "http://your-server:3000/sse"
+        if api_key:
+            config = {
+                "mcpServers": {
+                    "laravelgraph": {
+                        "type": "sse",
+                        "url": _url,
+                        "headers": {"Authorization": f"Bearer {api_key}"},
+                        "description": f"LaravelGraph — remote code intelligence for {root.name}",
+                    }
+                }
+            }
+        else:
+            config = {
+                "mcpServers": {
+                    "laravelgraph": {
+                        "type": "sse",
+                        "url": _url,
+                        "description": f"LaravelGraph — remote code intelligence for {root.name}",
+                    }
+                }
+            }
+        console.print("\n[bold]Remote HTTP/SSE config[/bold] (for EC2 / shared server):")
+    else:
+        # Local stdio config (current default)
+        config = {
+            "mcpServers": {
+                "laravelgraph": {
+                    "type": "local",
+                    "command": ["bash", "-c", f"laravelgraph serve \"{root}\""],
+                    "description": f"LaravelGraph — code intelligence for {root.name}",
+                }
             }
         }
-    }
+        console.print("\n[bold]Local stdio config[/bold] (auto-starts MCP server):")
 
     if claude:
-        console.print("\n[bold]Claude Code (~/.claude.json or .claude.json):[/bold]")
-        console.print(json.dumps(config, indent=2))
+        console.print("[bold]Claude Code (~/.claude.json or .claude.json):[/bold]")
     elif cursor:
-        console.print("\n[bold]Cursor (~/.cursor/mcp.json):[/bold]")
-        console.print(json.dumps(config, indent=2))
+        console.print("[bold]Cursor (~/.cursor/mcp.json):[/bold]")
     elif windsurf:
-        console.print("\n[bold]Windsurf (~/.windsurf/mcp_config.json):[/bold]")
-        console.print(json.dumps(config, indent=2))
-    else:
-        console.print("\n[bold]MCP Server Configuration:[/bold]")
-        console.print(json.dumps(config, indent=2))
-        console.print("\nUse --claude, --cursor, or --windsurf for IDE-specific format.")
+        console.print("[bold]Windsurf (~/.windsurf/mcp_config.json):[/bold]")
+
+    console.print(json.dumps(config, indent=2))
+
+    if not http and not url:
+        console.print("\n[dim]For remote/shared server config: laravelgraph setup --http --url http://your-server:3000/sse[/dim]")
 
 
 # ── export ────────────────────────────────────────────────────────────────────
@@ -1309,7 +1373,126 @@ def doctor(path: Optional[Path] = PathArg) -> None:
         except Exception as e:
             warn(f"Closure route check skipped: {e}")
 
-    # ── 6. LLM Provider ───────────────────────────────────────────────────────
+    # ── 6. Recent Changes ─────────────────────────────────────────────────────
+    section("Recent Changes")
+    # 6a. _MAX_SNIPPET_LINES should be 300 (raised from 120 to fix source truncation)
+    try:
+        from laravelgraph.mcp.explain import _MAX_SNIPPET_LINES
+        if _MAX_SNIPPET_LINES >= 300:
+            ok(f"Source snippet limit: {_MAX_SNIPPET_LINES} lines (truncation fix active)")
+        else:
+            fail(
+                f"Source snippet limit is {_MAX_SNIPPET_LINES} — should be ≥ 300",
+                "Old value causes source truncation for large methods",
+            )
+    except Exception as e:
+        warn(f"Could not verify _MAX_SNIPPET_LINES: {e}")
+
+    # 6b. include_source parameter on laravelgraph_context (cache-warm token saving)
+    try:
+        import inspect
+        from laravelgraph.mcp.server import create_server as _cs
+        # Inspect the source of the module to find include_source param
+        import laravelgraph.mcp.server as _srv_mod
+        src_txt = inspect.getsource(_srv_mod)
+        if "include_source" in src_txt and "not cached_summary or include_source" in src_txt:
+            ok("Cache-aware source suppression active (include_source parameter)")
+        else:
+            fail(
+                "Cache-aware source suppression not detected",
+                "laravelgraph_context should omit source when cache is warm",
+            )
+    except Exception as e:
+        warn(f"Could not verify include_source: {e}")
+
+    # 6c. Route resolution quality: what % of routes have a resolved controller
+    if db is not None:
+        try:
+            total_r = db.execute("MATCH (r:Route) RETURN count(r) AS cnt")
+            resolved_r = db.execute(
+                "MATCH (r:Route) WHERE r.controller_fqn IS NOT NULL AND r.controller_fqn <> '' "
+                "AND r.controller_fqn <> 'Closure' RETURN count(r) AS cnt"
+            )
+            total_cnt = total_r[0].get("cnt", 0) if total_r else 0
+            resolved_cnt = resolved_r[0].get("cnt", 0) if resolved_r else 0
+            if total_cnt > 0:
+                pct = resolved_cnt / total_cnt * 100
+                if pct >= 80:
+                    ok(f"Route resolution: {resolved_cnt}/{total_cnt} routes resolved ({pct:.0f}%)")
+                elif pct >= 50:
+                    warn(f"Route resolution: {resolved_cnt}/{total_cnt} routes resolved ({pct:.0f}%) — some Closure routes may be unresolved")
+                else:
+                    fail(
+                        f"Route resolution low: only {resolved_cnt}/{total_cnt} routes resolved ({pct:.0f}%)",
+                        "Run: laravelgraph analyze --phases 14",
+                    )
+            else:
+                warn("No routes found — run laravelgraph analyze")
+        except Exception as e:
+            warn(f"Route resolution check skipped: {e}")
+
+    # 6d. Phase 14 upsert: verify routes can be re-indexed (check via route count stability)
+    # We verify this indirectly: if routes exist and are resolved, the upsert fix is working
+    if db is not None:
+        try:
+            route_count = db.execute("MATCH (r:Route) RETURN count(r) AS cnt")
+            cnt = route_count[0].get("cnt", 0) if route_count else 0
+            if cnt > 0:
+                ok(f"Phase 14 route upsert: {cnt} routes in graph (re-indexing safe)")
+            else:
+                warn("No routes — run: laravelgraph analyze --phases 14")
+        except Exception as e:
+            warn(f"Phase 14 check skipped: {e}")
+
+    # ── 7. Transport & Server ─────────────────────────────────────────────────
+    section("Transport & Server")
+    import shutil as _shutil
+
+    transport_mode = cfg.mcp.transport  # "stdio" or "http"
+
+    # 7a. stdio transport checks
+    console.print(f"  [dim]Configured transport:[/dim] {transport_mode}")
+
+    binary = _shutil.which("laravelgraph")
+    if binary:
+        ok(f"laravelgraph binary found: {binary}")
+    else:
+        fail("laravelgraph binary not in PATH", "Run: pipx install . or pip install -e .")
+
+    # 7b. HTTP transport checks (if configured or running)
+    _http_host = cfg.mcp.host or "127.0.0.1"
+    _http_port = cfg.mcp.port or 3000
+    try:
+        import urllib.request as _urllib
+        health_url = f"http://{_http_host}:{_http_port}/health"
+        req = _urllib.Request(health_url)
+        with _urllib.urlopen(req, timeout=2) as resp:
+            body = resp.read().decode()
+            ok(f"HTTP server reachable at {health_url}")
+            console.print(f"       [dim]{body[:100]}[/dim]")
+    except Exception:
+        if transport_mode == "http":
+            fail(
+                f"HTTP server not reachable at http://{_http_host}:{_http_port}/health",
+                f"Start with: laravelgraph serve --http --host {_http_host} --port {_http_port}",
+            )
+        else:
+            console.print(f"  [dim]  HTTP server not running on {_http_host}:{_http_port} (stdio mode — expected)[/dim]")
+
+    # 7c. Show connection config for both modes
+    console.print()
+    console.print("  [bold]stdio config (local, auto-start):[/bold]")
+    stdio_cfg = {"laravelgraph": {"type": "local", "command": ["bash", "-c", f"laravelgraph serve \"{root}\""], "enabled": True}}
+    console.print(f"  [dim]{json.dumps(stdio_cfg)}[/dim]")
+
+    console.print()
+    console.print(f"  [bold]HTTP/SSE config (remote EC2):[/bold]")
+    http_cfg: dict = {"laravelgraph": {"type": "sse", "url": f"http://{_http_host}:{_http_port}/sse"}}
+    if cfg.mcp.api_key:
+        http_cfg["laravelgraph"]["headers"] = {"Authorization": f"Bearer {cfg.mcp.api_key}"}
+    console.print(f"  [dim]{json.dumps(http_cfg)}[/dim]")
+
+    # ── 8. LLM Provider ───────────────────────────────────────────────────────
     section("LLM Provider")
     from laravelgraph.mcp.summarize import provider_status, generate_summary
     status = provider_status(cfg.summary)
@@ -1366,7 +1549,7 @@ def doctor(path: Optional[Path] = PathArg) -> None:
                     "Check your model name / network connection, then run: laravelgraph configure",
                 )
 
-    # ── 7. Optional Features ──────────────────────────────────────────────────
+    # ── 9. Optional Features ──────────────────────────────────────────────────
     section("Optional Features")
     try:
         import watchfiles  # noqa

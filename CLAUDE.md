@@ -81,6 +81,67 @@ Laravel project on disk
 
 Add a `@mcp.tool()` decorated function to `mcp/server.py`. Update the server instructions string at the top of `create_server()`.
 
+## HTTP Serving (EC2 / Shared Server)
+
+LaravelGraph supports two transport modes:
+
+**Local stdio (default)** — Claude Code auto-starts the server, no manual steps:
+```json
+{
+  "laravelgraph": {
+    "type": "local",
+    "command": ["bash", "-c", "laravelgraph serve \"$PWD\""],
+    "enabled": true
+  }
+}
+```
+
+**Remote HTTP/SSE** — One server, many developers. Run on EC2:
+```bash
+# Start the HTTP server (use systemd/pm2 to keep alive)
+laravelgraph serve /path/to/project --http --host 0.0.0.0 --port 3000 --api-key your-secret-key
+
+# Health check (always public, no auth)
+curl http://your-server:3000/health
+
+# Re-index after code changes (requires server to be stopped due to KuzuDB write lock)
+laravelgraph analyze /path/to/project
+```
+
+Each developer's agent config:
+```json
+{
+  "laravelgraph": {
+    "type": "sse",
+    "url": "http://your-server:3000/sse",
+    "headers": { "Authorization": "Bearer your-secret-key" }
+  }
+}
+```
+
+Config via environment variables:
+```bash
+LARAVELGRAPH_API_KEY=your-secret-key   # API key for HTTP auth
+LARAVELGRAPH_PORT=3000                  # HTTP port
+```
+
+Or persist in `.laravelgraph/config.json`:
+```json
+{
+  "mcp": {
+    "transport": "http",
+    "host": "0.0.0.0",
+    "port": 3000,
+    "api_key": "your-secret-key"
+  }
+}
+```
+
+**Note on Ollama with remote server:** Ollama runs on your laptop; the remote server can't reach `localhost:11434`. For EC2, configure a cloud LLM provider instead (Groq free tier recommended — fast, cheap, same quality):
+```bash
+laravelgraph configure  # on the EC2 server
+```
+
 ## Tests
 
 - Fixtures live in `tests/fixtures/tiny-laravel-app/` — a minimal Laravel app used by integration and unit tests.

@@ -2065,7 +2065,51 @@ def run_http(
     host: str = "127.0.0.1",
     port: int = 3000,
     config: Config | None = None,
+    api_key: str = "",
 ) -> None:
-    """Run MCP server over HTTP/SSE transport."""
+    """Run MCP server over HTTP/SSE transport.
+
+    If api_key is set, all requests must include:
+        Authorization: Bearer <api_key>
+    The /health endpoint is always publicly accessible (no auth required).
+    """
     mcp = create_server(project_root, config)
-    mcp.run(transport="sse", host=host, port=port)
+
+    # ── /health endpoint — always public, used by EC2/load-balancer health checks ──
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "project": str(project_root)})
+
+    # ── API key middleware ────────────────────────────────────────────────────
+    middleware = []
+    if api_key:
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.responses import Response
+
+        class _BearerAuthMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):
+                # Health check is always public
+                if request.url.path == "/health":
+                    return await call_next(request)
+                auth_header = request.headers.get("Authorization", "")
+                if auth_header == f"Bearer {api_key}":
+                    return await call_next(request)
+                return Response(
+                    content='{"error":"Unauthorized — valid Bearer token required"}',
+                    status_code=401,
+                    media_type="application/json",
+                )
+
+        from starlette.middleware import Middleware
+        middleware = [Middleware(_BearerAuthMiddleware)]
+
+    mcp.run(
+        transport="sse",
+        host=host,
+        port=port,
+        show_banner=False,
+        middleware=middleware,
+    )
