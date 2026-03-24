@@ -58,26 +58,26 @@ def _load_embedder(model_name: str) -> Any:
         if "NO_SUCH" not in err and ".onnx" not in err and "File doesn't exist" not in err:
             raise  # unrelated error — don't swallow
 
-        # Find and remove the corrupt model directory
-        import os
+        # Extract the corrupt model directory directly from the error message.
+        # The error always contains the full path, e.g.:
+        #   "Load model from /tmp/fastembed_cache/models--qdrant--bge-.../model_optimized.onnx"
+        import re
         import shutil
-        import tempfile
         from pathlib import Path
 
-        cache_base = Path(os.environ.get("FASTEMBED_CACHE_PATH", tempfile.gettempdir())) / "fastembed_cache"
-        # Model dir name: "models--<org>--<name>" derived from model_name
-        model_dir_name = "models--" + model_name.replace("/", "--").replace(".", "-").lower()
-        # Find any directory under cache_base that matches (case-insensitive prefix)
         deleted = False
-        if cache_base.exists():
-            for candidate in cache_base.iterdir():
-                if candidate.is_dir() and candidate.name.lower().startswith(model_dir_name.lower()[:20]):
+        path_match = re.search(r"(/[^\s]+/fastembed_cache/[^/\s]+)", err)
+        if path_match:
+            model_dir = Path(path_match.group(1))
+            # Walk up to the models--* directory (direct child of fastembed_cache/)
+            for parent in [model_dir, *model_dir.parents]:
+                if parent.name.startswith("models--") and parent.exists():
                     logger.warning(
                         "Corrupt fastembed model cache detected — deleting and re-downloading",
-                        path=str(candidate),
+                        path=str(parent),
                         model=model_name,
                     )
-                    shutil.rmtree(candidate, ignore_errors=True)
+                    shutil.rmtree(parent, ignore_errors=True)
                     deleted = True
                     break
 
