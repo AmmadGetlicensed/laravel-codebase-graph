@@ -699,7 +699,7 @@ def run(ctx: PipelineContext) -> None:
     # Insert Route nodes and ROUTES_TO relationships
     for route in all_routes:
         try:
-            db._insert_node("Route", {
+            db.upsert_node("Route", {
                 "node_id": route["node_id"],
                 "name": route["name"],
                 "http_method": route["http_method"],
@@ -715,7 +715,7 @@ def run(ctx: PipelineContext) -> None:
                 "is_api": route["is_api"],
             })
         except Exception as exc:
-            logger.debug("Route node insert failed", route=route["node_id"], error=str(exc))
+            logger.debug("Route node upsert failed", route=route["node_id"], error=str(exc))
             continue
 
         controller_fqn = route["controller_fqn"]

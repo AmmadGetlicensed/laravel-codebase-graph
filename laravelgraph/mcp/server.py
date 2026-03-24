@@ -157,14 +157,26 @@ saving you from making 10+ individual tool calls.
     # ── Tool: laravelgraph_context ───────────────────────────────────────────
 
     @mcp.tool()
-    def laravelgraph_context(symbol: str) -> str:
-        """360° view of any symbol: source code, semantic summary, callers, callees, relationships.
+    def laravelgraph_context(symbol: str, include_source: bool = False) -> str:
+        """360° view of any symbol: semantic summary, callers, callees, relationships.
 
-        Returns the actual PHP source code and docblock for the symbol, plus all
-        graph relationships. Cached semantic summaries are shown when available.
+        Returns metadata and a semantic summary for the symbol plus all graph
+        relationships. The file path and line numbers are always included so you
+        can read the source directly when needed.
+
+        Source code behaviour:
+        - First time a symbol is queried (no cached summary): source is included
+          automatically so you can see what the summary is based on.
+        - Subsequent queries (cached summary): source is omitted by default —
+          use include_source=True to force it when you need to read or edit code.
+        - If the source file changes the cache is invalidated and source is
+          included again on the next query.
 
         Args:
-            symbol: Symbol identifier — FQN, node_id, class name, or method name (e.g. "UserController::store")
+            symbol: Symbol identifier — FQN, node_id, class name, or method name
+                    (e.g. "UserController::store")
+            include_source: Set True to always include the PHP source snippet,
+                            even when a cached summary is available.
         """
         start = time.perf_counter()
         db = _db()
@@ -201,14 +213,18 @@ saving you from making 10+ individual tool calls.
             lines.append(f"**Summary:** {cached_summary}")
             lines.append("")
         else:
-            # Option 2: cleaned docblock
-            from laravelgraph.mcp.explain import clean_docblock, read_source_snippet, _append_source_block
+            # No cached summary — show cleaned docblock as interim description
+            from laravelgraph.mcp.explain import clean_docblock
             description = clean_docblock(raw_doc)
             if description:
                 lines.append(f"**Purpose:** {description}")
 
         # ── Source code ──────────────────────────────────────────────────────
-        if fp and ls:
+        # Include when: cache is cold (first query) OR caller explicitly requests it.
+        # When cache is warm and include_source=False, omit source to save tokens.
+        # The file path + line numbers above are always present for direct reading.
+        should_include_source = fp and ls and (not cached_summary or include_source)
+        if should_include_source:
             from laravelgraph.mcp.explain import _append_source_block
             _append_source_block(fp, ls, le, project_root, lines)
 

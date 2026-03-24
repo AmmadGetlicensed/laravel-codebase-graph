@@ -1,5 +1,6 @@
-"""Unit tests for context-tool bugs:
-- Source code must always appear in laravelgraph_context, even when summary is cached
+"""Unit tests for context-tool behaviour:
+- Source code appears on first query (cache cold) and when include_source=True
+- Source code is omitted when cache is warm and include_source=False (default)
 - community_id -1 must not appear in output (both string and integer form)
 - community_id with a real value must appear
 """
@@ -79,10 +80,15 @@ class TestCommunityIdDisplay:
         assert any("Community" in l and "0" in l for l in lines)
 
 
-# ── Source always present (even with cached summary) ──────────────────────────
+# ── Source inclusion logic ────────────────────────────────────────────────────
 
-class TestSourceAlwaysShown:
-    """Source code block must appear regardless of summary cache state."""
+def _should_include_source(cached_summary, include_source, fp, ls):
+    """Mirrors the should_include_source condition in server.py laravelgraph_context."""
+    return bool(fp and ls and (not cached_summary or include_source))
+
+
+class TestSourceInclusionLogic:
+    """Source appears on cold cache or explicit include_source=True; omitted on warm cache."""
 
     @pytest.fixture()
     def php_file(self, tmp_path):
@@ -96,61 +102,50 @@ class TestSourceAlwaysShown:
         )
         return php
 
-    def test_source_appears_when_no_cached_summary(self, php_file, tmp_path):
+    def _render(self, php_file, cached_summary, include_source=False):
         from laravelgraph.mcp.explain import _append_source_block
-
         lines: list[str] = []
-        # cached_summary is None (old code would run source block)
-        cached_summary = None
-        fp = str(php_file)
-        ls, le = 3, 5
-
-        # New logic: always append source when fp and ls are set
-        if fp and ls:
+        fp, ls, le = str(php_file), 3, 5
+        if _should_include_source(cached_summary, include_source, fp, ls):
             _append_source_block(fp, ls, le, project_root=None, lines=lines)
+        return "\n".join(lines)
 
-        full = "\n".join(lines)
-        assert "```php" in full, "Source block missing when no cached summary"
-        assert "posts.index" in full
+    # Cold cache — source always included
+    def test_source_appears_on_cold_cache(self, php_file):
+        out = self._render(php_file, cached_summary=None)
+        assert "```php" in out
+        assert "posts.index" in out
 
-    def test_source_appears_when_summary_is_cached(self, php_file, tmp_path):
-        from laravelgraph.mcp.explain import _append_source_block
+    # Warm cache + default — source omitted (the big change)
+    def test_source_omitted_when_cache_warm_default(self, php_file):
+        out = self._render(php_file, cached_summary="Handles posts listing.")
+        assert "```php" not in out, "Source must be omitted when cache is warm and include_source=False"
 
-        lines: list[str] = []
-        # Simulates the fixed logic: cached_summary exists but source still appended
-        cached_summary = "This controller handles the posts listing page."
-        fp = str(php_file)
-        ls, le = 3, 5
+    # Warm cache + include_source=True — source returned
+    def test_source_included_when_cache_warm_and_flag_set(self, php_file):
+        out = self._render(php_file, cached_summary="Handles posts listing.", include_source=True)
+        assert "```php" in out
+        assert "posts.index" in out
 
-        # Fixed: condition is just `if fp and ls` — no `not cached_summary`
-        if fp and ls:
-            _append_source_block(fp, ls, le, project_root=None, lines=lines)
+    # Cold cache + include_source=True — source returned (no change)
+    def test_source_included_on_cold_cache_with_flag(self, php_file):
+        out = self._render(php_file, cached_summary=None, include_source=True)
+        assert "```php" in out
 
-        full = "\n".join(lines)
-        assert "```php" in full, "Source block missing when summary is cached — regression!"
-        assert "posts.index" in full
-
+    # No file path — always skip regardless
     def test_source_absent_when_no_file_path(self):
-        from laravelgraph.mcp.explain import _append_source_block
+        assert not _should_include_source(None, False, "", 3)
+        assert not _should_include_source(None, True, "", 3)
 
-        lines: list[str] = []
-        fp = ""   # no file path — gracefully skip
-        ls = 3
+    # No line start — always skip
+    def test_source_absent_when_no_line_start(self, php_file):
+        assert not _should_include_source(None, False, str(php_file), 0)
 
-        if fp and ls:
-            _append_source_block(fp, ls, 5, project_root=None, lines=lines)
-
-        assert "```php" not in "\n".join(lines)
-
+    # Missing file — no crash, no source block
     def test_source_absent_for_missing_file(self, tmp_path):
         from laravelgraph.mcp.explain import _append_source_block
-
         lines: list[str] = []
         fp = str(tmp_path / "NonExistent.php")
-        ls = 1
-
-        if fp and ls:
-            _append_source_block(fp, ls, 5, project_root=None, lines=lines)
-
-        # Missing file should not crash and should produce no source block
+        if _should_include_source(None, False, fp, 1):
+            _append_source_block(fp, 1, 5, project_root=None, lines=lines)
         assert "```php" not in "\n".join(lines)
