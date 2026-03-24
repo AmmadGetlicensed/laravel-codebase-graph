@@ -3,6 +3,11 @@
 Build the template inheritance graph: BladeTemplate nodes with EXTENDS_TEMPLATE,
 INCLUDES_TEMPLATE, and HAS_COMPONENT relationships. Also links controller methods
 that return a view to their BladeTemplate via RENDERS_TEMPLATE.
+
+Also detects static method calls inside Blade expressions ({{ Cls::method() }},
+{!! Cls::method() !!}, <?php Cls::method() ?>) and creates CALLS edges from
+the BladeTemplate to the target Method. This prevents helper/utility methods
+that are only invoked from templates from being falsely flagged as dead code.
 """
 
 from __future__ import annotations
@@ -32,6 +37,85 @@ _VIEW_CALL_RE = re.compile(
     r"""(?:return\s+)?view\s*\(\s*['"]([^'"]+)['"]\s*[,\)]""",
     re.DOTALL,
 )
+
+# Static method calls in Blade: ClassName::method( or \Full\Ns\Cls::method(
+# Captures class (group 1) and method name (group 2).
+_STATIC_CALL_RE = re.compile(
+    r"\\?([A-Za-z_][\w\\]*)::([a-zA-Z_]\w*)\s*\("
+)
+
+# Laravel facade / framework class names to skip (never app code)
+_BLADE_SKIP_CLASSES: frozenset[str] = frozenset({
+    "Route", "Auth", "Session", "Cache", "DB", "Log", "Event",
+    "Mail", "Queue", "Storage", "Validator", "Hash", "Str", "Arr",
+    "Config", "Facade", "Gate", "Bus", "Crypt", "Cookie", "File",
+    "Lang", "URL", "Password", "RateLimiter", "Artisan",
+    "Broadcast", "Notification", "Pipeline", "Redirect", "Response",
+    "Request", "View", "Blade", "Carbon", "Collection", "Closure",
+    "Illuminate", "Laravel", "PHP_EOL", "PHP_INT_MAX", "PHP_INT_MIN",
+    "Application", "Container", "Model", "Builder",
+    "Str", "Arr", "Number", "Date",
+})
+
+
+def _extract_blade_static_calls(
+    source: str,
+    class_map: dict[str, Path],
+    composer_namespace: str,
+) -> list[tuple[str, str]]:
+    """Return (class_fqn, method_name) pairs for static calls found in a Blade file.
+
+    Resolves short class names to FQNs using the project class_map.
+    Skips Laravel facade/framework classes.
+    """
+    calls: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for m in _STATIC_CALL_RE.finditer(source):
+        raw_cls = m.group(1).lstrip("\\")
+        method = m.group(2)
+
+        # Skip framework classes
+        short = raw_cls.split("\\")[-1]
+        if short in _BLADE_SKIP_CLASSES:
+            continue
+        if raw_cls.startswith(("Illuminate\\", "Laravel\\")):
+            continue
+
+        # Resolve to FQN
+        if "\\" in raw_cls:
+            # Already a qualified name — normalise backslash
+            fqn = raw_cls
+        elif raw_cls in class_map:
+            fqn = raw_cls
+        else:
+            # Try common App namespaces
+            candidates = [
+                f"App\\Helpers\\{raw_cls}",
+                f"App\\{raw_cls}",
+                f"{composer_namespace}{raw_cls}",
+            ]
+            # Also try matching last segment of any key in class_map
+            fqn = ""
+            for candidate in candidates:
+                if candidate in class_map:
+                    fqn = candidate
+                    break
+            if not fqn:
+                # Fuzzy: find any class_map key whose last segment matches
+                for key in class_map:
+                    if key.split("\\")[-1] == raw_cls:
+                        fqn = key
+                        break
+            if not fqn:
+                continue  # Cannot resolve — skip
+
+        pair = (fqn, method)
+        if pair not in seen:
+            seen.add(pair)
+            calls.append(pair)
+
+    return calls
 
 
 def _view_name_from_path(path: Path, project_root: Path) -> str:
@@ -113,6 +197,15 @@ def run(ctx: PipelineContext) -> None:
     db = ctx.db
     templates_parsed = 0
     component_usages = 0
+    blade_calls_created = 0
+
+    # Pre-compute composer namespace for class resolution
+    composer_namespace = ""
+    if ctx.composer and hasattr(ctx.composer, "autoload_psr4"):
+        for ns, path in ctx.composer.autoload_psr4.items():
+            if path in ("app/", "app"):
+                composer_namespace = ns
+                break
 
     # Map view_name → node_id for cross-referencing
     view_nid_map: dict[str, str] = {}
@@ -131,7 +224,7 @@ def run(ctx: PipelineContext) -> None:
             rel_path = str(blade_path)
 
         try:
-            db._insert_node("BladeTemplate", {
+            db.upsert_node("BladeTemplate", {
                 "node_id": nid,
                 "name": view_name,
                 "file_path": str(blade_path),
@@ -158,7 +251,7 @@ def run(ctx: PipelineContext) -> None:
             # Ensure layout node exists (create stub if needed)
             if layout_name not in view_nid_map:
                 try:
-                    db._insert_node("BladeTemplate", {
+                    db.upsert_node("BladeTemplate", {
                         "node_id": layout_nid,
                         "name": layout_name,
                         "file_path": "",
@@ -181,7 +274,7 @@ def run(ctx: PipelineContext) -> None:
             inc_nid = view_nid_map.get(included, make_node_id("blade", included))
             if included not in view_nid_map:
                 try:
-                    db._insert_node("BladeTemplate", {
+                    db.upsert_node("BladeTemplate", {
                         "node_id": inc_nid,
                         "name": included,
                         "file_path": "",
@@ -360,10 +453,43 @@ def run(ctx: PipelineContext) -> None:
                     line=call_line,
                 )
 
+    # ── Blade static-call detection → CALLS edges ─────────────────────────────
+    # Find ClassName::method() calls in Blade files and create CALLS edges so
+    # that phase 10 does not mark those methods as dead code.
+    for blade_path in ctx.blade_files:
+        source = _read_source(blade_path)
+        if "::" not in source:
+            continue  # fast-path: skip templates with no static calls at all
+
+        view_name = _view_name_from_path(blade_path, ctx.project_root)
+        blade_nid = view_nid_map.get(view_name, make_node_id("blade", view_name))
+
+        calls = _extract_blade_static_calls(source, ctx.class_map, composer_namespace)
+        for class_fqn, method_name in calls:
+            method_nid = make_node_id("method", class_fqn, method_name)
+            try:
+                db.upsert_rel(
+                    "BLADE_CALLS",
+                    "BladeTemplate", blade_nid,
+                    "Method", method_nid,
+                    {"line": 0},
+                )
+                blade_calls_created += 1
+            except Exception as exc:
+                logger.debug(
+                    "BLADE_CALLS edge failed",
+                    blade=view_name,
+                    class_fqn=class_fqn,
+                    method=method_name,
+                    error=str(exc),
+                )
+
     ctx.stats["templates_parsed"] = templates_parsed
     ctx.stats["component_usages"] = component_usages
+    ctx.stats["blade_calls_indexed"] = blade_calls_created
     logger.info(
         "Blade template graph built",
         templates=templates_parsed,
         components=component_usages,
+        blade_calls=blade_calls_created,
     )

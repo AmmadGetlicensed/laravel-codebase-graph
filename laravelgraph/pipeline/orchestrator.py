@@ -129,7 +129,6 @@ class Pipeline:
             (7,  "Type Analysis",               phase_07_types.run),
             (8,  "Community Detection",         phase_08_community.run),
             (9,  "Execution Flow Detection",    phase_09_flows.run),
-            (10, "Dead Code Detection",         phase_10_dead_code.run),
             (11, "Change Coupling (Git)",       phase_11_git.run),
             (12, "Embeddings",                  phase_12_embeddings.run if not skip_embeddings else _skip),
             (13, "Eloquent Relationships",      phase_13_eloquent.run),
@@ -138,6 +137,9 @@ class Pipeline:
             (16, "Service Container Bindings",  phase_16_bindings.run),
             (17, "Event/Listener/Job Graph",    phase_17_events.run),
             (18, "Blade Template Graph",        phase_18_blade.run),
+            # Phase 10 intentionally runs after phase 18 so that BLADE_CALLS edges
+            # (created by phase 18) are present before dead-code detection fires.
+            (10, "Dead Code Detection",         phase_10_dead_code.run),
             (19, "Database Schema",             phase_19_schema.run),
             (20, "Config/Env Dependencies",     phase_20_config.run),
             (21, "Dependency Injection",        phase_21_di.run),

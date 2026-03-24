@@ -515,6 +515,10 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
     ], [("channels", "STRING")]),
 
     # Blade
+    ("BLADE_CALLS", [
+        ("BladeTemplate", "Method"),
+        ("BladeTemplate", "Function_"),
+    ], [("line", "INT32")]),
     ("RENDERS_TEMPLATE", [
         ("Method", "BladeTemplate"),
         ("Controller", "BladeTemplate"),

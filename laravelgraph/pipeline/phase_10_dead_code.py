@@ -81,6 +81,7 @@ def _has_incoming_call_edges(db: Any, node_id: str, node_label: str) -> bool:
     LISTENS_TO, or HANDLES edge pointing to it."""
     queries = [
         f"MATCH ()-[:CALLS]->(n:{node_label} {{node_id: $nid}}) RETURN count(*) AS cnt",
+        f"MATCH ()-[:BLADE_CALLS]->(n:{node_label} {{node_id: $nid}}) RETURN count(*) AS cnt",
         f"MATCH ()-[:ROUTES_TO]->(n:{node_label} {{node_id: $nid}}) RETURN count(*) AS cnt",
         f"MATCH ()-[:LISTENS_TO]->(n:{node_label} {{node_id: $nid}}) RETURN count(*) AS cnt",
         f"MATCH ()-[:HANDLES]->(n:{node_label} {{node_id: $nid}}) RETURN count(*) AS cnt",

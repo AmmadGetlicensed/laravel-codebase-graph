@@ -6,6 +6,7 @@ Tests cover:
 - Phase 14: Resource route controller FQN strips ::class
 - Phase 14: Nested group prefix stacking (protect → api → auth)
 - Phase 14: _find_brace_end correctly finds matching closing brace
+- Phase 18: _extract_blade_static_calls resolves short class names via class_map
 """
 
 from __future__ import annotations
@@ -224,3 +225,66 @@ class TestVendorPathExclusion:
 
     def test_model_path_not_skipped(self):
         assert not self._should_skip("/app/Models/Booking.php")
+
+
+# ── Phase 18: Blade static-call extraction ────────────────────────────────────
+
+from laravelgraph.pipeline.phase_18_blade import (
+    _extract_blade_static_calls,
+    _BLADE_SKIP_CLASSES,
+)
+from pathlib import Path
+
+
+class TestExtractBladeStaticCalls:
+    """_extract_blade_static_calls must resolve short class names via class_map."""
+
+    _CLASS_MAP = {
+        "App\\Helpers\\CommonFunctions": Path("/app/Helpers/CommonFunctions.php"),
+        "App\\Helpers\\GlobalHelper": Path("/app/Helpers/GlobalHelper.php"),
+    }
+    _NS = "App\\"
+
+    def _calls(self, source: str):
+        return _extract_blade_static_calls(source, self._CLASS_MAP, self._NS)
+
+    def test_short_name_resolved_via_helpers_namespace(self):
+        calls = self._calls("{{ CommonFunctions::formatPrice($x) }}")
+        assert ("App\\Helpers\\CommonFunctions", "formatPrice") in calls
+
+    def test_short_name_resolved_via_fuzzy_match(self):
+        calls = self._calls("{!! GlobalHelper::currencySymbol() !!}")
+        assert ("App\\Helpers\\GlobalHelper", "currencySymbol") in calls
+
+    def test_facade_skipped(self):
+        """Auth, Route, etc. must never appear in results."""
+        calls = self._calls("{{ Auth::user()->name }}")
+        assert not any(cls == "Auth" for cls, _ in calls)
+
+    def test_illuminate_skipped(self):
+        calls = self._calls("{{ Illuminate\\Support\\Str::ucfirst($x) }}")
+        assert not calls
+
+    def test_fqn_in_blade_resolved_directly(self):
+        calls = self._calls("{{ App\\Helpers\\CommonFunctions::something() }}")
+        assert ("App\\Helpers\\CommonFunctions", "something") in calls
+
+    def test_unknown_class_skipped(self):
+        """Short names with no class_map match are discarded."""
+        calls = self._calls("{{ UnknownXyz::doThing() }}")
+        assert not calls
+
+    def test_deduplication(self):
+        """Duplicate calls produce only one entry."""
+        calls = self._calls(
+            "{{ CommonFunctions::fmt() }}\n{{ CommonFunctions::fmt() }}"
+        )
+        assert calls.count(("App\\Helpers\\CommonFunctions", "fmt")) == 1
+
+    def test_php_block_also_parsed(self):
+        calls = self._calls("<?php echo GlobalHelper::translate($key); ?>")
+        assert ("App\\Helpers\\GlobalHelper", "translate") in calls
+
+    def test_no_static_calls_returns_empty(self):
+        calls = self._calls("<p>Hello {{ $name }}</p>")
+        assert calls == []
