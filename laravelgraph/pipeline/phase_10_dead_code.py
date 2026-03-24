@@ -25,6 +25,14 @@ _EXEMPT_METHOD_NAMES: frozenset[str] = frozenset({
     "down",
     "run",
     "definition",
+    "schedule",        # App\Console\Kernel::schedule — called by framework scheduler
+    "broadcastOn",     # Event classes — called by Laravel Broadcasting
+    "broadcastWith",   # Event classes — called by Laravel Broadcasting
+    "broadcastAs",     # Event classes — called by Laravel Broadcasting
+    "via",             # Notification classes — called by Laravel Notifications
+    "toMail",          # Notification/Mailable classes — called by framework
+    "toArray",         # Notification/Resource classes — called by framework
+    "build",           # Mailable::build() — called by Mail::send()
     "__construct",
     "__call",
     "__callStatic",
@@ -43,11 +51,12 @@ _EXEMPT_METHOD_NAMES: frozenset[str] = frozenset({
     "__debugInfo",
 })
 
-# Laravel roles whose methods are always exempt
+# Laravel roles whose ALL methods are always exempt (framework calls them via conventions)
 _EXEMPT_ROLES: frozenset[str] = frozenset({
     "policy",
     "observer",
-    "request",  # FormRequest
+    "request",    # FormRequest — authorize() / rules() / messages() called by framework
+    "resource",   # API Resources — toArray() / collection() / setExtra() called by framework
 })
 
 _SCOPE_PATTERN = re.compile(r"^scope[A-Z]")
@@ -171,10 +180,19 @@ def run(ctx: PipelineContext) -> None:
     dead_methods = 0
     dead_functions = 0
 
+    # ── Reset: clear all previous dead-code flags before re-evaluating ────────
+    # Required so that re-runs pick up new exemptions (e.g. after route fixes).
+    for label in ("Method", "Function_"):
+        try:
+            db._conn.execute(f"MATCH (n:{label}) SET n.is_dead_code = false")
+        except Exception as exc:
+            logger.debug("Failed to reset dead-code flags", label=label, error=str(exc))
+
     # ── Pass 1: Methods ───────────────────────────────────────────────────────
     try:
         method_rows = db.execute(
-            "MATCH (m:Method) RETURN m.node_id AS nid, m.name AS name, m.fqn AS fqn"
+            "MATCH (m:Method) RETURN m.node_id AS nid, m.name AS name, m.fqn AS fqn, "
+            "m.file_path AS fp"
         )
     except Exception as exc:
         logger.error("Failed to fetch Method nodes", error=str(exc))
@@ -185,7 +203,18 @@ def run(ctx: PipelineContext) -> None:
     for row in method_rows:
         nid = row.get("nid") or ""
         name = row.get("name") or ""
+        fp = row.get("fp") or ""
         if not nid:
+            continue
+
+        # Skip vendor/legacy files — their methods are called via dynamic dispatch
+        # or string-based lookup that static analysis cannot detect
+        if fp and (
+            "/vendor/" in fp
+            or "/legacy/" in fp
+            or "\\vendor\\" in fp
+            or "\\legacy\\" in fp
+        ):
             continue
 
         try:

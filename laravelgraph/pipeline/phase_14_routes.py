@@ -44,7 +44,7 @@ _ROUTE_SIMPLE_PATTERN = re.compile(
 _ROUTE_RESOURCE_PATTERN = re.compile(
     r"Route\s*::\s*(resource|apiResource)\s*\(\s*"
     r"['\"]([^'\"]+)['\"]\s*,\s*"  # URI prefix
-    r"([A-Za-z_\\:]+)(?:::class)?\s*"  # controller
+    r"([A-Za-z_\\]+)(?:::class)?\s*"  # controller — no : so ::class is stripped by (?:::class)?
     r"([^)]*)\)",  # optional extra args
     re.IGNORECASE,
 )
@@ -371,6 +371,45 @@ def _resolve_controller_fqn(
     return short_name
 
 
+def _find_brace_end(source: str, brace_start: int) -> int:
+    """Return the position of the matching closing brace (no size cap).
+
+    Skips string literals and comments so inner braces are not miscounted.
+    Returns len(source) if the brace is never closed (malformed file).
+    """
+    depth = 0
+    i = brace_start
+    end = len(source)
+    while i < end:
+        ch = source[i]
+        if ch in ('"', "'"):
+            q = ch
+            i += 1
+            while i < end:
+                c = source[i]
+                if c == '\\':
+                    i += 2
+                    continue
+                if c == q:
+                    break
+                i += 1
+        elif ch == '#' or (ch == '/' and i + 1 < end and source[i + 1] == '/'):
+            while i < end and source[i] != '\n':
+                i += 1
+        elif ch == '/' and i + 1 < end and source[i + 1] == '*':
+            close = source.find('*/', i + 2)
+            i = (close + 2) if close != -1 else end
+            continue
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return end
+
+
 def _parse_route_group_context(source: str) -> list[dict[str, Any]]:
     """Return context dicts for route groups (prefix, middleware, domain, controller).
 
@@ -379,8 +418,10 @@ def _parse_route_group_context(source: str) -> list[dict[str, Any]]:
       - Route::controller(Ctrl::class)->prefix('...')->group(function() {...})
       - Route::prefix('...')->controller(Ctrl::class)->group(function() {...})
 
-    Nested groups are flattened. Each context applies to everything after its
-    opening position in the file.
+    Each context records ``start`` and ``end`` positions (the opening and closing
+    braces of the function body), so nested groups can be correctly identified:
+    only groups whose range contains the route position are active, and their
+    prefixes are *stacked* (outermost first) rather than overwritten.
     """
     contexts = []
 
@@ -452,24 +493,44 @@ def _parse_route_group_context(source: str) -> list[dict[str, Any]]:
                 ctx["controller"] = inline_ctrl_m.group(1) or inline_ctrl_m.group(2) or ""
 
         ctx["start"] = m.start()
+        # The regex ends with `{`; m.end()-1 is the position of that opening brace.
+        ctx["end"] = _find_brace_end(source, m.end() - 1)
         contexts.append(ctx)
 
     return contexts
 
 
 def _get_group_context_for_pos(contexts: list[dict[str, Any]], pos: int) -> dict[str, Any]:
-    """Return the merged group context that covers pos, or an empty context."""
+    """Return the merged group context for pos, stacking nested prefixes.
+
+    Only contexts whose body (start … end) actually contains pos are active.
+    Prefixes are concatenated outermost-first so that
+    ``protect → api → auth`` yields ``/protect/api/auth``.
+    """
+    # Keep only groups whose brace range contains pos
+    active = [
+        ctx for ctx in contexts
+        if ctx.get("start", 0) <= pos <= ctx.get("end", len(""))
+    ]
+    # Sort by start position so outer groups come first
+    active.sort(key=lambda c: c.get("start", 0))
+
     result: dict[str, Any] = {"prefix": "", "middleware": [], "domain": "", "controller": ""}
-    for ctx in contexts:
-        if ctx.get("start", 0) <= pos:
-            if ctx.get("prefix"):
-                result["prefix"] = ctx["prefix"]
-            if ctx.get("middleware"):
-                result["middleware"] = ctx["middleware"]
-            if ctx.get("domain"):
-                result["domain"] = ctx["domain"]
-            if ctx.get("controller"):
-                result["controller"] = ctx["controller"]
+    prefix_parts: list[str] = []
+
+    for ctx in active:
+        if ctx.get("prefix"):
+            prefix_parts.append(ctx["prefix"].strip("/"))
+        if ctx.get("middleware"):
+            result["middleware"] = ctx["middleware"]
+        if ctx.get("domain"):
+            result["domain"] = ctx["domain"]
+        if ctx.get("controller"):
+            result["controller"] = ctx["controller"]
+
+    if prefix_parts:
+        result["prefix"] = "/" + "/".join(p for p in prefix_parts if p)
+
     return result
 
 
@@ -673,6 +734,14 @@ def run(ctx: PipelineContext) -> None:
             if path in ("app/", "app"):
                 composer_namespace = ns
                 break
+
+    # Reset: delete all existing Route nodes and their edges before rebuilding.
+    # Required because URI-based node IDs change when prefix stacking is corrected
+    # or route files are renamed — stale nodes would otherwise remain in the graph.
+    try:
+        db._conn.execute("MATCH (r:Route) DETACH DELETE r")
+    except Exception as exc:
+        logger.debug("Failed to reset Route nodes", error=str(exc))
 
     routes_parsed = 0
     all_routes: list[dict[str, Any]] = []
