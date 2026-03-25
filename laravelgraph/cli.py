@@ -487,7 +487,7 @@ def context(
     # Models used
     try:
         model_rows = db.execute(
-            "MATCH (target)-[:USES_MODEL]->(m) WHERE target.node_id = $id "
+            "MATCH (target)-[:CALLS]->(m:EloquentModel) WHERE target.node_id = $id "
             "RETURN m.fqn AS fqn LIMIT 5",
             {"id": node_id},
         )
