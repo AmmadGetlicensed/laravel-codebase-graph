@@ -296,24 +296,87 @@ NODE_TYPES: list[tuple[str, list[tuple[str, str]]]] = [
         ("batch", "INT32"),
         ("ran_at", "STRING"),
     ]),
+    ("DatabaseConnection", [
+        ("node_id", "STRING"),
+        ("name", "STRING"),       # logical name, e.g. "default", "analytics"
+        ("driver", "STRING"),     # mysql | pgsql
+        ("host", "STRING"),
+        ("port", "INT32"),
+        ("database", "STRING"),   # schema name
+    ]),
     ("DatabaseTable", [
         ("node_id", "STRING"),
         ("name", "STRING"),
-        ("created_in", "STRING"),  # migration file path
+        ("connection", "STRING"),  # which DB connection (empty = migration-derived)
+        ("created_in", "STRING"),  # migration file path (empty = live-introspected)
         ("engine", "STRING"),
         ("charset", "STRING"),
+        ("table_comment", "STRING"),
+        ("source", "STRING"),      # "migration" | "live_db"
+        ("row_count", "INT64"),    # approximate row count from information_schema.TABLE_ROWS
     ]),
     ("DatabaseColumn", [
         ("node_id", "STRING"),
         ("name", "STRING"),
         ("table_name", "STRING"),
+        ("connection", "STRING"),  # which DB connection
         ("type", "STRING"),
+        ("full_type", "STRING"),   # full MySQL type e.g. varchar(255), enum('a','b')
         ("nullable", "BOOLEAN"),
         ("default_value", "STRING"),
         ("unique", "BOOLEAN"),
         ("indexed", "BOOLEAN"),
         ("unsigned", "BOOLEAN"),
-        ("length", "INT32"),
+        ("length", "INT64"),       # INT64 — LONGTEXT/LONGBLOB CHARACTER_MAXIMUM_LENGTH = 4294967295
+        ("column_comment", "STRING"),
+        ("extra", "STRING"),       # e.g. "auto_increment", "on update CURRENT_TIMESTAMP"
+        ("column_key", "STRING"),  # PRI | UNI | MUL | ""
+        # ── Static analysis evidence (populated by phase_26) ──────────────────
+        ("write_path_evidence", "STRING"),  # JSON: [{method_fqn, line, rhs, context}]
+        ("polymorphic_candidate", "BOOLEAN"),
+        ("sibling_type_column", "STRING"),  # companion *_type column name if detected
+        ("guard_conditions", "STRING"),     # JSON: [{condition_var, condition_val, method_fqn, line}]
+    ]),
+    ("InferredRelationship", [
+        ("node_id", "STRING"),
+        ("from_table", "STRING"),
+        ("from_column", "STRING"),
+        ("to_table", "STRING"),      # inferred target table
+        ("to_column", "STRING"),     # inferred target column (usually 'id')
+        ("connection", "STRING"),
+        ("confidence", "FLOAT"),
+        ("evidence_types", "STRING"),   # JSON list: write_path|guard_pattern|column_pair|naming
+        ("conditions", "STRING"),       # JSON list: [{when_var, when_val}]
+        ("evidence_summary", "STRING"), # human-readable for LLM prompt augmentation
+    ]),
+    ("StoredProcedure", [
+        ("node_id", "STRING"),
+        ("name", "STRING"),
+        ("connection", "STRING"),
+        ("database", "STRING"),
+        ("routine_type", "STRING"),   # PROCEDURE | FUNCTION
+        ("parameters", "STRING"),     # JSON list of param definitions
+        ("body_preview", "STRING"),   # first 1000 chars of body
+        ("full_body", "STRING"),      # complete body for SQL parsing
+        ("comment", "STRING"),
+    ]),
+    ("DatabaseView", [
+        ("node_id", "STRING"),
+        ("name", "STRING"),
+        ("connection", "STRING"),
+        ("database", "STRING"),
+        ("definition", "STRING"),     # SELECT statement
+        ("is_updatable", "STRING"),
+    ]),
+    ("UsageContext", [
+        ("node_id", "STRING"),
+        ("source_fqn", "STRING"),     # method/function/procedure FQN
+        ("source_type", "STRING"),    # method | function | procedure | view
+        ("tables_read", "STRING"),    # JSON list of table names
+        ("tables_written", "STRING"), # JSON list of table names
+        ("column_semantics", "STRING"), # JSON: {col: {when, references, meaning}}
+        ("summary", "STRING"),        # LLM-generated natural language description
+        ("confidence", "FLOAT"),
     ]),
 
     # ── Container / Config ───────────────────────────────────────────────────
@@ -535,7 +598,7 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
         ("BladeTemplate", "LivewireComponent"),
     ], [("tag", "STRING"), ("line", "INT32")]),
 
-    # Database
+    # Database — schema structure
     ("MIGRATES_TABLE", [
         ("Migration", "DatabaseTable"),
     ], []),
@@ -550,7 +613,73 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
         ("to_column", "STRING"),
         ("on_delete", "STRING"),
         ("on_update", "STRING"),
+        ("constraint_name", "STRING"),
+        ("enforced", "BOOLEAN"),  # false = live FK vs migration-derived guess
     ]),
+    ("HAS_TABLE", [
+        ("DatabaseConnection", "DatabaseTable"),
+    ], []),
+    ("HAS_PROCEDURE", [
+        ("DatabaseConnection", "StoredProcedure"),
+    ], []),
+    ("HAS_VIEW", [
+        ("DatabaseConnection", "DatabaseView"),
+    ], []),
+
+    # Database — code linkage
+    ("USES_TABLE", [
+        ("EloquentModel", "DatabaseTable"),
+    ], [
+        ("connection", "STRING"),
+    ]),
+    # Universal DB access: covers both Eloquent ad-hoc usage and raw query builder
+    ("QUERIES_TABLE", [
+        ("Method", "DatabaseTable"),
+        ("Function_", "DatabaseTable"),
+    ], [
+        ("operation", "STRING"),    # read | write | readwrite | call
+        ("connection", "STRING"),
+        ("via", "STRING"),          # eloquent | query_builder | raw_sql | procedure
+        ("confidence", "FLOAT"),
+        ("line", "INT32"),
+    ]),
+
+    # Database — procedure access
+    ("PROCEDURE_READS", [
+        ("StoredProcedure", "DatabaseTable"),
+    ], [
+        ("confidence", "FLOAT"),
+    ]),
+    ("PROCEDURE_WRITES", [
+        ("StoredProcedure", "DatabaseTable"),
+    ], [
+        ("confidence", "FLOAT"),
+    ]),
+
+    # Database — relationship inference
+    ("INFERRED_REFERENCES", [
+        ("DatabaseColumn", "DatabaseTable"),
+    ], [
+        ("confidence", "FLOAT"),
+        ("condition", "STRING"),      # "" = unconditional, else "when type='order'"
+        ("evidence_type", "STRING"),  # write_path | guard_pattern | column_pair | naming
+        ("evidence_detail", "STRING"),
+    ]),
+
+    # Database — usage context (semantic layer)
+    ("HAS_USAGE_CONTEXT", [
+        ("Method", "UsageContext"),
+        ("Function_", "UsageContext"),
+        ("StoredProcedure", "UsageContext"),
+    ], []),
+    ("CONTEXT_READS", [
+        ("UsageContext", "DatabaseColumn"),
+        ("UsageContext", "DatabaseTable"),
+    ], [("confidence", "FLOAT")]),
+    ("CONTEXT_WRITES", [
+        ("UsageContext", "DatabaseColumn"),
+        ("UsageContext", "DatabaseTable"),
+    ], [("confidence", "FLOAT")]),
 
     # Config / Env
     ("USES_CONFIG", [

@@ -100,7 +100,7 @@ This graph is stored locally in your project at `.laravelgraph/`. Nothing is sen
 laravelgraph serve /path/to/your/laravel-app
 ```
 
-Starts an MCP server that exposes 19 tools and 9 resources to your AI agent. The agent calls these tools instead of reading files blindly.
+Starts an MCP server that exposes 23 tools and 9 resources to your AI agent. The agent calls these tools instead of reading files blindly.
 
 ### 3. Query (AI agent does this automatically)
 
@@ -234,10 +234,14 @@ Starts an HTTP/SSE server at `http://127.0.0.1:3000` compatible with any MCP cli
 | `laravelgraph_explain` | Natural language explanation of how a feature works end-to-end |
 | `laravelgraph_impact` | Blast radius grouped by depth (direct / indirect / transitive) |
 | `laravelgraph_routes` | Full route map with middleware stacks and controller bindings |
-| `laravelgraph_models` | Eloquent relationship graph with foreign keys and pivot tables |
+| `laravelgraph_models` | Eloquent relationship graph with foreign keys, pivot tables, and linked DB tables |
 | `laravelgraph_request_flow` | Trace `middleware → controller → FormRequest → service → model → event → listener` |
 | `laravelgraph_dead_code` | Unreachable code with Laravel-aware exemptions |
-| `laravelgraph_schema` | Database schema reconstructed from migration files |
+| `laravelgraph_schema` | Database schema (live DB + migrations) with connection info and code access summary |
+| `laravelgraph_db_context` | Full semantic picture of a DB table — columns, FK/inferred relations, code access, lazy LLM annotation |
+| `laravelgraph_resolve_column` | Deep-dive on one column — write-path evidence, polymorphic hints, guard conditions, lazy LLM resolution |
+| `laravelgraph_procedure_context` | Stored procedure body, table access map, and lazy semantic annotation |
+| `laravelgraph_connection_map` | All configured DB connections, live table counts, stored procedures, cross-DB access |
 | `laravelgraph_events` | Event → listener → job dispatch map |
 | `laravelgraph_bindings` | Service container binding map (what's bound, where, how) |
 | `laravelgraph_config_usage` | All code depending on a config key or env variable |
@@ -446,6 +450,15 @@ laravelgraph serve [PATH]            # Start MCP server (stdio, for AI agents)
 laravelgraph watch [PATH]            # Live re-indexing on file changes (standalone)
 ```
 
+### Database Connections
+
+```bash
+laravelgraph db-connections list                # Show all configured DB connections
+laravelgraph db-connections add                 # Interactive wizard to add a connection
+laravelgraph db-connections remove NAME         # Remove a connection (with confirmation)
+laravelgraph db-connections test [NAME]         # Test connectivity (all or a specific connection)
+```
+
 ### Setup and Export
 
 ```bash
@@ -497,9 +510,131 @@ Exits with code 0 on success, 1 on failure — usable in CI.
 
 ---
 
+## Database Intelligence
+
+LaravelGraph includes full database intelligence — not just migration parsing. It connects to your live MySQL/RDS databases and builds a rich semantic picture of every table, including tables that have no Eloquent models and columns with no FK constraints.
+
+### What It Handles
+
+- **Multiple databases** — connect to as many MySQL/RDS instances as you need
+- **Live DB introspection** — reads `information_schema` for tables, columns (with full types), foreign keys, stored procedures, and views
+- **Tables with no Eloquent models** — pure query builder / raw SQL access tracked via `QUERIES_TABLE` edges
+- **Unconstrained `reference_id` columns** — write-path analysis, polymorphic pair detection, guard condition parsing, all at zero AI cost
+- **Stored procedures** — full body stored, table reads/writes detected with regex analysis
+- **Thousands of columns** — lazy analysis: static facts collected at `analyze` time, LLM interpretation generated on first MCP call and cached
+
+### Two-Tier Semantic Architecture
+
+```
+Tier 1 — Schema semantics (what it IS)
+  Collected during analyze (zero AI cost):
+  • Table structure, column types, FK constraints
+  • Write-path evidence: $model->col_id = $expr → which table?
+  • Polymorphic pairs: *_id + *_type columns
+  • Guard conditions: if ($type === 'order') { ...$reference_id... }
+  • Code access patterns: QUERIES_TABLE edges
+
+Tier 2 — Usage semantics (what it DOES in context)
+  Generated lazily on first MCP tool call (cached permanently):
+  • Table semantic annotation (what this table represents)
+  • Column resolution (what this unconstrained column points to)
+  • Procedure annotation (what this procedure does)
+```
+
+### Adding DB Connections
+
+```bash
+# Interactive wizard — name, host, port, database, user, password, SSL
+laravelgraph db-connections add
+
+# List all configured connections
+laravelgraph db-connections list
+
+# Test connectivity
+laravelgraph db-connections test
+
+# Remove a connection
+laravelgraph db-connections remove my-connection
+```
+
+Connections are stored in `.laravelgraph/config.json` (project-level) or `~/.laravelgraph/config.json` (global). Passwords can reference environment variables using `${ENV_VAR}` syntax.
+
+```json
+{
+  "databases": [
+    {
+      "name": "main",
+      "host": "my-rds.cluster.us-east-1.rds.amazonaws.com",
+      "port": 3306,
+      "database": "myapp_production",
+      "username": "readonly_user",
+      "password": "${DB_PASSWORD}",
+      "ssl": true,
+      "analyze_procedures": true,
+      "analyze_views": true
+    },
+    {
+      "name": "analytics",
+      "host": "analytics-db.internal",
+      "database": "analytics",
+      "username": "laravelgraph",
+      "password": "${ANALYTICS_DB_PASSWORD}"
+    }
+  ]
+}
+```
+
+Then re-analyze:
+
+```bash
+laravelgraph analyze /path/to/project --full
+```
+
+### DB MCP Tools
+
+Once connected, AI agents can ask deep questions about your database:
+
+```
+laravelgraph_connection_map()
+→ All connections, table counts, stored procedures, cross-DB access
+
+laravelgraph_schema(connection="analytics")
+→ Browse tables on a specific connection
+
+laravelgraph_db_context("orders")
+→ Full picture: columns (with full types), FK constraints, inferred refs,
+  code access patterns, linked Eloquent models, lazy LLM annotation
+
+laravelgraph_resolve_column("activity_logs", "reference_id")
+→ Write-path evidence: $model->reference_id = $order->id (conf 85%)
+  Polymorphic: sibling type column is `reference_type`
+  Guard conditions: if ($type === 'order'), if ($type === 'invoice')
+  Lazy LLM resolution: "This column is a polymorphic foreign key..."
+
+laravelgraph_procedure_context("calculate_order_totals")
+→ Reads: orders, order_items. Writes: orders.
+  Full body (truncated). Lazy LLM annotation.
+```
+
+### How `reference_id` columns work
+
+Columns like `reference_id`, `entity_id`, `owner_id` that have no FK constraint are automatically analyzed:
+
+1. **Write-path analysis** — LaravelGraph scans all PHP for `$model->reference_id = $expr`. If `$expr` is `$order->id`, the target is inferred as `orders.id` with confidence 0.85.
+
+2. **Polymorphic pair detection** — If a table has both `reference_id` and `reference_type`, both columns are flagged as `polymorphic_candidate = true` with `sibling_type_column` pointing at each other.
+
+3. **Guard conditions** — If PHP code has `if ($reference_type === 'order') { ...$reference_id... }`, the guard condition is stored on the column. This lets the LLM reconstruct the full polymorphic map.
+
+4. **`INFERRED_REFERENCES` edges** — When a target table can be confidently inferred from write-path evidence, a graph edge is created with a confidence score. These edges are queryable just like FK edges.
+
+All of this is collected statically during `analyze` — zero AI cost. The LLM is only invoked when you call `laravelgraph_resolve_column`, and only once (cached thereafter).
+
+---
+
 ## Analysis Pipeline
 
-LaravelGraph runs 23 phases in sequence during `analyze`:
+LaravelGraph runs 26 phases in sequence during `analyze`:
 
 | Phase | Name | What It Does |
 |-------|------|-------------|
@@ -526,6 +661,9 @@ LaravelGraph runs 23 phases in sequence during `analyze`:
 | 21 | Dependency Injection | Constructor and method injection graph |
 | 22 | API Contracts | FormRequest validation rules, API Resource shapes |
 | 23 | Scheduled Tasks | Parses Kernel.php schedule definitions |
+| 24 | Live DB Introspection | Connects to MySQL/RDS, reads `information_schema` — tables, columns, stored procedures, views |
+| 25 | Model-Table Linking | Links EloquentModel nodes to DatabaseTable nodes (live DB first, migration fallback) |
+| 26 | DB Access Analysis | Scans PHP for `DB::table()`, raw SQL, Eloquent static calls — creates QUERIES_TABLE edges; detects write-path evidence, polymorphic columns, guard conditions |
 
 ---
 

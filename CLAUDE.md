@@ -27,36 +27,42 @@ pipx reinstall laravelgraph   # After any source changes — required because MC
 
 ## Architecture
 
-LaravelGraph is a **23-phase analysis pipeline** that indexes a Laravel/PHP codebase into a local KuzuDB graph database, then exposes it via an MCP server to AI agents.
+LaravelGraph is a **26-phase analysis pipeline** that indexes a Laravel/PHP codebase into a local KuzuDB graph database, then exposes it via an MCP server to AI agents.
 
 ### Data flow
 
 ```
 Laravel project on disk
-  → Pipeline (23 phases) → .laravelgraph/graph.kuzu  (KuzuDB)
-                         → .laravelgraph/summaries.json (LLM summary cache)
+  → Pipeline (26 phases) → .laravelgraph/graph.kuzu  (KuzuDB)
+                         → .laravelgraph/summaries.json (LLM symbol summary cache)
+                         → .laravelgraph/db_context.json (LLM DB context cache)
   → MCP server (FastMCP) ← Claude Code / other agents
+MySQL/RDS databases
+  → Phase 24 (live introspection) → graph nodes + edges
 ```
 
 ### Key packages
 
-- **`laravelgraph/pipeline/`** — 23 sequential phases. Each is a single `.py` file with a `run(ctx: PipelineContext)` function. `PipelineContext` (in `orchestrator.py`) is the shared state object carrying `db`, `config`, parsed file maps, and the FQN index.
+- **`laravelgraph/pipeline/`** — 26 sequential phases. Each is a single `.py` file with a `run(ctx: PipelineContext)` function. `PipelineContext` (in `orchestrator.py`) is the shared state object carrying `db`, `config`, parsed file maps, and the FQN index.
+  - Phases 24–26 handle database intelligence: live DB introspection (PyMySQL), model-table linking, and DB access analysis (static, zero AI cost).
 
 - **`laravelgraph/core/`** — `graph.py` wraps KuzuDB (CRUD + Cypher), `schema.py` defines 50+ node types and 100+ relationship types, `registry.py` manages the global `~/.laravelgraph/repos.json` index.
 
 - **`laravelgraph/parsers/`** — PHP (tree-sitter + regex fallback), Blade templates, and Composer JSON parsing.
 
-- **`laravelgraph/mcp/server.py`** — The FastMCP server. All 19 MCP tools and 9 resources live here as `@mcp.tool()` / `@mcp.resource()` decorated functions. This is the largest file (~90KB).
+- **`laravelgraph/mcp/server.py`** — The FastMCP server. All 23 MCP tools and 9 resources live here as `@mcp.tool()` / `@mcp.resource()` decorated functions.
 
 - **`laravelgraph/mcp/summarize.py`** — 18-provider LLM registry (`PROVIDER_REGISTRY`). All OpenAI-compatible providers share `_call_openai_compat()`; only Anthropic uses its native SDK. `generate_summary()` returns `(str | None, str)` — never raises.
 
 - **`laravelgraph/mcp/cache.py`** — `SummaryCache`: file-backed JSON sidecar at `.laravelgraph/summaries.json`. Mtime-based auto-invalidation — if the source file changes, the cached summary is discarded on the next tool call.
 
+- **`laravelgraph/mcp/db_cache.py`** — `DBContextCache`: file-backed JSON sidecar at `.laravelgraph/db_context.json`. Hash-based invalidation — if the table's column structure changes, the cached annotation is discarded. Stores table, column, and procedure annotations.
+
 - **`laravelgraph/search/hybrid.py`** — BM25 + vector (fastembed) + fuzzy (rapidfuzz) with RRF ranking.
 
-- **`laravelgraph/config.py`** — Pydantic config model. `SummaryConfig` uses `api_keys: dict`, `models: dict`, `base_urls: dict` (not flat per-provider fields). Config priority: env vars → `.laravelgraph/config.json` → `~/.laravelgraph/config.json` → defaults.
+- **`laravelgraph/config.py`** — Pydantic config model. `SummaryConfig` uses `api_keys: dict`, `models: dict`, `base_urls: dict`. `DatabaseConnectionConfig` per-connection config. Config priority: env vars → `.laravelgraph/config.json` → `~/.laravelgraph/config.json` → defaults.
 
-- **`laravelgraph/cli.py`** — Typer application. All CLI commands including `analyze`, `serve`, `doctor`, `configure`, `providers`, `status`, `query`, `context`, `impact`, `routes`, `models`, `events`, `schema`, `bindings`, `dead-code`, `warm`.
+- **`laravelgraph/cli.py`** — Typer application. All CLI commands including `analyze`, `serve`, `doctor`, `configure`, `providers`, `status`, `query`, `context`, `impact`, `routes`, `models`, `events`, `schema`, `bindings`, `dead-code`, `warm`, and `db-connections` sub-commands.
 
 ### Storage layout (per project)
 
@@ -64,10 +70,11 @@ Laravel project on disk
 <project>/.laravelgraph/
   graph.kuzu/         KuzuDB database (directory)
   summaries.json      LLM-generated semantic summaries (mtime-invalidated)
-  config.json         Project-level config overrides
+  db_context.json     LLM-generated DB table/column/procedure annotations (hash-invalidated)
+  config.json         Project-level config overrides (including databases[])
 ~/.laravelgraph/
   repos.json          Global registry of indexed projects
-  config.json         Global config defaults
+  config.json         Global config defaults (including databases[])
   logs/               Structured logs
 ```
 

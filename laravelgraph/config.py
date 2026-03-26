@@ -65,6 +65,30 @@ class MCPConfig(BaseModel):
     log_requests: bool = True
 
 
+class DatabaseConnectionConfig(BaseModel):
+    """Configuration for a single live database connection to introspect.
+
+    Supports MySQL and PostgreSQL. Either supply a full ``dsn`` string or the
+    individual ``host`` / ``port`` / ``database`` / ``username`` / ``password``
+    fields.  Password values may reference environment variables using the
+    ``${VAR_NAME}`` syntax — they are resolved at connection time.
+    """
+
+    name: str                           # logical name matching Laravel connection key
+    driver: str = "mysql"               # mysql | pgsql
+    host: str = "127.0.0.1"
+    port: int = 3306
+    database: str = ""                  # schema / database name
+    username: str = ""
+    password: str = ""                  # may use ${ENV_VAR} syntax
+    dsn: str = ""                       # full DSN overrides individual fields
+    analyze_procedures: bool = True
+    analyze_views: bool = True
+    analyze_triggers: bool = False
+    ssl: bool = False                   # enable SSL (recommended for AWS RDS)
+    query_cache_ttl: int = 300          # seconds to cache SELECT results (0 = disable)
+
+
 class SummaryConfig(BaseModel):
     """Configuration for lazy semantic summary caching.
 
@@ -99,6 +123,7 @@ class Config(BaseModel):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     log: LogConfig = Field(default_factory=LogConfig)
     summary: SummaryConfig = Field(default_factory=SummaryConfig)
+    databases: list[DatabaseConnectionConfig] = Field(default_factory=list)
 
     @field_validator("log", mode="before")
     @classmethod

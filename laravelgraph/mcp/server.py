@@ -6,6 +6,7 @@ Supports both stdio and HTTP/SSE transports.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -15,6 +16,8 @@ from laravelgraph.config import Config, index_dir
 from laravelgraph.core.graph import GraphDB
 from laravelgraph.logging import configure, get_logger, get_mcp_logger
 from laravelgraph.mcp.cache import SummaryCache
+from laravelgraph.mcp.db_cache import DBContextCache
+from laravelgraph.mcp.query_cache import QueryResultCache, validate_sql
 from laravelgraph.mcp.summarize import generate_summary
 
 logger = get_logger(__name__)
@@ -50,11 +53,17 @@ Use these tools to understand any Laravel codebase:
 - laravelgraph_explain: Natural language explanation of how a feature works end-to-end
 - laravelgraph_impact: Find blast radius of changes
 - laravelgraph_routes: Explore the route table
-- laravelgraph_models: Explore Eloquent model relationships
+- laravelgraph_models: Explore Eloquent model relationships (shows linked DB tables)
 - laravelgraph_request_flow: Trace a complete HTTP request lifecycle
 - laravelgraph_events: Explore the event/listener/job dispatch graph
 - laravelgraph_dead_code: Find unreachable code
-- laravelgraph_schema: Database schema from migrations
+- laravelgraph_schema: Database schema (live DB + migrations) with code access summary
+- laravelgraph_db_context: Full semantic picture of a DB table — columns, FK/inferred relations, code access patterns, lazy LLM annotation
+- laravelgraph_resolve_column: Deep-dive on a single column — write-path evidence, polymorphic hints, guard conditions, lazy LLM resolution
+- laravelgraph_procedure_context: Stored procedure details with lazy semantic annotation
+- laravelgraph_connection_map: Map of all configured DB connections, table counts, cross-DB access
+- laravelgraph_db_query: Run a live read-only SQL query (SELECT/SHOW/DESCRIBE) — use this to see actual data values, lookup table rows, enum meanings
+- laravelgraph_db_impact: Trace what fires when a table is written to — events dispatched, listeners, downstream jobs. Use this for "when X happens in the DB, what runs in code?"
 - laravelgraph_bindings: Service container binding map
 - laravelgraph_config_usage: Config/env dependency map
 - laravelgraph_detect_changes: Map git diff to affected symbols
@@ -65,11 +74,29 @@ Use these tools to understand any Laravel codebase:
 IMPORTANT: For understanding any feature, ALWAYS call laravelgraph_feature_context FIRST.
 It returns routes + controller source + models + events + config in a single call,
 saving you from making 10+ individual tool calls.
+
+For database questions: use laravelgraph_connection_map first to see all DBs, then
+laravelgraph_db_context for a specific table. For mystery columns like reference_id,
+use laravelgraph_resolve_column for inferred relationships and polymorphic detection.
+To see actual data values (lookup rows, enum IDs, reference data), use laravelgraph_db_query.
+For cross-layer tracing ("when this table is written to, what events/jobs fire?"), use laravelgraph_db_impact.
 """,
     )
 
     # Lazy semantic summary cache — stored in .laravelgraph/summaries.json
     _summary_cache = SummaryCache(index_dir(project_root))
+
+    # Lazy DB context cache — stored in .laravelgraph/db_context.json
+    _db_cache = DBContextCache(index_dir(project_root))
+
+    # TTL-based query result cache — stored in .laravelgraph/query_cache.json
+    _query_cache = QueryResultCache(index_dir(project_root))
+
+    # Evict expired query cache entries on startup — cheap disk cleanup so
+    # stale results from previous sessions don't accumulate indefinitely.
+    _expired_on_startup = _query_cache.evict_expired()
+    if _expired_on_startup:
+        logger.info("Query cache: evicted expired entries on startup", count=_expired_on_startup)
 
     db_ref: list[GraphDB | None] = [None]
 
@@ -93,6 +120,81 @@ saving you from making 10+ individual tool calls.
 
     def _next_steps(*hints: str) -> str:
         return "\n\n---\n**Next steps:**\n" + "\n".join(f"- {h}" for h in hints)
+
+    # ── Discriminator column helpers ─────────────────────────────────────────
+
+    def _is_discriminator_column(col_name: str, col_type: str, guard_conditions: str = "") -> bool:
+        """Return True if this column likely encodes an enum/type/status discriminator."""
+        name = col_name.lower()
+        ctype = col_type.lower()
+        # Has guard conditions = definitely used as a discriminator
+        if guard_conditions and guard_conditions not in ("[]", "null", "", "None"):
+            return True
+        # Name pattern: *_type, *_status, *_state, *_kind, *_mode, is_*, has_*
+        if any(name.endswith(s) for s in ("_type", "_status", "_state", "_kind", "_mode", "_flag")):
+            return True
+        if name.startswith("is_") or name.startswith("has_"):
+            return True
+        # Type pattern: small integer types and enum are typically discriminators
+        if any(t in ctype for t in ("tinyint", "smallint", "enum")):
+            return True
+        return False
+
+    def _fetch_col_distribution(
+        table: str,
+        column: str,
+        conn_cfg: Any,
+    ) -> list[dict] | None:
+        """Fetch value distribution for a discriminator column via QueryResultCache.
+
+        Returns a list of {val, cnt} dicts ordered by value, or None on failure.
+        Results are cached using the standard query TTL.
+        """
+        safe_table = table.replace("`", "")
+        safe_col = column.replace("`", "")
+        sql = (
+            f"SELECT `{safe_col}` AS val, COUNT(*) AS cnt "
+            f"FROM `{safe_table}` "
+            f"GROUP BY `{safe_col}` "
+            f"ORDER BY `{safe_col}` LIMIT 100"
+        )
+        ttl = getattr(conn_cfg, "query_cache_ttl", 300)
+        key = _query_cache.make_key(conn_cfg.name, sql)
+
+        # Check cache first
+        cached = _query_cache.get(key, ttl=ttl)
+        if cached is not None:
+            return cached.get("rows", [])
+
+        if ttl == 0:
+            return None  # caching disabled — don't hit DB for a non-essential enrichment
+
+        try:
+            from laravelgraph.pipeline.phase_24_db_introspect import _connect_mysql
+            mc = _connect_mysql(conn_cfg)
+            try:
+                with mc.cursor() as cur:
+                    cur.execute(sql)
+                    raw = cur.fetchall()
+                    cols_desc = [d[0] for d in (cur.description or [])]
+                rows_data = [dict(zip(cols_desc, row)) for row in raw]
+            finally:
+                try:
+                    mc.close()
+                except Exception:
+                    pass
+            _query_cache.set(key, sql, conn_cfg.name, cols_desc, rows_data, ttl=ttl)
+            return rows_data
+        except Exception as e:
+            logger.debug("_fetch_col_distribution failed", table=table, column=column, error=str(e))
+            return None
+
+    def _get_conn_cfg_for_table(conn_name: str) -> Any | None:
+        """Return the DatabaseConnectionConfig for a given connection name, or None."""
+        for c in (cfg.databases if hasattr(cfg, "databases") else []):
+            if c.name == conn_name:
+                return c
+        return None
 
     # ── Tool: laravelgraph_query ─────────────────────────────────────────────
 
@@ -591,6 +693,22 @@ saving you from making 10+ individual tool calls.
             if m.get("m.soft_deletes"):
                 lines.append("- **Soft Deletes:** Yes")
 
+            # Linked DB table (live or migration-derived)
+            try:
+                linked_tables = db.execute(
+                    "MATCH (m:EloquentModel)-[:USES_TABLE]->(t:DatabaseTable) WHERE m.fqn = $fqn "
+                    "RETURN t.name AS tname, t.connection AS tconn, t.source AS tsrc, t.row_count AS rows",
+                    {"fqn": fqn},
+                )
+                if linked_tables:
+                    for lt in linked_tables:
+                        source = lt.get("tsrc", "") or "migration"
+                        conn = f" on `{lt.get('tconn')}`" if lt.get("tconn") else ""
+                        rows = f" (~{lt.get('rows'):,} rows)" if lt.get("rows") else ""
+                        lines.append(f"- **DB Table:** `{lt.get('tname')}`{conn}{rows} _{source}_")
+            except Exception:
+                pass
+
             # Relationships
             try:
                 rels = db.execute(
@@ -613,7 +731,7 @@ saving you from making 10+ individual tool calls.
             lines.append("")
 
         return "\n".join(lines) + _next_steps(
-            "Use laravelgraph_schema to see the database schema for model tables",
+            "Use laravelgraph_db_context(table) for full DB table analysis (columns, access patterns, semantics)",
             "Use laravelgraph_context(ModelName) to see which controllers/jobs use this model",
             "Use laravelgraph_impact(ModelName) to see the blast radius of changing this model",
         )
@@ -906,60 +1024,1165 @@ saving you from making 10+ individual tool calls.
     # ── Tool: laravelgraph_schema ─────────────────────────────────────────────
 
     @mcp.tool()
-    def laravelgraph_schema(table_name: str = "") -> str:
-        """Database schema graph with table relationships.
+    def laravelgraph_schema(table_name: str = "", connection: str = "") -> str:
+        """Database schema — live DB introspection preferred, migration fallback.
 
         Args:
-            table_name: Optional — filter to a specific table
+            table_name: Optional — filter to a specific table name
+            connection: Optional — filter to a specific DB connection name
         """
         db = _db()
         start = time.perf_counter()
 
         try:
-            if table_name:
+            if table_name and connection:
                 tables = db.execute(
-                    "MATCH (t:DatabaseTable) WHERE t.name = $name RETURN t.* LIMIT 1",
+                    "MATCH (t:DatabaseTable) WHERE t.name = $name AND t.connection = $conn RETURN t.* LIMIT 5",
+                    {"name": table_name, "conn": connection},
+                )
+                # Fallback: match just by name if connection-specific misses
+                if not tables:
+                    tables = db.execute(
+                        "MATCH (t:DatabaseTable) WHERE t.name = $name RETURN t.* LIMIT 5",
+                        {"name": table_name},
+                    )
+            elif table_name:
+                tables = db.execute(
+                    "MATCH (t:DatabaseTable) WHERE t.name = $name RETURN t.* LIMIT 5",
                     {"name": table_name},
                 )
+            elif connection:
+                tables = db.execute(
+                    "MATCH (t:DatabaseTable) WHERE t.connection = $conn RETURN t.* LIMIT 60",
+                    {"conn": connection},
+                )
             else:
-                tables = db.execute("MATCH (t:DatabaseTable) RETURN t.* LIMIT 50")
+                tables = db.execute("MATCH (t:DatabaseTable) RETURN t.* LIMIT 60")
         except Exception as e:
             return f"Error: {e}"
 
         elapsed = (time.perf_counter() - start) * 1000
-        _log_tool("laravelgraph_schema", {"table": table_name}, len(tables), elapsed)
+        _log_tool("laravelgraph_schema", {"table": table_name, "connection": connection}, len(tables), elapsed)
 
         if not tables:
-            return "No database tables found. Ensure migrations are present and the project has been indexed."
+            hint = f" (connection: {connection})" if connection else ""
+            return (
+                f"No database tables found{hint}. "
+                "Ensure migrations are present and the project has been indexed. "
+                "For live DB data, configure a connection with: laravelgraph db-connections add"
+            )
+
+        # Group tables by connection for display
+        by_conn: dict[str, list[dict]] = {}
+        for t in tables:
+            conn_name = t.get("t.connection", "") or "migration"
+            by_conn.setdefault(conn_name, []).append(t)
 
         lines = [f"## Database Schema ({len(tables)} tables)\n"]
-        for t in tables:
-            t_name = t.get("t.name", "?")
-            lines.append(f"### `{t_name}`")
-            try:
-                cols = db.execute(
-                    "MATCH (t:DatabaseTable)-[:HAS_COLUMN]->(c:DatabaseColumn) WHERE t.name = $name "
-                    "RETURN c.name AS col, c.type AS type, c.nullable AS nullable, "
-                    "c.unique AS uniq, c.default_value AS default_val",
-                    {"name": t_name},
-                )
-                if cols:
-                    lines.append("| Column | Type | Nullable | Unique | Default |")
-                    lines.append("|--------|------|----------|--------|---------|")
-                    for col in cols:
-                        nullable = "Yes" if col.get("nullable") else "No"
-                        unique = "Yes" if col.get("uniq") else ""
-                        default = col.get("default_val", "") or ""
-                        lines.append(
-                            f"| `{col.get('col')}` | {col.get('type', '?')} | {nullable} | {unique} | {default} |"
-                        )
-            except Exception:
-                pass
-            lines.append("")
+
+        for conn_name, conn_tables in sorted(by_conn.items()):
+            source_label = "live DB" if conn_name != "migration" else "migrations"
+            lines.append(f"### Connection: `{conn_name}` ({source_label}, {len(conn_tables)} tables)\n")
+
+            for t in conn_tables:
+                t_name = t.get("t.name", "?")
+                row_count = t.get("t.row_count")
+                comment = t.get("t.table_comment", "") or ""
+                header = f"#### `{t_name}`"
+                if row_count is not None:
+                    header += f"  _(~{row_count:,} rows)_"
+                if comment:
+                    header += f"  — {comment}"
+                lines.append(header)
+
+                # Check if any model uses this table
+                try:
+                    nid = t.get("t.node_id", "")
+                    model_rows = db.execute(
+                        "MATCH (m:EloquentModel)-[:USES_TABLE]->(t:DatabaseTable) "
+                        "WHERE t.node_id = $nid RETURN m.name AS mname LIMIT 3",
+                        {"nid": nid},
+                    ) if nid else []
+                    if model_rows:
+                        model_list = ", ".join(f"`{r.get('mname')}`" for r in model_rows)
+                        lines.append(f"- **Model(s):** {model_list}")
+                except Exception:
+                    pass
+
+                try:
+                    cols = db.execute(
+                        "MATCH (t:DatabaseTable)-[:HAS_COLUMN]->(c:DatabaseColumn) WHERE t.node_id = $nid "
+                        "RETURN c.name AS col, c.type AS type, c.full_type AS full_type, "
+                        "c.nullable AS nullable, c.unique AS uniq, c.default_value AS default_val, "
+                        "c.column_key AS col_key, c.polymorphic_candidate AS poly",
+                        {"nid": t.get("t.node_id", "")},
+                    ) if t.get("t.node_id") else db.execute(
+                        "MATCH (t:DatabaseTable)-[:HAS_COLUMN]->(c:DatabaseColumn) WHERE t.name = $name "
+                        "RETURN c.name AS col, c.type AS type, c.full_type AS full_type, "
+                        "c.nullable AS nullable, c.unique AS uniq, c.default_value AS default_val, "
+                        "c.column_key AS col_key, c.polymorphic_candidate AS poly",
+                        {"name": t_name},
+                    )
+                    if cols:
+                        lines.append("| Column | Type | Nullable | Key | Poly? |")
+                        lines.append("|--------|------|----------|-----|-------|")
+                        for col in cols:
+                            nullable = "Yes" if col.get("nullable") else "No"
+                            full_t = col.get("full_type") or col.get("type", "?")
+                            key = col.get("col_key", "") or ""
+                            poly = "✓" if col.get("poly") else ""
+                            lines.append(
+                                f"| `{col.get('col')}` | {full_t} | {nullable} | {key} | {poly} |"
+                            )
+                except Exception:
+                    pass
+
+                # Show QUERIES_TABLE summary (which code accesses this table)
+                try:
+                    access_rows = db.execute(
+                        "MATCH (src)-[q:QUERIES_TABLE]->(t:DatabaseTable) WHERE t.node_id = $nid "
+                        "RETURN src.name AS src_name, q.operation AS op, q.via AS via LIMIT 6",
+                        {"nid": t.get("t.node_id", "")},
+                    ) if t.get("t.node_id") else []
+                    if access_rows:
+                        lines.append("\n**Code access:**")
+                        for ar in access_rows:
+                            lines.append(f"- `{ar.get('src_name')}` — {ar.get('op', '?')} via {ar.get('via', '?')}")
+                except Exception:
+                    pass
+
+                lines.append("")
 
         return "\n".join(lines) + _next_steps(
+            "Use laravelgraph_db_context(table) for full semantic analysis of any table",
             "Use laravelgraph_models to see which Eloquent models correspond to these tables",
-            "Use laravelgraph_context(ModelName) to see how a model uses its table",
+            "Use laravelgraph_connection_map to see all DB connections and cross-DB access",
+        )
+
+    # ── Tool: laravelgraph_db_context ────────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_db_context(table: str, connection: str = "") -> str:
+        """Full semantic picture of a database table.
+
+        Returns column details, FK and inferred relationships, which code
+        accesses this table, and a lazy LLM-generated semantic annotation
+        (generated once on first call, cached thereafter).
+
+        Args:
+            table: Table name (e.g. "orders")
+            connection: DB connection name (optional — omit if only one connection)
+        """
+        db = _db()
+        start = time.perf_counter()
+
+        # Find the table node — prefer live DB over migration
+        try:
+            if connection:
+                rows = db.execute(
+                    "MATCH (t:DatabaseTable) WHERE t.name = $name AND t.connection = $conn RETURN t.* LIMIT 1",
+                    {"name": table, "conn": connection},
+                )
+            else:
+                # Prefer live DB node (has connection set), fall back to migration node
+                rows = db.execute(
+                    "MATCH (t:DatabaseTable) WHERE t.name = $name RETURN t.* LIMIT 5",
+                    {"name": table},
+                )
+                # Sort: live DB nodes first (have non-empty connection)
+                rows = sorted(rows, key=lambda r: (0 if r.get("t.connection") else 1))
+        except Exception as e:
+            return f"Error querying table: {e}"
+
+        if not rows:
+            return (
+                f"Table `{table}` not found. "
+                "Run `laravelgraph analyze` to index the project. "
+                "For live DB tables, add a connection with `laravelgraph db-connections add`."
+            )
+
+        t = rows[0]
+        t_node_id = t.get("t.node_id", "")
+        t_name = t.get("t.name", table)
+        conn_name = t.get("t.connection", "") or "migration"
+        source = t.get("t.source", "migration")
+        row_count = t.get("t.row_count")
+        comment = t.get("t.table_comment", "") or ""
+
+        lines = [f"## Table: `{t_name}` (connection: `{conn_name}`, source: {source})\n"]
+        if row_count is not None:
+            lines.append(f"- **Approximate row count:** {row_count:,}")
+        if comment:
+            lines.append(f"- **Comment:** {comment}")
+
+        # ── Columns ───────────────────────────────────────────────────────────
+        cols: list[dict] = []
+        try:
+            cols = db.execute(
+                "MATCH (t:DatabaseTable)-[:HAS_COLUMN]->(c:DatabaseColumn) WHERE t.node_id = $nid "
+                "RETURN c.node_id AS col_id, c.name AS col, c.type AS type, c.full_type AS full_type, "
+                "c.nullable AS nullable, c.column_key AS col_key, c.default_value AS def_val, "
+                "c.column_comment AS col_comment, c.polymorphic_candidate AS poly, "
+                "c.sibling_type_column AS sibling_type, c.write_path_evidence AS wpe, "
+                "c.guard_conditions AS guard",
+                {"nid": t_node_id},
+            )
+        except Exception:
+            pass
+
+        if cols:
+            lines.append("\n### Columns\n")
+            lines.append("| Column | Type | Nullable | Key | Notes |")
+            lines.append("|--------|------|----------|-----|-------|")
+            for col in cols:
+                full_t = col.get("full_type") or col.get("type", "?")
+                nullable = "Yes" if col.get("nullable") else "No"
+                key = col.get("col_key", "") or ""
+                notes_parts = []
+                if col.get("col_comment"):
+                    notes_parts.append(col["col_comment"])
+                if col.get("poly"):
+                    sibling = col.get("sibling_type", "")
+                    notes_parts.append(f"polymorphic (type col: `{sibling}`)" if sibling else "polymorphic candidate")
+                if col.get("def_val"):
+                    notes_parts.append(f"default={col['def_val']}")
+                notes = "; ".join(notes_parts)
+                lines.append(f"| `{col.get('col')}` | {full_t} | {nullable} | {key} | {notes} |")
+
+        # ── Value semantics for discriminator columns ──────────────────────────
+        # For columns like type, status, state — fetch actual value distribution
+        # so agents can see real enum values instead of guessing from names.
+        conn_cfg_obj = _get_conn_cfg_for_table(conn_name) if conn_name != "migration" else None
+        if conn_cfg_obj and cols:
+            disc_cols = [
+                c for c in cols
+                if _is_discriminator_column(
+                    c.get("col", ""),
+                    c.get("full_type") or c.get("type", ""),
+                    c.get("guard", "") or "",
+                )
+            ]
+            if disc_cols:
+                value_sections: list[str] = []
+                for dc in disc_cols[:5]:  # cap at 5 discriminator cols per table
+                    dist = _fetch_col_distribution(t_name, dc.get("col", ""), conn_cfg_obj)
+                    if dist:
+                        col_name_d = dc.get("col", "")
+                        guard_raw_d = dc.get("guard", "") or ""
+                        guard_vals: list[str] = []
+                        try:
+                            parsed = json.loads(guard_raw_d) if guard_raw_d else []
+                            guard_vals = [str(g) for g in (parsed if isinstance(parsed, list) else [parsed])]
+                        except Exception:
+                            pass
+                        rows_str = ", ".join(
+                            f"`{r.get('val')}` ({r.get('cnt'):,} rows)" for r in dist[:20]
+                        )
+                        sec = f"**`{col_name_d}`**: {rows_str}"
+                        if guard_vals:
+                            sec += f"\n  - Code checks: {', '.join(guard_vals[:8])}"
+                        value_sections.append(sec)
+                if value_sections:
+                    lines.append("\n### Value Semantics (discriminator columns — live DB distribution)\n")
+                    for vs in value_sections:
+                        lines.append(vs)
+                        lines.append("")
+
+        # ── FK / inferred relationships ───────────────────────────────────────
+        try:
+            fk_rows = db.execute(
+                "MATCH (src:DatabaseTable)-[r:REFERENCES_TABLE]->(tgt:DatabaseTable) "
+                "WHERE src.node_id = $nid "
+                "RETURN r.source_column AS src_col, tgt.name AS tgt_table, r.target_column AS tgt_col, "
+                "r.enforced AS enforced, r.constraint_name AS cname",
+                {"nid": t_node_id},
+            )
+            if fk_rows:
+                lines.append("\n### Foreign Keys (enforced)\n")
+                for fk in fk_rows:
+                    enforced = "" if fk.get("enforced") else " ⚠ not enforced"
+                    lines.append(
+                        f"- `{fk.get('src_col')}` → `{fk.get('tgt_table')}.{fk.get('tgt_col')}`{enforced}"
+                        + (f" (constraint: {fk.get('cname')})" if fk.get("cname") else "")
+                    )
+        except Exception:
+            pass
+
+        # ── Inferred relationships (from write-path analysis) ─────────────────
+        try:
+            inferred_rows = db.execute(
+                "MATCH (c:DatabaseColumn)-[r:INFERRED_REFERENCES]->(tgt:DatabaseTable) "
+                "WHERE c.node_id STARTS WITH $prefix "
+                "RETURN c.name AS col_name, tgt.name AS tgt_table, r.confidence AS conf, "
+                "r.condition AS cond, r.evidence_type AS ev_type",
+                {"prefix": f"col:{conn_name}:{t_name}."},
+            ) if t_node_id else []
+            if inferred_rows:
+                lines.append("\n### Inferred References (static write-path analysis)\n")
+                for ir in sorted(inferred_rows, key=lambda r: -(r.get("conf") or 0)):
+                    conf = ir.get("conf", 0) or 0
+                    cond = f" when `{ir.get('cond')}`" if ir.get("cond") else ""
+                    lines.append(
+                        f"- `{ir.get('col_name')}` → `{ir.get('tgt_table')}`  "
+                        f"confidence={conf:.0%}{cond}  _{ir.get('ev_type', '')}_"
+                    )
+        except Exception:
+            pass
+
+        # ── Code access (QUERIES_TABLE) ───────────────────────────────────────
+        try:
+            access_rows = db.execute(
+                "MATCH (src)-[q:QUERIES_TABLE]->(t:DatabaseTable) WHERE t.node_id = $nid "
+                "RETURN src.name AS src_name, src.fqn AS src_fqn, q.operation AS op, "
+                "q.via AS via, q.line AS line LIMIT 20",
+                {"nid": t_node_id},
+            )
+            if access_rows:
+                lines.append("\n### Code Access Patterns\n")
+                by_op: dict[str, list] = {}
+                for ar in access_rows:
+                    op = ar.get("op", "read") or "read"
+                    by_op.setdefault(op, []).append(ar)
+                for op, op_rows in sorted(by_op.items()):
+                    lines.append(f"**{op.upper()}:**")
+                    for ar in op_rows[:6]:
+                        via = ar.get("via", "") or ""
+                        line = f" (line {ar.get('line')})" if ar.get("line") else ""
+                        lines.append(f"- `{ar.get('src_fqn') or ar.get('src_name')}`{line} via {via}")
+        except Exception:
+            pass
+
+        # ── Linked models ─────────────────────────────────────────────────────
+        try:
+            model_rows = db.execute(
+                "MATCH (m:EloquentModel)-[:USES_TABLE]->(t:DatabaseTable) WHERE t.node_id = $nid "
+                "RETURN m.name AS mname, m.fqn AS mfqn",
+                {"nid": t_node_id},
+            )
+            if model_rows:
+                lines.append("\n### Eloquent Models\n")
+                for mr in model_rows:
+                    lines.append(f"- `{mr.get('mname')}` (`{mr.get('mfqn')}`)")
+        except Exception:
+            pass
+
+        # ── Lazy LLM semantic annotation ──────────────────────────────────────
+        col_hash = DBContextCache.schema_hash(
+            [{"name": c.get("col", ""), "type": c.get("full_type") or c.get("type", "")} for c in cols]
+        )
+        cache_key = f"dbctx:table:{conn_name}:{t_name}"
+        annotation = _db_cache.get(cache_key, current_hash=col_hash)
+
+        if not annotation and cfg.summary.enabled:
+            # Build a rich prompt — include columns, models, and top callers so the
+            # LLM doesn't have to guess from the table name alone (e.g. "locations"
+            # could be course events, not geography).
+            col_summary = ", ".join(
+                f"{c.get('col')} ({c.get('full_type') or c.get('type', '?')})"
+                for c in cols[:30]
+            )
+
+            # Pull linked model names and top callers to ground the annotation
+            model_names_prompt = ""
+            try:
+                _mrows = db.execute(
+                    "MATCH (m:EloquentModel)-[:USES_TABLE]->(t:DatabaseTable) WHERE t.node_id = $nid "
+                    "RETURN m.name AS mname",
+                    {"nid": t_node_id},
+                )
+                if _mrows:
+                    model_names_prompt = "Linked Eloquent models: " + ", ".join(
+                        r.get("mname", "") for r in _mrows
+                    ) + "\n"
+            except Exception:
+                pass
+
+            callers_prompt = ""
+            try:
+                _arows = db.execute(
+                    "MATCH (src)-[q:QUERIES_TABLE]->(t:DatabaseTable) WHERE t.node_id = $nid "
+                    "RETURN src.name AS sname, q.operation AS op LIMIT 8",
+                    {"nid": t_node_id},
+                )
+                if _arows:
+                    callers_prompt = "Code that accesses this table: " + ", ".join(
+                        f"{r.get('sname')} ({r.get('op', '?')})" for r in _arows
+                    ) + "\n"
+            except Exception:
+                pass
+
+            prompt_source = (
+                f"Database table `{t_name}` (connection: {conn_name})\n"
+                + (f"MySQL comment: {comment}\n" if comment else "")
+                + (f"Columns: {col_summary}\n" if col_summary else "WARNING: column data not yet available.\n")
+                + model_names_prompt
+                + callers_prompt
+                + "\nIMPORTANT: Do not infer purpose from the table name alone — "
+                "names can be misleading (e.g. a table named 'locations' may actually store "
+                "course event scheduling data, not geographic locations). "
+                "Use column names, linked model names, and calling code to determine "
+                "the real business purpose. Be specific. If genuinely uncertain, say so."
+            )
+            annotation, used_provider = generate_summary(
+                fqn=f"db.table.{t_name}",
+                node_type="database table",
+                source=prompt_source,
+                summary_cfg=cfg.summary,
+            )
+            if annotation:
+                _db_cache.set(cache_key, annotation, used_provider, schema_hash=col_hash)
+
+        elapsed = (time.perf_counter() - start) * 1000
+        _log_tool("laravelgraph_db_context", {"table": table, "connection": connection}, len(cols), elapsed)
+
+        if annotation:
+            lines.append(f"\n### Semantic Annotation\n\n> {annotation}")
+
+        return "\n".join(lines) + _next_steps(
+            "Use laravelgraph_resolve_column(table, column) for deep analysis of any mystery column",
+            "Use laravelgraph_models to see how Eloquent models map to this table",
+            "Use laravelgraph_schema to browse the full schema",
+        )
+
+    # ── Tool: laravelgraph_resolve_column ─────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_resolve_column(table: str, column: str, connection: str = "") -> str:
+        """Deep-dive into a single database column.
+
+        Especially useful for polymorphic/unconstrained columns like
+        `reference_id`, `entity_id`, `owner_id` that lack FK constraints.
+
+        Returns write-path evidence, polymorphic hints, guard conditions,
+        inferred target tables with confidence scores, and a lazy LLM
+        resolution (generated once on first call, cached thereafter).
+
+        Args:
+            table: Table name (e.g. "activity_logs")
+            column: Column name (e.g. "reference_id")
+            connection: DB connection name (optional)
+        """
+        db = _db()
+        start = time.perf_counter()
+
+        # Find the column node
+        col_id_prefix = f"col:{connection or ''}:{table}.{column}" if connection else None
+        col_data: dict | None = None
+
+        try:
+            if connection:
+                col_rows = db.execute(
+                    "MATCH (t:DatabaseTable)-[:HAS_COLUMN]->(c:DatabaseColumn) "
+                    "WHERE t.name = $tname AND t.connection = $conn AND c.name = $cname "
+                    "RETURN c.*",
+                    {"tname": table, "conn": connection, "cname": column},
+                )
+            else:
+                col_rows = db.execute(
+                    "MATCH (t:DatabaseTable)-[:HAS_COLUMN]->(c:DatabaseColumn) "
+                    "WHERE t.name = $tname AND c.name = $cname "
+                    "RETURN c.*",
+                    {"tname": table, "cname": column},
+                )
+            if col_rows:
+                raw = col_rows[0]
+                col_data = {(k[2:] if k.startswith("c.") else k): v for k, v in raw.items()}
+        except Exception as e:
+            return f"Error querying column: {e}"
+
+        if not col_data:
+            return (
+                f"Column `{table}.{column}` not found in the graph. "
+                "Run `laravelgraph analyze` and ensure the table is indexed."
+            )
+
+        col_node_id = col_data.get("node_id", "")
+        conn_name = connection or col_node_id.split(":")[1] if col_node_id.count(":") >= 2 else "?"
+        full_t = col_data.get("full_type") or col_data.get("type", "?")
+
+        lines = [f"## Column: `{table}.{column}` (`{full_t}`)\n"]
+        lines.append(f"- **Connection:** `{conn_name}`")
+        lines.append(f"- **Nullable:** {'Yes' if col_data.get('nullable') else 'No'}")
+        if col_data.get("column_comment"):
+            lines.append(f"- **Comment:** {col_data['column_comment']}")
+        if col_data.get("column_key"):
+            lines.append(f"- **Key:** {col_data['column_key']}")
+
+        # ── Polymorphic hints ─────────────────────────────────────────────────
+        if col_data.get("polymorphic_candidate"):
+            sibling = col_data.get("sibling_type_column", "")
+            lines.append(f"\n### Polymorphic Detection\n")
+            lines.append(
+                f"This column is a **polymorphic ID** candidate. "
+                f"The sibling type discriminator column is `{sibling or '(unknown)'}`. "
+                "Use laravelgraph_resolve_column on the type column to see all guarded values."
+            )
+
+        # ── Guard conditions ──────────────────────────────────────────────────
+        guard_raw = col_data.get("guard_conditions", "")
+        if guard_raw:
+            try:
+                guards = json.loads(guard_raw) if isinstance(guard_raw, str) else guard_raw
+                if guards:
+                    lines.append("\n### Guard Conditions (detected in code)\n")
+                    for g in (guards if isinstance(guards, list) else [guards])[:10]:
+                        lines.append(f"- `{g}`")
+            except Exception:
+                if guard_raw:
+                    lines.append(f"\n**Guard:** `{guard_raw}`")
+
+        # ── Write-path evidence ───────────────────────────────────────────────
+        wpe_raw = col_data.get("write_path_evidence", "")
+        if wpe_raw:
+            try:
+                evidence = json.loads(wpe_raw) if isinstance(wpe_raw, str) else wpe_raw
+                if evidence:
+                    lines.append("\n### Write-Path Evidence\n")
+                    lines.append("These are the expressions this column was assigned in PHP code:\n")
+                    for ev in (evidence if isinstance(evidence, list) else [evidence])[:10]:
+                        if isinstance(ev, dict):
+                            lines.append(f"- `{ev.get('rhs', ev)}` in `{ev.get('file', '')}:{ev.get('line', '')}`")
+                        else:
+                            lines.append(f"- `{ev}`")
+            except Exception:
+                pass
+
+        # ── Inferred references from this column ──────────────────────────────
+        try:
+            inferred = db.execute(
+                "MATCH (c:DatabaseColumn)-[r:INFERRED_REFERENCES]->(tgt:DatabaseTable) "
+                "WHERE c.node_id = $nid "
+                "RETURN tgt.name AS tgt_table, tgt.connection AS tgt_conn, "
+                "r.confidence AS conf, r.condition AS cond, r.evidence_type AS ev_type",
+                {"nid": col_node_id},
+            ) if col_node_id else []
+            if inferred:
+                lines.append("\n### Inferred Target Tables\n")
+                lines.append("| Target Table | Connection | Confidence | Condition | Evidence |")
+                lines.append("|-------------|------------|------------|-----------|----------|")
+                for ir in sorted(inferred, key=lambda r: -(r.get("conf") or 0)):
+                    conf = ir.get("conf", 0) or 0
+                    cond = ir.get("cond", "") or ""
+                    ev = ir.get("ev_type", "") or ""
+                    lines.append(
+                        f"| `{ir.get('tgt_table')}` | {ir.get('tgt_conn') or '?'} | {conf:.0%} | {cond} | {ev} |"
+                    )
+        except Exception:
+            pass
+
+        # ── Value semantics (discriminator detection) ─────────────────────────
+        disc_dist: list[dict] | None = None
+        if _is_discriminator_column(column, full_t, guard_raw if isinstance(guard_raw, str) else ""):
+            resolve_conn_cfg = _get_conn_cfg_for_table(conn_name)
+            if resolve_conn_cfg:
+                disc_dist = _fetch_col_distribution(table, column, resolve_conn_cfg)
+            if disc_dist:
+                lines.append("\n### Value Distribution (live DB)\n")
+                lines.append("| Value | Row Count |")
+                lines.append("|-------|-----------|")
+                for drow in disc_dist[:30]:
+                    lines.append(f"| `{drow.get('val')}` | {drow.get('cnt'):,} |")
+
+        # ── Lazy LLM resolution ───────────────────────────────────────────────
+        schema_sig = f"{full_t}:{col_data.get('polymorphic_candidate', False)}:{wpe_raw}"
+        col_hash = hashlib.sha1(schema_sig.encode()).hexdigest()[:12]
+        cache_key = f"dbctx:column:{conn_name}:{table}.{column}"
+        annotation = _db_cache.get(cache_key, current_hash=col_hash)
+
+        if not annotation and cfg.summary.enabled:
+            guard_summary = guard_raw[:200] if isinstance(guard_raw, str) else ""
+            wpe_summary = wpe_raw[:400] if isinstance(wpe_raw, str) else ""
+            dist_summary = ""
+            if disc_dist:
+                dist_summary = "Value distribution: " + ", ".join(
+                    f"{r.get('val')}={r.get('cnt')}" for r in disc_dist[:20]
+                ) + "\n"
+            prompt_source = (
+                f"Database column: {table}.{column} ({full_t})\n"
+                f"Nullable: {col_data.get('nullable', True)}\n"
+                f"Polymorphic candidate: {col_data.get('polymorphic_candidate', False)}\n"
+                + (f"Sibling type column: {col_data.get('sibling_type_column', '')}\n" if col_data.get("sibling_type_column") else "")
+                + (f"Guard conditions (code checks these values): {guard_summary}\n" if guard_summary else "")
+                + dist_summary
+                + (f"Write-path expressions: {wpe_summary}\n" if wpe_summary else "")
+                + "\nIMPORTANT: Lead with what code DOES with this column (guard conditions, "
+                "write-path assignments, value distribution), not what the name implies. "
+                "If guard conditions or value distribution are present, use them as the "
+                "primary evidence. Be concrete about what each value means in the codebase."
+            )
+            annotation, used_provider = generate_summary(
+                fqn=f"db.column.{table}.{column}",
+                node_type="database column",
+                source=prompt_source,
+                summary_cfg=cfg.summary,
+            )
+            if annotation:
+                _db_cache.set(cache_key, annotation, used_provider, schema_hash=col_hash)
+
+        elapsed = (time.perf_counter() - start) * 1000
+        _log_tool("laravelgraph_resolve_column", {"table": table, "column": column}, 1, elapsed)
+
+        if annotation:
+            lines.append(f"\n### Semantic Resolution\n\n> {annotation}")
+
+        return "\n".join(lines) + _next_steps(
+            f"Use laravelgraph_db_context('{table}') for the full table picture",
+            "Use laravelgraph_schema to see FK constraints across all tables",
+        )
+
+    # ── Tool: laravelgraph_procedure_context ──────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_procedure_context(name: str, connection: str = "") -> str:
+        """Stored procedure details with table access map and semantic annotation.
+
+        Returns the procedure body, which tables it reads/writes, and a lazy
+        LLM-generated annotation (generated once on first call, cached thereafter).
+
+        Args:
+            name: Procedure name (e.g. "calculate_order_totals")
+            connection: DB connection name (optional)
+        """
+        db = _db()
+        start = time.perf_counter()
+
+        try:
+            if connection:
+                procs = db.execute(
+                    "MATCH (p:StoredProcedure) WHERE p.name = $name AND p.connection = $conn RETURN p.* LIMIT 1",
+                    {"name": name, "conn": connection},
+                )
+            else:
+                procs = db.execute(
+                    "MATCH (p:StoredProcedure) WHERE p.name = $name RETURN p.* LIMIT 1",
+                    {"name": name},
+                )
+        except Exception as e:
+            return f"Error: {e}"
+
+        if not procs:
+            return (
+                f"Stored procedure `{name}` not found. "
+                "Live DB introspection requires a configured connection — "
+                "run `laravelgraph db-connections add` and re-analyze."
+            )
+
+        p = procs[0]
+        p_nid = p.get("p.node_id", "")
+        conn_name = p.get("p.connection", "") or connection or "?"
+        body = p.get("p.body", "") or ""
+        params_raw = p.get("p.parameters", "") or ""
+        security = p.get("p.security_type", "") or ""
+        definer = p.get("p.definer", "") or ""
+
+        lines = [f"## Stored Procedure: `{name}` (connection: `{conn_name}`)\n"]
+        if params_raw:
+            lines.append(f"- **Parameters:** `{params_raw}`")
+        if security:
+            lines.append(f"- **Security:** {security}")
+        if definer:
+            lines.append(f"- **Definer:** {definer}")
+
+        # Table access map
+        try:
+            reads = db.execute(
+                "MATCH (p:StoredProcedure)-[:PROCEDURE_READS]->(t:DatabaseTable) WHERE p.node_id = $nid "
+                "RETURN t.name AS tname",
+                {"nid": p_nid},
+            )
+            writes = db.execute(
+                "MATCH (p:StoredProcedure)-[:PROCEDURE_WRITES]->(t:DatabaseTable) WHERE p.node_id = $nid "
+                "RETURN t.name AS tname",
+                {"nid": p_nid},
+            )
+            if reads:
+                lines.append("\n### Reads From\n")
+                for r in reads:
+                    lines.append(f"- `{r.get('tname')}`")
+            if writes:
+                lines.append("\n### Writes To\n")
+                for w in writes:
+                    lines.append(f"- `{w.get('tname')}`")
+        except Exception:
+            pass
+
+        # Procedure body (truncated)
+        if body:
+            truncated = body[:2000]
+            lines.append("\n### Body\n")
+            lines.append("```sql")
+            lines.append(truncated)
+            if len(body) > 2000:
+                lines.append(f"... ({len(body) - 2000} more chars)")
+            lines.append("```")
+
+        # ── Lazy LLM annotation ───────────────────────────────────────────────
+        body_hash = hashlib.sha1(body[:500].encode()).hexdigest()[:12]
+        cache_key = f"dbctx:proc:{conn_name}:{name}"
+        annotation = _db_cache.get(cache_key, current_hash=body_hash)
+
+        if not annotation and cfg.summary.enabled:
+            prompt_source = (
+                f"Stored procedure: {name}\n"
+                f"Connection: {conn_name}\n"
+                + (f"Parameters: {params_raw}\n" if params_raw else "")
+                + (f"Body (truncated):\n{body[:800]}\n" if body else "")
+            )
+            annotation, used_provider = generate_summary(
+                fqn=f"db.procedure.{name}",
+                node_type="stored procedure",
+                source=prompt_source,
+                summary_cfg=cfg.summary,
+            )
+            if annotation:
+                _db_cache.set(cache_key, annotation, used_provider, schema_hash=body_hash)
+
+        elapsed = (time.perf_counter() - start) * 1000
+        _log_tool("laravelgraph_procedure_context", {"name": name, "connection": connection}, 1, elapsed)
+
+        if annotation:
+            lines.append(f"\n### Semantic Annotation\n\n> {annotation}")
+
+        return "\n".join(lines) + _next_steps(
+            "Use laravelgraph_db_context(table) for any of the tables accessed by this procedure",
+            "Use laravelgraph_connection_map to see all procedures across all connections",
+        )
+
+    # ── Tool: laravelgraph_connection_map ─────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_connection_map() -> str:
+        """Map of all configured database connections with table counts, procedures,
+        views, and any cross-database query patterns detected in code.
+        """
+        db = _db()
+        start = time.perf_counter()
+
+        lines = ["## Database Connection Map\n"]
+
+        # ── Configured connections from config ────────────────────────────────
+        configured = cfg.databases if hasattr(cfg, "databases") else []
+        if configured:
+            lines.append("### Configured Connections\n")
+            lines.append("| Name | Host | Database | Driver | SSL |")
+            lines.append("|------|------|----------|--------|-----|")
+            for conn_cfg in configured:
+                host = conn_cfg.host if hasattr(conn_cfg, "host") else "?"
+                dbname = conn_cfg.database if hasattr(conn_cfg, "database") else "?"
+                driver = conn_cfg.driver if hasattr(conn_cfg, "driver") else "mysql"
+                ssl = "Yes" if (hasattr(conn_cfg, "ssl") and conn_cfg.ssl) else "No"
+                lines.append(f"| `{conn_cfg.name}` | {host} | {dbname} | {driver} | {ssl} |")
+            lines.append("")
+        else:
+            lines.append(
+                "> No DB connections configured. "
+                "Run `laravelgraph db-connections add` to add a MySQL/RDS connection.\n"
+            )
+
+        # ── Live DB nodes in graph ─────────────────────────────────────────────
+        try:
+            conn_summary = db.execute(
+                "MATCH (t:DatabaseTable) WHERE t.connection IS NOT NULL AND t.connection <> '' "
+                "RETURN t.connection AS conn, count(*) AS table_count"
+            )
+            if conn_summary:
+                lines.append("### Live DB Data in Graph\n")
+                lines.append("| Connection | Tables |")
+                lines.append("|------------|--------|")
+                for row in conn_summary:
+                    lines.append(f"| `{row.get('conn')}` | {row.get('table_count')} |")
+                lines.append("")
+        except Exception:
+            pass
+
+        # ── Migration-derived tables ───────────────────────────────────────────
+        try:
+            mig_rows = db.execute(
+                "MATCH (t:DatabaseTable) WHERE t.source = 'migration' OR t.connection IS NULL "
+                "RETURN count(*) AS cnt"
+            )
+            if mig_rows:
+                cnt = mig_rows[0].get("cnt", 0)
+                if cnt:
+                    lines.append(f"- **Migration-derived tables:** {cnt} (no live DB connection required)\n")
+        except Exception:
+            pass
+
+        # ── Stored procedures per connection ──────────────────────────────────
+        try:
+            proc_summary = db.execute(
+                "MATCH (p:StoredProcedure) RETURN p.connection AS conn, count(*) AS cnt"
+            )
+            if proc_summary:
+                lines.append("### Stored Procedures\n")
+                for row in proc_summary:
+                    conn_label = row.get("conn") or "unknown"
+                    lines.append(f"- `{conn_label}`: {row.get('cnt')} procedure(s)")
+                lines.append("")
+        except Exception:
+            pass
+
+        # ── Views per connection ───────────────────────────────────────────────
+        try:
+            view_summary = db.execute(
+                "MATCH (v:DatabaseView) RETURN v.connection AS conn, count(*) AS cnt"
+            )
+            if view_summary:
+                lines.append("### Database Views\n")
+                for row in view_summary:
+                    conn_label = row.get("conn") or "unknown"
+                    lines.append(f"- `{conn_label}`: {row.get('cnt')} view(s)")
+                lines.append("")
+        except Exception:
+            pass
+
+        # ── Cross-DB access patterns ───────────────────────────────────────────
+        try:
+            cross_db = db.execute(
+                "MATCH (src)-[q:QUERIES_TABLE]->(t:DatabaseTable) "
+                "WHERE q.connection IS NOT NULL AND q.connection <> '' "
+                "RETURN q.connection AS db_conn, count(*) AS access_count "
+                "ORDER BY access_count DESC LIMIT 10"
+            )
+            if cross_db:
+                lines.append("### Cross-DB Access (code explicitly names a connection)\n")
+                for row in cross_db:
+                    lines.append(f"- `{row.get('db_conn')}`: {row.get('access_count')} queries from code")
+                lines.append("")
+        except Exception:
+            pass
+
+        # ── QUERIES_TABLE summary ──────────────────────────────────────────────
+        try:
+            qt_total = db.execute("MATCH ()-[q:QUERIES_TABLE]->() RETURN count(*) AS cnt")
+            if qt_total:
+                cnt = qt_total[0].get("cnt", 0)
+                lines.append(f"- **Total QUERIES_TABLE edges:** {cnt} (code → table access points detected)")
+        except Exception:
+            pass
+
+        elapsed = (time.perf_counter() - start) * 1000
+        _log_tool("laravelgraph_connection_map", {}, 1, elapsed)
+
+        return "\n".join(lines) + _next_steps(
+            "Use laravelgraph_db_context(table) for full analysis of any table",
+            "Use laravelgraph_schema(connection='name') to browse tables on a specific connection",
+            "Use laravelgraph_procedure_context(name) for stored procedure details",
+        )
+
+    # ── Tool: laravelgraph_db_query ───────────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_db_query(
+        sql: str,
+        connection: str = "",
+        limit: int = 50,
+        bypass_cache: bool = False,
+    ) -> str:
+        """Run a read-only SQL query against a configured live database.
+
+        Executes SELECT, SHOW, DESCRIBE, or EXPLAIN statements against any
+        configured database connection. Results are cached for 5 minutes by
+        default — the same query called multiple times in a session hits the
+        cache, not the DB.
+
+        Use this when you need to see actual data values: lookup tables, enum
+        meanings, reference rows, live counts. The graph tells you structure;
+        this tool tells you content.
+
+        Args:
+            sql:          Read-only SQL — SELECT, SHOW, DESCRIBE, or EXPLAIN only.
+                          Do NOT include a LIMIT clause — use the ``limit`` param.
+            connection:   Connection name from config (default: first configured).
+            limit:        Max rows to return (default 50, max 500).
+            bypass_cache: Set True to skip cache and force a fresh DB query.
+        """
+        start = time.perf_counter()
+
+        # ── Safety check ──────────────────────────────────────────────────────
+        err = validate_sql(sql)
+        if err:
+            return f"**SQL rejected:** {err}"
+
+        # ── Resolve connection ─────────────────────────────────────────────────
+        db_configs = cfg.databases if hasattr(cfg, "databases") else []
+        if not db_configs:
+            return (
+                "**No database connections configured.**\n"
+                "Run `laravelgraph db-connections add` to add a MySQL/RDS connection."
+            )
+
+        if connection:
+            conn_cfg = next((c for c in db_configs if c.name == connection), None)
+            if not conn_cfg:
+                names = ", ".join(f"`{c.name}`" for c in db_configs)
+                return f"**Connection `{connection}` not found.** Available: {names}"
+        else:
+            conn_cfg = db_configs[0]
+
+        conn_name = conn_cfg.name
+
+        # ── Enforce row limit ──────────────────────────────────────────────────
+        from laravelgraph.mcp.query_cache import _MAX_ROWS
+        safe_limit = max(1, min(limit, _MAX_ROWS))
+
+        # Inject LIMIT if not already present (only for SELECT)
+        sql_for_exec = sql.strip().rstrip(";")
+        if sql_for_exec.upper().lstrip().startswith("SELECT") and \
+                "LIMIT" not in sql_for_exec.upper():
+            sql_for_exec = f"{sql_for_exec} LIMIT {safe_limit}"
+
+        # ── Cache lookup ───────────────────────────────────────────────────────
+        cache_key = _query_cache.make_key(conn_name, sql_for_exec)
+        ttl = conn_cfg.query_cache_ttl if hasattr(conn_cfg, "query_cache_ttl") else 300
+
+        if not bypass_cache and ttl > 0:
+            cached = _query_cache.get(cache_key, ttl=ttl)
+            if cached:
+                age = int(time.time() - cached["cached_at"])
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_db_query", {"sql": sql[:80], "connection": conn_name, "cached": True}, cached["row_count"], elapsed)
+                return _format_query_result(
+                    cached["columns"],
+                    cached["rows"],
+                    conn_name,
+                    sql,
+                    from_cache=True,
+                    cache_age_sec=age,
+                )
+
+        # ── Live query ─────────────────────────────────────────────────────────
+        try:
+            from laravelgraph.pipeline.phase_24_db_introspect import _connect_mysql
+            mysql_conn = _connect_mysql(conn_cfg)
+        except ImportError:
+            return "**PyMySQL not installed.** Run: `pip install pymysql`"
+        except Exception as exc:
+            return f"**Connection failed** (`{conn_name}`): {exc}"
+
+        try:
+            with mysql_conn.cursor() as cur:
+                cur.execute(sql_for_exec)
+                raw_rows = cur.fetchall()
+                columns: list[str] = [d[0] for d in (cur.description or [])]
+        except Exception as exc:
+            return f"**Query failed:** {exc}\n\nSQL: `{sql_for_exec}`"
+        finally:
+            try:
+                mysql_conn.close()
+            except Exception:
+                pass
+
+        # Convert tuples → dicts for storage
+        rows = [dict(zip(columns, row)) for row in raw_rows]
+
+        # ── Store in cache ─────────────────────────────────────────────────────
+        if ttl > 0:
+            _query_cache.set(cache_key, sql, conn_name, columns, rows, ttl=ttl)
+
+        elapsed = (time.perf_counter() - start) * 1000
+        _log_tool("laravelgraph_db_query", {"sql": sql[:80], "connection": conn_name, "cached": False}, len(rows), elapsed)
+
+        return _format_query_result(columns, rows, conn_name, sql, from_cache=False)
+
+    def _format_query_result(
+        columns: list[str],
+        rows: list[dict],
+        connection: str,
+        sql: str,
+        from_cache: bool = False,
+        cache_age_sec: int = 0,
+    ) -> str:
+        """Render query results as a Markdown table."""
+        cache_note = f" *(cached {cache_age_sec}s ago)*" if from_cache else " *(live)*"
+        lines = [
+            f"## Query Results — `{connection}`{cache_note}\n",
+            f"```sql\n{sql.strip()}\n```\n",
+        ]
+
+        if not rows:
+            lines.append("*No rows returned.*")
+            return "\n".join(lines)
+
+        lines.append(f"**{len(rows)} row(s)**\n")
+
+        # Markdown table
+        lines.append("| " + " | ".join(str(c) for c in columns) + " |")
+        lines.append("|" + "|".join("---" for _ in columns) + "|")
+        for row in rows:
+            cells = [str(row.get(c, "")) for c in columns]
+            lines.append("| " + " | ".join(cells) + " |")
+
+        return "\n".join(lines) + _next_steps(
+            "Use laravelgraph_db_context(table) to see how this table is used in code",
+            "Use laravelgraph_schema(table) for column definitions and FK relationships",
+            f"Run again with bypass_cache=True to force a fresh query",
+        )
+
+    # ── Tool: laravelgraph_db_impact ──────────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_db_impact(
+        table: str,
+        operation: str = "write",
+        connection: str = "",
+    ) -> str:
+        """Trace what happens in code when a database table is written to.
+
+        Answers the question: "when this table gets a new/updated row, what
+        events fire, what jobs are dispatched, what listeners run?"
+
+        Walks the complete chain:
+          DB write site → dispatched events/jobs → listeners → downstream jobs
+
+        This closes the cross-layer gap that pure graph analysis misses — e.g.
+        "when a trainee completes a type-6 event, what jobs fire?" requires
+        connecting the DB write in VirtualCctvEventsServiceRevamp to the
+        DISPATCHES edges that follow it.
+
+        Args:
+            table:      Table name (e.g. "course_events")
+            operation:  "write" (default), "read", or "any"
+            connection: DB connection name (optional)
+        """
+        db = _db()
+        start = time.perf_counter()
+
+        # ── Find write/read sites ──────────────────────────────────────────────
+        try:
+            if operation == "any":
+                op_filter = ""
+            elif operation == "read":
+                op_filter = "AND q.operation = 'read' "
+            else:
+                op_filter = "AND q.operation <> 'read' "
+
+            if connection:
+                conn_filter = "AND t.connection = $conn "
+                params: dict = {"tname": table, "conn": connection}
+            else:
+                conn_filter = ""
+                params = {"tname": table}
+
+            sites = db.execute(
+                "MATCH (src:Method)-[q:QUERIES_TABLE]->(t:DatabaseTable) "
+                "WHERE t.name = $tname "
+                + conn_filter
+                + op_filter
+                + "RETURN src.name AS src_name, src.fqn AS src_fqn, "
+                "q.operation AS op, q.via AS via, q.line AS line "
+                "ORDER BY src.fqn LIMIT 30",
+                params,
+            )
+        except Exception as e:
+            return f"Error querying write sites: {e}"
+
+        if not sites:
+            op_label = "access" if operation == "any" else operation
+            return (
+                f"No `{op_label}` sites found for table `{table}`. "
+                "Run `laravelgraph analyze` to index DB access patterns."
+            )
+
+        lines = [
+            f"## DB Impact: `{table}` ({operation} paths)\n",
+            f"**{len(sites)} code site(s) found** that {operation} this table.\n",
+        ]
+
+        seen_sites: set[str] = set()
+
+        for site in sites:
+            src_fqn = site.get("src_fqn", "") or ""
+            src_name = site.get("src_name", src_fqn)
+            op = site.get("op", "?")
+            via = site.get("via", "?") or "?"
+            line = site.get("line")
+            line_str = f" line {line}" if line else ""
+
+            if src_fqn in seen_sites:
+                continue
+            seen_sites.add(src_fqn)
+
+            lines.append(f"\n### `{src_name}`{line_str}  _{op} via {via}_")
+            lines.append(f"**FQN:** `{src_fqn}`\n")
+
+            # ── Dispatches from this method ────────────────────────────────────
+            dispatches: list[dict] = []
+            try:
+                dispatches = db.execute(
+                    "MATCH (m:Method)-[d:DISPATCHES]->(evt) WHERE m.fqn = $fqn "
+                    "RETURN evt.name AS name, evt.fqn AS efqn, "
+                    "d.dispatch_type AS dtype, d.is_queued AS queued",
+                    {"fqn": src_fqn},
+                ) or []
+            except Exception:
+                pass
+
+            # Also check the parent class (method might be dispatched at class level)
+            if not dispatches:
+                class_fqn = "::".join(src_fqn.split("::")[:-1]) if "::" in src_fqn else ""
+                if class_fqn:
+                    try:
+                        dispatches = db.execute(
+                            "MATCH (c)-[d:DISPATCHES]->(evt) WHERE c.fqn = $fqn "
+                            "RETURN evt.name AS name, evt.fqn AS efqn, "
+                            "d.dispatch_type AS dtype, d.is_queued AS queued",
+                            {"fqn": class_fqn},
+                        ) or []
+                    except Exception:
+                        pass
+
+            if not dispatches:
+                lines.append("_No direct event/job dispatches detected from this method._")
+                continue
+
+            for disp in dispatches:
+                evt_name = disp.get("name", "?")
+                evt_fqn = disp.get("efqn", "")
+                dtype = disp.get("dtype", "event") or "event"
+                queued = " (queued)" if disp.get("queued") else ""
+                lines.append(f"- **dispatches** `{evt_name}`{queued} [{dtype}]")
+
+                # ── Listeners for this event ───────────────────────────────────
+                if dtype in ("event", "Event"):
+                    listeners: list[dict] = []
+                    try:
+                        listeners = db.execute(
+                            "MATCH (evt:Event)<-[:LISTENS_TO]-(l:Listener) WHERE evt.fqn = $fqn "
+                            "RETURN l.name AS lname, l.fqn AS lfqn",
+                            {"fqn": evt_fqn},
+                        ) or []
+                    except Exception:
+                        pass
+
+                    for li in listeners:
+                        lname = li.get("lname", "?")
+                        lfqn = li.get("lfqn", "")
+                        lines.append(f"  - **listened by** `{lname}`")
+
+                        # ── Jobs dispatched from listener ──────────────────────
+                        try:
+                            jobs = db.execute(
+                                "MATCH (l:Listener)-[d:DISPATCHES]->(j) WHERE l.fqn = $fqn "
+                                "RETURN j.name AS jname, d.is_queued AS queued",
+                                {"fqn": lfqn},
+                            ) or []
+                            for job in jobs:
+                                jq = " (queued)" if job.get("queued") else ""
+                                lines.append(f"    - **dispatches job** `{job.get('jname')}`{jq}")
+                        except Exception:
+                            pass
+
+                        if not listeners:
+                            lines.append(f"  _(no listeners registered for `{evt_name}`)_")
+
+        elapsed = (time.perf_counter() - start) * 1000
+        _log_tool("laravelgraph_db_impact", {"table": table, "operation": operation}, len(sites), elapsed)
+
+        return "\n".join(lines) + _next_steps(
+            f"Use laravelgraph_db_context('{table}') for full table schema and column details",
+            "Use laravelgraph_events() for the complete event → listener → job map",
+            f"Use laravelgraph_impact(ClassName) to trace the blast radius from any of the write sites above",
         )
 
     # ── Tool: laravelgraph_events ─────────────────────────────────────────────
@@ -1185,14 +2408,20 @@ saving you from making 10+ individual tool calls.
 
     @mcp.tool()
     def laravelgraph_explain(feature: str) -> str:
-        """End-to-end explanation of how a feature works: routes → controllers (with source) → events → models.
+        """End-to-end explanation of how a feature works.
 
-        Includes actual PHP source code for controller actions, docblock descriptions,
-        event chains with listener source, and model relationship maps.
-        Semantic summaries are cached — first call generates them, subsequent calls are instant.
+        Uses a multi-anchor search strategy: runs HybridSearch upfront to find the
+        BEST entry point for the feature — which may be a route, a service class,
+        a job, or an event — and expands from that anchor.
+
+        This avoids the common failure mode where simple substring matching on route
+        URIs returns dozens of unrelated routes (e.g. "online" matches 46 routes).
+        Instead, the highest-scoring symbol from semantic + BM25 + fuzzy search wins.
+
+        Includes PHP source code, event chains, linked models, and DB tables accessed.
 
         Args:
-            feature: Feature or concept to explain (e.g. "user registration", "payment processing", "checkout")
+            feature: Feature or concept to explain (e.g. "user registration", "CCTV virtual delivery", "payment processing")
         """
         db = _db()
         start = time.perf_counter()
@@ -1203,6 +2432,7 @@ saving you from making 10+ individual tool calls.
             trace_method_flow,
             trace_event_chain,
             trace_model_summary,
+            read_source_snippet,
         )
         from laravelgraph.search.hybrid import HybridSearch
 
@@ -1212,10 +2442,47 @@ saving you from making 10+ individual tool calls.
 
         lines = [f"## How '{feature}' works\n"]
 
-        # ── Routes matching the feature ──────────────────────────────────────
+        # ── Step 1: Run HybridSearch upfront to score all symbol types ────────
+        # This is the key architectural change: instead of route-first substring
+        # matching, we use semantic scores to pick the BEST anchor.
+        search_results: list = []
+        try:
+            search = HybridSearch(db, cfg.search)
+            search.build_index()
+            search_results = search.search(feature, limit=20)
+        except Exception:
+            pass
+
+        # Separate results by type
+        route_results = [r for r in search_results if r.label in ("Route",)]
+        service_results = [
+            r for r in search_results
+            if r.label in ("Class_", "Method", "Service", "Job", "Listener", "Event")
+        ]
+
+        best_route_score = route_results[0].score if route_results else 0.0
+        best_service_score = service_results[0].score if service_results else 0.0
+
+        # Also run substring-based route matching for recall completeness
         matched_routes = find_routes_for_feature(db, terms)
-        if matched_routes:
-            lines.append(f"### HTTP Entry Points ({len(matched_routes)} routes)\n")
+        route_match_count = len(matched_routes)
+
+        # ── Step 2: Decide the primary anchor ─────────────────────────────────
+        # Route substring matching is high-recall but low-precision (matches
+        # "online" in 46 routes). Use it only when it returns FEW routes (≤5)
+        # OR when it scores clearly better than any service/class result.
+        USE_ROUTE_ANCHOR = (
+            route_match_count > 0 and route_match_count <= 5
+        ) or (
+            best_route_score > 0 and best_route_score >= best_service_score * 0.9
+            and route_match_count <= 10
+        )
+
+        anchor_used = "route" if USE_ROUTE_ANCHOR and matched_routes else "service"
+
+        if USE_ROUTE_ANCHOR and matched_routes:
+            # ── Route-anchored path ───────────────────────────────────────────
+            lines.append(f"### HTTP Entry Points ({route_match_count} routes)\n")
             for r in matched_routes[:5]:
                 method = r.get("hm", "?")
                 uri    = r.get("uri", "?")
@@ -1233,14 +2500,12 @@ saving you from making 10+ individual tool calls.
                 if ctrl:
                     lines.append(f"→ `{ctrl}::{action}`{mw_str}\n")
 
-                    # Check summary cache for this controller method
                     method_nid = f"method:{ctrl}::{action}"
                     cached = _summary_cache.get(method_nid)
                     if cached:
                         lines.append(f"**Summary:** {cached}\n")
                     else:
                         trace_method_flow(db, ctrl, action, lines, project_root=project_root)
-                        # Try to generate + cache the summary
                         if cfg.summary.enabled:
                             try:
                                 method_rows = db.execute(
@@ -1252,7 +2517,6 @@ saving you from making 10+ individual tool calls.
                                 )
                                 if method_rows:
                                     row = method_rows[0]
-                                    from laravelgraph.mcp.explain import read_source_snippet
                                     src = read_source_snippet(
                                         row.get("fp", ""), row.get("ls", 0),
                                         row.get("le", 0), project_root,
@@ -1267,15 +2531,114 @@ saving you from making 10+ individual tool calls.
                                         )
                                         if summary and row.get("nid"):
                                             _summary_cache.set(
-                                                row["nid"], summary,
-                                                provider_used,
+                                                row["nid"], summary, provider_used,
                                                 file_path=row.get("fp", ""),
                                             )
                             except Exception:
                                 pass
                 lines.append("")
 
-        # ── Artisan commands matching the feature ────────────────────────────
+        else:
+            # ── Service/class-anchored path ───────────────────────────────────
+            # The top hybrid search result (service, job, event, class) is more
+            # relevant than a route match. Expand from it.
+            anchor_used = "service"
+            top_symbols = service_results[:5] or search_results[:5]
+
+            if top_symbols:
+                lines.append(f"### Best Match: `{top_symbols[0].fqn}` (score: {top_symbols[0].score:.3f})\n")
+                lines.append(
+                    f"> _{route_match_count} route(s) also matched the search terms but scored lower "
+                    f"than semantic results — using class-anchored expansion._\n"
+                    if route_match_count > 0 else ""
+                )
+
+                for sr in top_symbols[:3]:
+                    node_id = sr.node_id or ""
+                    fqn = sr.fqn or ""
+                    label = sr.label or ""
+
+                    lines.append(f"#### `{label}`: `{fqn}`")
+
+                    # Show cached summary or snippet
+                    cached_sum = _summary_cache.get(node_id, file_path=sr.file_path or "")
+                    if cached_sum:
+                        lines.append(f"**Summary:** {cached_sum}\n")
+                    elif sr.snippet:
+                        lines.append(f"**Snippet:** {sr.snippet}\n")
+
+                    # For class/method nodes, show source and method-level detail
+                    if label in ("Class_", "Method", "Service"):
+                        try:
+                            node_rows = db.execute(
+                                "MATCH (n) WHERE n.node_id = $nid "
+                                "RETURN n.file_path AS fp, n.line_start AS ls, n.line_end AS le, "
+                                "n.fqn AS fqn, n.name AS name",
+                                {"nid": node_id},
+                            ) if node_id else []
+                            if node_rows:
+                                nr = node_rows[0]
+                                src = read_source_snippet(
+                                    nr.get("fp", ""), nr.get("ls", 0),
+                                    nr.get("le", 0), project_root,
+                                )
+                                if src:
+                                    rel = Path(nr.get("fp", "")).name
+                                    lines.append(f"**Source** (`{rel}:{nr.get('ls', 0)}-{nr.get('le', 0)}`):")
+                                    lines.append("```php")
+                                    lines.append(src)
+                                    lines.append("```")
+                        except Exception:
+                            pass
+
+                    # Show DB tables this symbol queries
+                    try:
+                        db_tables = db.execute(
+                            "MATCH (n)-[:QUERIES_TABLE]->(t:DatabaseTable) WHERE n.node_id = $nid "
+                            "RETURN t.name AS tname, t.connection AS conn LIMIT 5",
+                            {"nid": node_id},
+                        ) if node_id else []
+                        if db_tables:
+                            lines.append(f"**DB tables accessed:** " + ", ".join(
+                                f"`{r.get('tname')}`" for r in db_tables
+                            ))
+                    except Exception:
+                        pass
+
+                    # Show events dispatched
+                    try:
+                        dispatches = db.execute(
+                            "MATCH (n)-[:DISPATCHES]->(e:Event) WHERE n.node_id = $nid "
+                            "RETURN e.node_id AS enid, e.name AS ename LIMIT 3",
+                            {"nid": node_id},
+                        ) if node_id else []
+                        if dispatches:
+                            lines.append(f"**Events dispatched:** " + ", ".join(
+                                f"`{r.get('ename')}`" for r in dispatches
+                            ))
+                            for ev in dispatches[:2]:
+                                trace_event_chain(db, ev["enid"], ev.get("ename", "?"), lines, project_root=project_root)
+                    except Exception:
+                        pass
+
+                    lines.append("")
+
+                # Show routes that eventually reach any of these classes
+                if route_match_count > 0:
+                    lines.append(f"\n### Related Routes ({route_match_count} matched — shown for reference)\n")
+                    for r in matched_routes[:3]:
+                        method = r.get("hm", "?")
+                        uri = r.get("uri", "?")
+                        ctrl = r.get("ctrl", "")
+                        action = r.get("action", "")
+                        name = r.get("rname", "")
+                        lines.append(
+                            f"- `{method} {uri}`{' (' + name + ')' if name else ''}"
+                            + (f" → `{ctrl}::{action}`" if ctrl else "")
+                        )
+                    lines.append("")
+
+        # ── Artisan commands matching the feature ─────────────────────────────
         matched_commands = find_commands_for_feature(db, terms)
         if matched_commands:
             lines.append(f"### Artisan Commands ({len(matched_commands)})\n")
@@ -1283,7 +2646,7 @@ saving you from making 10+ individual tool calls.
                 lines.append(f"- `{cmd.get('sig', cmd.get('name', '?'))}` — {cmd.get('desc', '')}")
             lines.append("")
 
-        # ── Events matching the feature ───────────────────────────────────────
+        # ── Events matching the feature (term-based) ──────────────────────────
         try:
             events = db.execute(
                 "MATCH (e:Event) RETURN e.node_id AS nid, e.name AS name, e.fqn AS fqn LIMIT 100"
@@ -1292,13 +2655,11 @@ saving you from making 10+ individual tool calls.
                 e for e in events
                 if any(t in (e.get("name") or "").lower() for t in terms)
             ]
-            if matched_events:
+            if matched_events and anchor_used == "route":
+                # Only show in route-anchored path; service path shows events per-symbol
                 lines.append(f"### Events ({len(matched_events)})\n")
                 for ev in matched_events[:3]:
-                    trace_event_chain(
-                        db, ev["nid"], ev.get("name", "?"), lines,
-                        project_root=project_root,
-                    )
+                    trace_event_chain(db, ev["nid"], ev.get("name", "?"), lines, project_root=project_root)
         except Exception:
             pass
 
@@ -1318,24 +2679,18 @@ saving you from making 10+ individual tool calls.
         except Exception:
             pass
 
-        # ── Fallback: hybrid search if nothing matched above ──────────────────
-        if not matched_routes and not matched_commands:
-            try:
-                search = HybridSearch(db, cfg.search)
-                search.build_index()
-                results = search.search(feature, limit=8)
-                if results:
-                    lines.append("### Related Symbols\n")
-                    for r in results:
-                        cached = _summary_cache.get(r.node_id or "", file_path=r.file_path or "")
-                        summary_str = f" — {cached}" if cached else (f" — {r.snippet}" if r.snippet else "")
-                        lines.append(f"- **{r.label}** `{r.fqn}`{summary_str}")
-                    lines.append("")
-            except Exception:
-                pass
+        # ── Nothing found at all ──────────────────────────────────────────────
+        if not search_results and not matched_routes and not matched_commands:
+            if search_results:
+                lines.append("### Related Symbols (no strong match found)\n")
+                for r in search_results[:5]:
+                    cached = _summary_cache.get(r.node_id or "", file_path=r.file_path or "")
+                    summary_str = f" — {cached}" if cached else (f" — {r.snippet}" if r.snippet else "")
+                    lines.append(f"- **{r.label}** `{r.fqn}`{summary_str}")
+                lines.append("")
 
         elapsed = (time.perf_counter() - start) * 1000
-        _log_tool("laravelgraph_explain", {"feature": feature}, 1, elapsed)
+        _log_tool("laravelgraph_explain", {"feature": feature, "anchor": anchor_used}, 1, elapsed)
 
         if len(lines) <= 2:
             return (
@@ -1347,6 +2702,7 @@ saving you from making 10+ individual tool calls.
             "Use laravelgraph_feature_context(feature) for a structured full-picture view",
             "Use laravelgraph_context(ClassName) to inspect any specific class in depth",
             "Use laravelgraph_request_flow(route) to trace a specific route lifecycle",
+            "Use laravelgraph_query(feature) to search for related symbols directly",
         )
 
     # ── Tool: laravelgraph_feature_context ───────────────────────────────────

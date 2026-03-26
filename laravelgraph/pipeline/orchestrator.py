@@ -74,7 +74,24 @@ class Pipeline:
             shutil.rmtree(str(db_path), ignore_errors=True)
             logger.info("Full rebuild: cleared existing index", path=str(db_path))
 
-        db = GraphDB(db_path)
+        # On full rebuild also wipe the JSON caches so stale LLM annotations
+        # and cached query results don't survive the schema reset.
+        if full:
+            _idx = index_dir(self.project_root)
+            for cache_file in ("query_cache.json", "db_context.json"):
+                _p = _idx / cache_file
+                if _p.exists():
+                    try:
+                        _p.unlink()
+                        logger.info("Full rebuild: cleared cache", file=cache_file)
+                    except Exception as _e:
+                        logger.warning("Could not clear cache file", file=cache_file, error=str(_e))
+
+        # force_reinit=True drops all tables via Cypher before recreating them.
+        # This is the authoritative schema reset — it works even when shutil.rmtree
+        # couldn't fully remove the directory (e.g. KuzuDB lock files held by a
+        # running MCP server process prevent deletion on some platforms).
+        db = GraphDB(db_path, force_reinit=full)
         composer = parse_composer(self.project_root / "composer.json")
 
         ctx = PipelineContext(
@@ -117,6 +134,9 @@ class Pipeline:
             phase_21_di,
             phase_22_api,
             phase_23_schedule,
+            phase_24_db_introspect,
+            phase_25_model_table_link,
+            phase_26_db_access,
         )
 
         all_phases: list[tuple[int, str, Any]] = [
@@ -145,6 +165,12 @@ class Pipeline:
             (21, "Dependency Injection",        phase_21_di.run),
             (22, "API Contract Analysis",       phase_22_api.run),
             (23, "Scheduled Tasks",             phase_23_schedule.run),
+            # Phase 24 must run after 19 (migration schema) so live data can augment it.
+            # Phase 25 must run after both 13 (Eloquent models) and 24 (live tables).
+            # Phase 26 must run after 25 (needs table/column/model nodes all present).
+            (24, "Live DB Introspection",       phase_24_db_introspect.run),
+            (25, "Model-Table Linking",         phase_25_model_table_link.run),
+            (26, "DB Access Analysis",          phase_26_db_access.run),
         ]
 
         active_phases = [(n, nm, fn) for n, nm, fn in all_phases if not phases or n in phases]

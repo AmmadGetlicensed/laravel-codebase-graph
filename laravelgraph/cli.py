@@ -67,6 +67,7 @@ def analyze(
     full: bool = typer.Option(False, "--full", help="Force full rebuild. Use on first run or after major refactors. Default: incremental update."),
     no_embeddings: bool = typer.Option(False, "--no-embeddings", help="Skip vector embedding generation. Speeds up indexing; disables semantic (vector) search. BM25 and fuzzy search still work."),
     phases: Optional[str] = typer.Option(None, "--phases", help="Re-run specific pipeline phases only (e.g. '14' or '1,2,14'). Phase 14 = route analysis. Skips all other phases for faster targeted updates."),
+    warm_cache: bool = typer.Option(False, "--warm-cache", help="Pre-warm the query cache after indexing: caches SELECT results for the most-accessed tables and small lookup tables so the first agent query is instant."),
 ) -> None:
     """Index a Laravel project — builds or updates the KuzuDB knowledge graph.
 
@@ -81,10 +82,15 @@ def analyze(
     rebuild. Useful for targeted updates (e.g. '--phases 14' to refresh only
     route analysis after adding new routes).
 
+    Use --warm-cache to pre-populate the query result cache after indexing.
+    This runs SELECT queries against the live DB for the most-accessed tables
+    so the first agent db-query call is served from cache, not a live DB hit.
+
     Examples:
       laravelgraph analyze
       laravelgraph analyze /path/to/project --full
       laravelgraph analyze --phases 14
+      laravelgraph analyze --phases 24,25,26 --warm-cache
     """
     root = _project_root(path)
 
@@ -181,6 +187,23 @@ def analyze(
             console.print(f"  [dim]{err}[/dim]")
         if len(ctx.errors) > 5:
             console.print(f"  [dim]...and {len(ctx.errors) - 5} more[/dim]")
+
+    # ── Cache warming (optional) ──────────────────────────────────────────────
+    if warm_cache and cfg.databases:
+        console.print("\n[dim]Warming query cache...[/dim]")
+        try:
+            from laravelgraph.mcp.warm_queries import warm_query_cache
+            warm_totals = warm_query_cache(root, cfg)
+            console.print(
+                f"[green]✓[/green] Query cache warmed: "
+                f"{warm_totals['warmed']} tables cached, "
+                f"{warm_totals['skipped']} skipped, "
+                f"{warm_totals['errors']} errors"
+            )
+        except Exception as e:
+            console.print(f"[yellow]Cache warming failed:[/yellow] {e}")
+    elif warm_cache and not cfg.databases:
+        console.print("[dim]--warm-cache: no DB connections configured, skipping[/dim]")
 
     console.print(
         f"\n[green]✓[/green] Project indexed successfully. "
@@ -1657,6 +1680,500 @@ def guide() -> None:
     console.print()
 
 
+# ── db-connections ────────────────────────────────────────────────────────────
+
+db_app = typer.Typer(
+    name="db-connections",
+    help="Manage live MySQL database connections for schema introspection.",
+    rich_markup_mode="rich",
+)
+app.add_typer(db_app, name="db-connections", rich_help_panel="1. Setup & Indexing")
+
+
+def _load_db_config(root: Path) -> tuple[dict, Path]:
+    """Load existing config JSON and return (data, path) for the project config."""
+    import json as _json
+    from laravelgraph.config import index_dir as _index_dir
+    cfg_path = _index_dir(root) / "config.json"
+    data: dict = {}
+    if cfg_path.exists():
+        try:
+            data = _json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return data, cfg_path
+
+
+def _save_db_config(data: dict, cfg_path: Path) -> None:
+    import json as _json
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _test_connection(cfg_data: dict) -> tuple[bool, str]:
+    """Try to open a pymysql connection and return (success, message)."""
+    try:
+        import pymysql  # type: ignore[import]
+    except ImportError:
+        return False, "pymysql not installed. Run: pip install pymysql"
+
+    import re as _re
+    from urllib.parse import urlparse as _urlparse
+
+    def _resolve(v: str) -> str:
+        import os
+        return _re.sub(r"\$\{([^}]+)\}", lambda m: os.environ.get(m.group(1), ""), v)
+
+    try:
+        dsn = cfg_data.get("dsn", "")
+        ssl_opts = {"ssl": {}} if cfg_data.get("ssl") else None
+        if dsn:
+            p = _urlparse(dsn)
+            conn = pymysql.connect(
+                host=p.hostname or "127.0.0.1",
+                port=p.port or 3306,
+                user=p.username or "",
+                password=_resolve(p.password or ""),
+                database=(p.path or "").lstrip("/"),
+                ssl=ssl_opts,
+                connect_timeout=10,
+            )
+        else:
+            conn = pymysql.connect(
+                host=cfg_data.get("host", "127.0.0.1"),
+                port=int(cfg_data.get("port", 3306)),
+                user=cfg_data.get("username", ""),
+                password=_resolve(cfg_data.get("password", "")),
+                database=cfg_data.get("database", ""),
+                ssl=ssl_opts,
+                connect_timeout=10,
+            )
+        with conn.cursor() as cur:
+            cur.execute("SELECT VERSION()")
+            version = cur.fetchone()
+        conn.close()
+        return True, f"Connected — MySQL {version[0] if version else '?'}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+@db_app.command("list")
+def db_list(
+    path: Optional[Path] = PathArg,
+) -> None:
+    """List all configured database connections for this project."""
+    root = _project_root(path)
+    data, _ = _load_db_config(root)
+    connections = data.get("databases", [])
+
+    if not connections:
+        console.print(
+            "[yellow]No database connections configured.[/yellow]\n"
+            "Run [bold]laravelgraph db-connections add[/bold] to add one."
+        )
+        return
+
+    table = Table(
+        title=f"Database Connections ({len(connections)})",
+        show_header=True,
+        header_style="bold cyan",
+    )
+    table.add_column("Name", style="bold")
+    table.add_column("Driver")
+    table.add_column("Host")
+    table.add_column("Port", justify="right")
+    table.add_column("Database")
+    table.add_column("Procedures")
+    table.add_column("Views")
+    table.add_column("SSL")
+
+    for c in connections:
+        host = c.get("host", "") or (c.get("dsn", "")[:30] + "…" if c.get("dsn") else "—")
+        table.add_row(
+            c.get("name", "?"),
+            c.get("driver", "mysql"),
+            host,
+            str(c.get("port", 3306)),
+            c.get("database", "—"),
+            "yes" if c.get("analyze_procedures", True) else "no",
+            "yes" if c.get("analyze_views", True) else "no",
+            "yes" if c.get("ssl", False) else "no",
+        )
+
+    console.print(table)
+    console.print(
+        "\nRun [bold]laravelgraph db-connections test[/bold] to verify connectivity.\n"
+        "Run [bold]laravelgraph analyze --full[/bold] to re-index with live schema."
+    )
+
+
+@db_app.command("add")
+def db_add(
+    path: Optional[Path] = PathArg,
+    name: str = typer.Option("", "--name", "-n", help="Connection name (e.g. default, analytics)"),
+    no_test: bool = typer.Option(False, "--no-test", help="Skip connection test after adding"),
+) -> None:
+    """Add a MySQL database connection — interactive wizard.
+
+    Prompts for connection details, tests the connection, then saves to the
+    project config at [cyan]<project>/.laravelgraph/config.json[/cyan].
+
+    Passwords may reference environment variables using [cyan]${VAR_NAME}[/cyan]
+    syntax — the raw reference is stored (not the resolved value) so secrets
+    are never written to disk.
+
+    After adding, run [bold]laravelgraph analyze --full[/bold] to rebuild the
+    index with live database schema.
+
+    Examples:
+      laravelgraph db-connections add
+      laravelgraph db-connections add --name analytics --no-test
+    """
+    root = _project_root(path)
+    data, cfg_path = _load_db_config(root)
+    existing_names = {c.get("name", "") for c in data.get("databases", [])}
+
+    console.print(Panel(
+        "Add a [bold]live MySQL connection[/bold] for database schema introspection.\n\n"
+        "The tool will connect to your database and read [cyan]information_schema[/cyan]\n"
+        "to extract tables, columns, foreign keys, stored procedures, and views.\n\n"
+        "[yellow]Tip:[/yellow] Use [cyan]${ENV_VAR}[/cyan] for passwords to avoid storing\n"
+        "secrets in config files — e.g. [dim]${DB_PASSWORD}[/dim]",
+        title="LaravelGraph — Add Database Connection",
+        border_style="cyan",
+    ))
+
+    # ── Connection name ───────────────────────────────────────────────────────
+    if not name:
+        default_name = "default" if "default" not in existing_names else "db2"
+        name = typer.prompt("Connection name (matches Laravel connection key)", default=default_name)
+
+    if name in existing_names:
+        overwrite = typer.confirm(
+            f"Connection '{name}' already exists. Overwrite?", default=False
+        )
+        if not overwrite:
+            console.print("Cancelled.")
+            raise typer.Exit(0)
+
+    # ── Input mode ────────────────────────────────────────────────────────────
+    console.print("\n[bold]How would you like to enter the connection details?[/bold]\n")
+    console.print("  [cyan]1[/cyan]  Individual fields  (host, port, database, username, password)")
+    console.print("  [cyan]2[/cyan]  Full DSN string    (mysql://user:pass@host:3306/dbname)\n")
+    mode = typer.prompt("Select", default="1")
+
+    cfg_entry: dict = {"name": name, "driver": "mysql"}
+
+    if mode == "2":
+        dsn = typer.prompt("DSN", default="mysql://user:password@host:3306/database")
+        cfg_entry["dsn"] = dsn
+    else:
+        cfg_entry["host"] = typer.prompt("Host", default="127.0.0.1")
+        cfg_entry["port"] = int(typer.prompt("Port", default="3306"))
+        cfg_entry["database"] = typer.prompt("Database (schema name)")
+        cfg_entry["username"] = typer.prompt("Username")
+        pw = typer.prompt(
+            "Password  [dim](use ${VAR_NAME} to reference an env var)[/dim]",
+            hide_input=True,
+        )
+        cfg_entry["password"] = pw
+
+    # ── SSL ───────────────────────────────────────────────────────────────────
+    ssl = typer.confirm("Enable SSL? (recommended for AWS RDS)", default=True)
+    cfg_entry["ssl"] = ssl
+
+    # ── Options ───────────────────────────────────────────────────────────────
+    console.print()
+    cfg_entry["analyze_procedures"] = typer.confirm(
+        "Introspect stored procedures?", default=True
+    )
+    cfg_entry["analyze_views"] = typer.confirm(
+        "Introspect views?", default=True
+    )
+    cfg_entry["analyze_triggers"] = typer.confirm(
+        "Introspect triggers? (slower, off by default)", default=False
+    )
+
+    # ── Test connection ───────────────────────────────────────────────────────
+    if not no_test:
+        console.print("\nTesting connection...", end=" ")
+        ok, msg = _test_connection(cfg_entry)
+        if ok:
+            console.print(f"[green]✓[/green] {msg}")
+        else:
+            console.print(f"[red]✗[/red] {msg}")
+            save_anyway = typer.confirm("Connection test failed. Save anyway?", default=False)
+            if not save_anyway:
+                console.print("Cancelled. Check your connection details and try again.")
+                raise typer.Exit(1)
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    connections = data.setdefault("databases", [])
+    connections = [c for c in connections if c.get("name") != name]
+    connections.append(cfg_entry)
+    data["databases"] = connections
+
+    _save_db_config(data, cfg_path)
+
+    console.print(
+        f"\n[green]✓[/green] Connection [bold]{name}[/bold] saved to "
+        f"[cyan]{cfg_path}[/cyan]\n\n"
+        "[bold]Next steps:[/bold]\n"
+        "  1. [dim]laravelgraph analyze --full[/dim]  — rebuild index with live DB schema\n"
+        "  2. [dim]laravelgraph db-connections list[/dim]  — verify all connections\n"
+        "  3. [dim]laravelgraph db-connections test[/dim]  — re-test connectivity\n\n"
+        "[yellow]Note:[/yellow] Schema changes require [bold]--full[/bold] rebuild to take effect."
+    )
+
+
+@db_app.command("remove")
+def db_remove(
+    conn_name: str = typer.Argument(..., help="Connection name to remove"),
+    path: Optional[Path] = PathArg,
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+) -> None:
+    """Remove a configured database connection by name."""
+    root = _project_root(path)
+    data, cfg_path = _load_db_config(root)
+    connections = data.get("databases", [])
+
+    match = next((c for c in connections if c.get("name") == conn_name), None)
+    if not match:
+        console.print(f"[red]Connection not found:[/red] {conn_name}")
+        console.print("Run [bold]laravelgraph db-connections list[/bold] to see configured connections.")
+        raise typer.Exit(1)
+
+    if not force:
+        confirmed = typer.confirm(f"Remove connection '{conn_name}'?", default=False)
+        if not confirmed:
+            console.print("Cancelled.")
+            return
+
+    data["databases"] = [c for c in connections if c.get("name") != conn_name]
+    _save_db_config(data, cfg_path)
+
+    console.print(
+        f"[green]✓[/green] Connection [bold]{conn_name}[/bold] removed.\n"
+        "Run [bold]laravelgraph analyze --full[/bold] to rebuild the index."
+    )
+
+
+@db_app.command("test")
+def db_test(
+    conn_name: str = typer.Argument("", help="Connection name to test (default: all)"),
+    path: Optional[Path] = PathArg,
+) -> None:
+    """Test connectivity for one or all configured database connections.
+
+    Examples:
+      laravelgraph db-connections test           # test all
+      laravelgraph db-connections test analytics # test one
+    """
+    root = _project_root(path)
+    data, _ = _load_db_config(root)
+    connections = data.get("databases", [])
+
+    if not connections:
+        console.print(
+            "[yellow]No connections configured.[/yellow]\n"
+            "Run [bold]laravelgraph db-connections add[/bold] to add one."
+        )
+        raise typer.Exit(1)
+
+    if conn_name:
+        connections = [c for c in connections if c.get("name") == conn_name]
+        if not connections:
+            console.print(f"[red]Connection not found:[/red] {conn_name}")
+            raise typer.Exit(1)
+
+    table = Table(title="Connection Tests", show_header=True, header_style="bold")
+    table.add_column("Name", style="bold")
+    table.add_column("Host")
+    table.add_column("Database")
+    table.add_column("Status")
+    table.add_column("Details")
+
+    all_ok = True
+    for c in connections:
+        host = c.get("host", c.get("dsn", "")[:30] or "—")
+        ok, msg = _test_connection(c)
+        status = "[green]✓ OK[/green]" if ok else "[red]✗ FAIL[/red]"
+        if not ok:
+            all_ok = False
+        table.add_row(c.get("name", "?"), host, c.get("database", "—"), status, msg)
+
+    console.print(table)
+
+    if not all_ok:
+        raise typer.Exit(1)
+
+
+# ── db-query ──────────────────────────────────────────────────────────────────
+
+@app.command(name="db-query", rich_help_panel="1. Setup & Indexing")
+def db_query(
+    sql: str = typer.Argument("", help="Read-only SQL — SELECT, SHOW, DESCRIBE, or EXPLAIN"),
+    path: Optional[Path] = ProjectOpt,
+    connection: str = typer.Option("", "--connection", "-c", help="Connection name (default: first configured)"),
+    limit: int = typer.Option(50, "--limit", "-n", help="Max rows (default 50, max 500)"),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Bypass cache and force a live query"),
+    clear_cache: bool = typer.Option(False, "--clear-cache", help="Clear all cached query results and exit"),
+    warm: bool = typer.Option(False, "--warm", help="Pre-warm the query cache for top-accessed and small lookup tables, then exit"),
+    top_n: int = typer.Option(20, "--top-n", help="Number of top-accessed tables to warm (used with --warm)"),
+    lookup_threshold: int = typer.Option(500, "--lookup-threshold", help="Tables with fewer rows than this are treated as lookup tables (used with --warm)"),
+) -> None:
+    """Run a read-only SQL query against a configured live database.
+
+    Only SELECT, SHOW, DESCRIBE, and EXPLAIN are allowed — this tool is
+    strictly read-only.  Results are cached for 5 minutes by default so
+    repeated calls (e.g. from an AI agent during a session) don't hammer
+    the database.
+
+    Examples:
+      laravelgraph db-query "SELECT * FROM course_delivery_types"
+      laravelgraph db-query "DESCRIBE users"
+      laravelgraph db-query "SELECT id, name FROM plans LIMIT 5" --connection staging
+      laravelgraph db-query "SELECT * FROM orders WHERE status='pending'" --no-cache
+      laravelgraph db-query --clear-cache
+      laravelgraph db-query --warm
+      laravelgraph db-query --warm --top-n 30 --lookup-threshold 1000
+    """
+    root = _project_root(path)
+
+    from laravelgraph.config import Config, index_dir as _index_dir
+    from laravelgraph.mcp.query_cache import QueryResultCache, validate_sql, _MAX_ROWS
+
+    cfg = Config.load(root)
+    qc = QueryResultCache(_index_dir(root))
+
+    # ── --clear-cache ──────────────────────────────────────────────────────────
+    if clear_cache:
+        removed = qc.clear_all()
+        console.print(f"[green]✓[/green] Query cache cleared ({removed} entries removed)")
+        return
+
+    # ── --warm ─────────────────────────────────────────────────────────────────
+    if warm:
+        if not cfg.databases:
+            console.print("[yellow]No DB connections configured.[/yellow] Run: laravelgraph db-connections add")
+            raise typer.Exit(1)
+        console.print(f"[dim]Warming query cache (top {top_n} accessed + lookup tables < {lookup_threshold} rows)...[/dim]")
+        try:
+            from laravelgraph.mcp.warm_queries import warm_query_cache
+            totals = warm_query_cache(root, cfg, top_n=top_n, lookup_threshold=lookup_threshold)
+            console.print(
+                f"[green]✓[/green] Cache warmed: "
+                f"[bold]{totals['warmed']}[/bold] tables cached, "
+                f"{totals['skipped']} already live, "
+                f"{totals['errors']} errors"
+            )
+        except Exception as e:
+            console.print(f"[red]Warm failed:[/red] {e}")
+            raise typer.Exit(1)
+        return
+
+    # ── Safety check ──────────────────────────────────────────────────────────
+    if not sql:
+        console.print("[red]Error:[/red] Provide a SQL query or use --warm / --clear-cache")
+        raise typer.Exit(1)
+
+    err = validate_sql(sql)
+    if err:
+        console.print(f"[red]SQL rejected:[/red] {err}")
+        raise typer.Exit(1)
+
+    # ── Resolve connection ─────────────────────────────────────────────────────
+    db_configs = cfg.databases
+    if not db_configs:
+        console.print(
+            "[red]No database connections configured.[/red]\n"
+            "Run [bold]laravelgraph db-connections add[/bold] first."
+        )
+        raise typer.Exit(1)
+
+    if connection:
+        conn_cfg = next((c for c in db_configs if c.name == connection), None)
+        if not conn_cfg:
+            names = ", ".join(c.name for c in db_configs)
+            console.print(f"[red]Connection '{connection}' not found.[/red] Available: {names}")
+            raise typer.Exit(1)
+    else:
+        conn_cfg = db_configs[0]
+
+    conn_name = conn_cfg.name
+    safe_limit = max(1, min(limit, _MAX_ROWS))
+
+    sql_for_exec = sql.strip().rstrip(";")
+    if sql_for_exec.upper().lstrip().startswith("SELECT") and \
+            "LIMIT" not in sql_for_exec.upper():
+        sql_for_exec = f"{sql_for_exec} LIMIT {safe_limit}"
+
+    ttl = conn_cfg.query_cache_ttl
+
+    # ── Cache lookup ───────────────────────────────────────────────────────────
+    cache_key = qc.make_key(conn_name, sql_for_exec)
+    if not no_cache and ttl > 0:
+        cached = qc.get(cache_key, ttl=ttl)
+        if cached:
+            age = int(time.time() - cached["cached_at"])
+            _render_query_table(console, cached["columns"], cached["rows"], conn_name, from_cache=True, cache_age=age)
+            return
+
+    # ── Live query ─────────────────────────────────────────────────────────────
+    try:
+        import pymysql  # noqa
+    except ImportError:
+        console.print("[red]PyMySQL not installed.[/red] Run: pip install pymysql")
+        raise typer.Exit(1)
+
+    with console.status(f"[dim]Querying {conn_name}…[/dim]"):
+        try:
+            from laravelgraph.pipeline.phase_24_db_introspect import _connect_mysql
+            mysql_conn = _connect_mysql(conn_cfg)
+            with mysql_conn.cursor() as cur:
+                cur.execute(sql_for_exec)
+                raw_rows = cur.fetchall()
+                columns = [d[0] for d in (cur.description or [])]
+            mysql_conn.close()
+        except Exception as exc:
+            console.print(f"[red]Query failed:[/red] {exc}")
+            raise typer.Exit(1)
+
+    rows = [dict(zip(columns, row)) for row in raw_rows]
+
+    if ttl > 0:
+        qc.set(cache_key, sql, conn_name, columns, rows, ttl=ttl)
+
+    _render_query_table(console, columns, rows, conn_name, from_cache=False)
+
+
+def _render_query_table(
+    console: Console,
+    columns: list,
+    rows: list,
+    connection: str,
+    from_cache: bool = False,
+    cache_age: int = 0,
+) -> None:
+    """Render query results as a Rich table in the terminal."""
+    import time as _time
+    source = f"cached {cache_age}s ago" if from_cache else "live"
+    console.print(f"\n[dim]Connection:[/dim] [bold]{connection}[/bold]  [dim]({source})[/dim]")
+
+    if not rows:
+        console.print("[dim]No rows returned.[/dim]")
+        return
+
+    table = Table(show_header=True, header_style="bold cyan", box=None)
+    for col in columns:
+        table.add_column(str(col))
+    for row in rows:
+        table.add_row(*[str(row.get(c, "")) for c in columns])
+
+    console.print(table)
+    console.print(f"[dim]{len(rows)} row(s)[/dim]")
+
+
 # ── version ───────────────────────────────────────────────────────────────────
 
 @app.command(rich_help_panel="5. Utilities")
@@ -1670,7 +2187,7 @@ def version() -> None:
 
 @app.command(rich_help_panel="5. Utilities")
 def doctor(path: Optional[Path] = PathArg) -> None:
-    """Full health check across all 9 system sections.
+    """Full health check across all 10 system sections.
 
     Runs a comprehensive diagnostic and reports pass/warn/fail for each check:
 
@@ -1683,6 +2200,7 @@ def doctor(path: Optional[Path] = PathArg) -> None:
       7. Transport & Server — binary in PATH, HTTP server reachability, config snippets
       8. LLM Provider   — active provider, model selection, live summary test
       9. Optional Features — watchfiles (watch mode), fastembed (vector search)
+     10. Database Connections — PyMySQL, configured connections, connectivity tests, indexed DB stats
 
     Exits with code 1 if any check fails. Use this to verify your setup after
     install, after upgrade, or when something seems wrong.
@@ -2046,6 +2564,166 @@ def doctor(path: Optional[Path] = PathArg) -> None:
         ok("fastembed installed — vector search available")
     except ImportError:
         warn("fastembed not installed — vector search unavailable (pip install fastembed)")
+
+    # ── 10. Database Connections ───────────────────────────────────────────────
+    section("Database Connections")
+    try:
+        import pymysql  # noqa
+        ok("PyMySQL installed — live DB introspection available")
+    except ImportError:
+        fail("PyMySQL not installed — live DB introspection unavailable", "pip install PyMySQL")
+
+    db_connections = cfg.databases if hasattr(cfg, "databases") else []
+    if not db_connections:
+        warn("No DB connections configured — migration-based schema only")
+        console.print("       [dim]Run: laravelgraph db-connections add[/dim]")
+    else:
+        ok(f"{len(db_connections)} connection(s) configured")
+        for db_conn in db_connections:
+            conn_name = getattr(db_conn, "name", "?")
+            host = getattr(db_conn, "host", "?")
+            dbname = getattr(db_conn, "database", "?")
+            console.print(f"  [dim]  {conn_name}: {host}/{dbname}[/dim]")
+
+            # Connectivity test
+            try:
+                import pymysql
+                import os as _os
+                password = getattr(db_conn, "password", "")
+                if isinstance(password, str) and password.startswith("${") and password.endswith("}"):
+                    env_var = password[2:-1]
+                    password = _os.environ.get(env_var, "")
+                pymysql.connect(
+                    host=getattr(db_conn, "host", "127.0.0.1"),
+                    port=int(getattr(db_conn, "port", 3306)),
+                    database=getattr(db_conn, "database", ""),
+                    user=getattr(db_conn, "username", ""),
+                    password=password,
+                    ssl={"ssl": {}} if getattr(db_conn, "ssl", False) else None,
+                    connect_timeout=5,
+                ).close()
+                ok(f"  Connection `{conn_name}` — reachable")
+            except Exception as e:
+                fail(
+                    f"  Connection `{conn_name}` — {e}",
+                    "Run: laravelgraph db-connections test",
+                )
+
+    # Check indexed DB stats if a project is indexed (phases 24-26 health)
+    from laravelgraph.config import index_dir as _index_dir_doctor
+    if root and (_index_dir_doctor(root) / "graph.kuzu").exists():
+        def _silent_count(_db, query: str) -> int:
+            """Run a count query without logging errors (schema may be outdated)."""
+            try:
+                result = _db.execute_raw(query)
+                if result and result.has_next():
+                    return result.get_next()[0] or 0
+            except Exception:
+                pass
+            return -1  # -1 = query not supported (old schema)
+
+        try:
+            from laravelgraph.core.graph import GraphDB
+            _db = GraphDB(_index_dir_doctor(root) / "graph.kuzu")
+
+            # ── Phase 19: migration-derived tables ────────────────────────────
+            mig_cnt = _silent_count(
+                _db,
+                "MATCH (t:DatabaseTable) WHERE t.source = 'migration' OR t.connection IS NULL "
+                "RETURN count(*)"
+            )
+            col_cnt = _silent_count(_db, "MATCH (c:DatabaseColumn) RETURN count(*)")
+            if mig_cnt >= 0:
+                ok(f"Phase 19 (migration schema): {mig_cnt} tables, {max(col_cnt, 0)} columns")
+            else:
+                warn("Phase 19 stats unavailable")
+
+            # ── Phase 24: live DB introspection ───────────────────────────────
+            live_cnt = _silent_count(
+                _db,
+                "MATCH (t:DatabaseTable) WHERE t.source = 'live_db' RETURN count(*)"
+            )
+            fk_cnt = _silent_count(
+                _db,
+                "MATCH (:DatabaseTable)-[:REFERENCES_TABLE {enforced: true}]->(:DatabaseTable) "
+                "RETURN count(*)"
+            )
+            proc_cnt = _silent_count(_db, "MATCH (p:StoredProcedure) RETURN count(*)")
+            if live_cnt > 0:
+                ok(f"Phase 24 (live DB): {live_cnt} live tables, {max(fk_cnt, 0)} enforced FKs, {max(proc_cnt, 0)} procedures")
+            elif db_connections:
+                fail(
+                    "Phase 24 (live DB): 0 live tables — introspection did not complete",
+                    "Run: laravelgraph analyze --phases 24,25,26",
+                )
+            else:
+                warn("Phase 24 (live DB): no connections configured — migration schema only")
+
+            # ── Schema health: check if INT32 overflow fix is in place ────────
+            try:
+                # CALL table_info() returns column names + types for the node table
+                _col_type_result = _db.execute_raw("CALL table_info('DatabaseColumn') RETURN *")
+                _length_type = None
+                while _col_type_result and _col_type_result.has_next():
+                    row = _col_type_result.get_next()
+                    # row is (name, type, ...) depending on KuzuDB version
+                    if row and len(row) >= 2 and str(row[0]).lower() == "length":
+                        _length_type = str(row[1]).upper()
+                        break
+                if _length_type in ("INT64", "INT32"):
+                    if _length_type == "INT64":
+                        ok("Schema health: DatabaseColumn.length is INT64 (overflow-safe)")
+                    else:
+                        fail(
+                            "Schema health: DatabaseColumn.length is INT32 — LONGTEXT columns will overflow",
+                            "Run: laravelgraph analyze . --full  to rebuild with the fixed schema",
+                        )
+                else:
+                    # Couldn't determine — not a failure, just skip
+                    pass
+            except Exception:
+                pass  # CALL table_info not supported on this KuzuDB version — skip silently
+
+            # ── Phase 25: model-table links ───────────────────────────────────
+            uses_table_cnt = _silent_count(
+                _db, "MATCH (:EloquentModel)-[:USES_TABLE]->(:DatabaseTable) RETURN count(*)"
+            )
+            model_cnt = _silent_count(_db, "MATCH (m:EloquentModel) RETURN count(*)")
+            if uses_table_cnt > 0:
+                ok(f"Phase 25 (model-table links): {uses_table_cnt} USES_TABLE edges across {max(model_cnt, 0)} models")
+            elif model_cnt > 0:
+                warn(
+                    f"Phase 25 (model-table links): 0 links for {model_cnt} models — "
+                    "run: laravelgraph analyze --phases 19,24,25"
+                )
+            else:
+                warn("Phase 25: no Eloquent models found")
+
+            # ── Phase 26: DB access analysis ──────────────────────────────────
+            qt_cnt = _silent_count(_db, "MATCH ()-[:QUERIES_TABLE]->() RETURN count(*)")
+            inferred_cnt = _silent_count(_db, "MATCH (n:InferredRelationship) RETURN count(*)")
+            if qt_cnt > 0:
+                ok(f"Phase 26 (DB access): {qt_cnt} QUERIES_TABLE edges, {max(inferred_cnt, 0)} inferred relationships")
+            else:
+                warn("Phase 26 (DB access): 0 QUERIES_TABLE edges — run: laravelgraph analyze --phases 26")
+
+        except Exception as e:
+            warn(f"DB graph stats unavailable: {e}")
+
+    # ── Query cache stats ──────────────────────────────────────────────────────
+    from laravelgraph.config import index_dir as _index_dir_qc
+    try:
+        from laravelgraph.mcp.query_cache import QueryResultCache
+        _qc = QueryResultCache(_index_dir_qc(root))
+        _qc_stats = _qc.stats()
+        live = _qc_stats["live_entries"]
+        total = _qc_stats["cached_entries"]
+        if total > 0:
+            ok(f"Query cache: {live} live entries, {total - live} expired ({total} total) — use 'laravelgraph db-query --clear-cache' to reset")
+        else:
+            ok("Query cache: empty (populated on first db-query call)")
+    except Exception:
+        pass
 
     # ── Summary ───────────────────────────────────────────────────────────────
     console.print()
