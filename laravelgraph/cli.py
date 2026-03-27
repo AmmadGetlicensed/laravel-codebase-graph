@@ -1306,6 +1306,7 @@ def providers(path: Optional[Path] = PathArg) -> None:
 def configure(
     path: Optional[Path] = PathArg,
     global_: bool = typer.Option(False, "--global", "-g", help="Save to global config (~/.laravelgraph/config.json) rather than project-level (.laravelgraph/config.json)"),
+    activate: str = typer.Option("", "--activate", "-a", help="Activate an already-configured provider by name without re-entering credentials (e.g. --activate groq)"),
 ) -> None:
     """Interactive wizard to configure an LLM provider for semantic summaries.
 
@@ -1326,14 +1327,52 @@ def configure(
     `laravelgraph doctor` to run a live test.
 
     Examples:
-      laravelgraph configure           # Interactive — project-level config
-      laravelgraph configure --global  # Save to ~/.laravelgraph/config.json
+      laravelgraph configure                  # Interactive — project-level config
+      laravelgraph configure --global         # Save to ~/.laravelgraph/config.json
+      laravelgraph configure --activate groq  # Switch active provider (no re-auth)
+      laravelgraph configure -g --activate openai  # Switch globally
     """
     import json as _json
     root = _project_root(path)
 
     from laravelgraph.config import global_dir, index_dir as _index_dir
-    from laravelgraph.mcp.summarize import PROVIDER_REGISTRY
+    from laravelgraph.mcp.summarize import PROVIDER_REGISTRY, provider_status
+    from laravelgraph.config import Config
+
+    # ── --activate shortcut: just switch the active provider ─────────────────
+    if activate:
+        activate = activate.strip().lower()
+        if activate not in PROVIDER_REGISTRY and activate != "auto":
+            known = ", ".join(PROVIDER_REGISTRY.keys())
+            console.print(f"[red]Unknown provider:[/red] {activate}\nKnown: {known}")
+            raise typer.Exit(1)
+
+        if not global_:
+            console.print("\n[bold]Where to save?[/bold]\n")
+            console.print(f"  [cyan]1[/cyan]  This project only  ({root / '.laravelgraph' / 'config.json'})")
+            console.print(f"  [cyan]2[/cyan]  Global — all projects  (~/.laravelgraph/config.json)\n")
+            global_ = typer.prompt("Save to", default="2") == "2"
+
+        cfg_path = (global_dir() if global_ else _index_dir(root)) / "config.json"
+        existing: dict = {}
+        if cfg_path.exists():
+            try:
+                existing = _json.loads(cfg_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        existing.setdefault("summary", {})["provider"] = activate
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(_json.dumps(existing, indent=2), encoding="utf-8")
+        scope_label = "global" if global_ else "project"
+        console.print(f"[green]✓[/green] Active provider set to [green]{activate}[/green] ({scope_label})")
+        console.print("Run [bold]laravelgraph providers[/bold] to verify.")
+        return
+
+    # ── Load existing config to show current state ────────────────────────────
+    cfg = Config.load(root)
+    status = provider_status(cfg.summary)
+    current_active = status.get("active_provider")
+    configured_names = {n for n, info in status["providers"].items() if info.get("configured")}
 
     console.print(Panel(
         "Configure an LLM provider for [bold]semantic summary generation[/bold].\n"
@@ -1343,17 +1382,29 @@ def configure(
         border_style="cyan",
     ))
 
+    if current_active:
+        console.print(f"\n[bold]Currently active:[/bold] [green]{current_active}[/green]  "
+                      f"(switch with [dim]--activate <name>[/dim])")
+    if configured_names:
+        others = configured_names - ({current_active} if current_active else set())
+        if others:
+            console.print(f"[dim]Also configured (not active): {', '.join(sorted(others))}[/dim]")
+
     # ── List all providers ────────────────────────────────────────────────────
     cloud_providers = [(n, v) for n, v in PROVIDER_REGISTRY.items() if not v.get("local")]
     local_providers = [(n, v) for n, v in PROVIDER_REGISTRY.items() if v.get("local")]
 
     console.print("\n[bold]Cloud providers:[/bold]\n")
     for i, (name, info) in enumerate(cloud_providers, start=1):
-        console.print(f"  [cyan]{i:2}[/cyan]  {info['label']}")
+        active_marker = " [green]← active[/green]" if name == current_active else ""
+        configured_marker = " [dim]✓ configured[/dim]" if name in configured_names else ""
+        console.print(f"  [cyan]{i:2}[/cyan]  {info['label']}{configured_marker}{active_marker}")
 
     console.print("\n[bold]Local providers (no API key required):[/bold]\n")
     for i, (name, info) in enumerate(local_providers, start=len(cloud_providers) + 1):
-        console.print(f"  [cyan]{i:2}[/cyan]  {info['label']}")
+        active_marker = " [green]← active[/green]" if name == current_active else ""
+        configured_marker = " [dim]✓ configured[/dim]" if name in configured_names else ""
+        console.print(f"  [cyan]{i:2}[/cyan]  {info['label']}{configured_marker}{active_marker}")
 
     console.print(f"\n  [cyan] 0[/cyan]  Disable summaries\n")
 
@@ -1374,6 +1425,40 @@ def configure(
     # ── Provider-specific prompts ─────────────────────────────────────────────
     summary_patch: dict = {}
 
+    def _pick_model(info: dict, custom_prompt: str = "") -> str:
+        """Show numbered model list for a provider; let user pick or type custom."""
+        model_list: list[tuple[str, str]] = info.get("models", [])
+        default_model: str = info.get("default_model", "")
+
+        if not model_list:
+            # No curated list — fall back to free-text prompt
+            return typer.prompt(custom_prompt or "Model", default=default_model)
+
+        console.print("\n[bold]Available models:[/bold]\n")
+        for i, (mid, desc) in enumerate(model_list, start=1):
+            default_marker = " [dim](default)[/dim]" if mid == default_model else ""
+            console.print(f"  [cyan]{i:2}[/cyan]  [bold]{mid}[/bold]{default_marker}")
+            console.print(f"       [dim]{desc}[/dim]")
+        console.print(f"\n  [cyan] 0[/cyan]  Enter custom model ID\n")
+
+        # Default choice = index of the default_model in the list, else 1
+        default_idx = next((str(i) for i, (mid, _) in enumerate(model_list, 1) if mid == default_model), "1")
+        raw = typer.prompt("Select model number (or type a model ID directly)", default=default_idx)
+
+        # If the input is a digit, treat as list pick; otherwise use as literal model ID
+        if raw.isdigit():
+            idx = int(raw)
+            if idx == 0:
+                return typer.prompt("Model ID")
+            if 1 <= idx <= len(model_list):
+                chosen_id = model_list[idx - 1][0]
+                console.print(f"  → [green]{chosen_id}[/green]")
+                return chosen_id
+            console.print(f"[yellow]Invalid choice {idx}, using default[/yellow]")
+            return default_model or model_list[0][0]
+        # User typed a model ID directly
+        return raw.strip()
+
     if provider_name == "disabled":
         summary_patch = {"enabled": False}
         console.print("[yellow]Summaries will be disabled.[/yellow]")
@@ -1383,7 +1468,7 @@ def configure(
         console.print(f"\n[bold]{provider_info['label']}[/bold]")
         default_url = provider_info["base_url"].replace("/v1", "")  # show clean URL
         base_url = typer.prompt("Base URL", default=default_url)
-        model = typer.prompt("Model name (must be already pulled/loaded locally)")
+        model = _pick_model(provider_info, "Model name (must be already pulled/loaded locally)")
         summary_patch = {
             "provider": provider_name,
             "base_urls": {provider_name: base_url},
@@ -1393,14 +1478,16 @@ def configure(
     else:
         # Cloud provider: ask for API key + model
         env_var = provider_info["env_var"]  # type: ignore[index]
-        default_model = provider_info["default_model"]  # type: ignore[index]
         console.print(f"\n[bold]{provider_info['label']}[/bold]")  # type: ignore[index]
         if env_var:
             console.print(f"Environment variable: [cyan]{env_var}[/cyan]")
         key = typer.prompt("API key", hide_input=True)
-        model = typer.prompt("Model", default=default_model)
+        model = _pick_model(provider_info)
+        # Save explicit provider name (not "auto") so this provider becomes the
+        # active one immediately and does not displace an already-active provider
+        # when the user later adds a second key.
         summary_patch = {
-            "provider": "auto",
+            "provider": provider_name,
             "api_keys": {provider_name: key},
             "models": {provider_name: model},
         }
@@ -1410,12 +1497,13 @@ def configure(
         console.print("\n[bold]Where to save?[/bold]\n")
         console.print(f"  [cyan]1[/cyan]  This project only  ({root / '.laravelgraph' / 'config.json'})")
         console.print(f"  [cyan]2[/cyan]  Global — all projects  (~/.laravelgraph/config.json)\n")
-        global_ = typer.prompt("Save to", default="1") == "2"
+        global_ = typer.prompt("Save to", default="2") == "2"
 
     cfg_path = (global_dir() if global_ else _index_dir(root)) / "config.json"
 
-    # Deep-merge into existing config
-    existing: dict = {}
+    # Deep-merge into existing config — api_keys/models/base_urls dicts are merged
+    # (not replaced) so previously configured providers are preserved.
+    existing = {}
     if cfg_path.exists():
         try:
             existing = _json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -1440,7 +1528,9 @@ def configure(
             f"\n[bold]Active provider:[/bold] [green]{provider_name}[/green]\n"
             "Summaries will be generated on first query and cached automatically.\n"
             "Run [bold]laravelgraph providers[/bold] to verify — "
-            "[bold]laravelgraph doctor[/bold] to test live."
+            "[bold]laravelgraph doctor[/bold] to test live.\n"
+            f"To switch provider later without re-entering keys: "
+            f"[dim]laravelgraph configure --activate <name>[/dim]"
         )
         if provider_info and not provider_info.get("local") and provider_info.get("env_var"):
             console.print(
@@ -2183,27 +2273,175 @@ def version() -> None:
     console.print(f"LaravelGraph v{__version__}")
 
 
+# ── changelog ─────────────────────────────────────────────────────────────────
+
+def _find_changelog() -> Path | None:
+    """Locate CHANGELOG.md — works in both dev (pip install -e) and installed (pipx) modes."""
+    # Bundled inside the package (installed via pipx / pip install)
+    pkg_path = Path(__file__).parent / "CHANGELOG.md"
+    if pkg_path.exists():
+        return pkg_path
+    # Source checkout — one level up from laravelgraph/
+    repo_path = Path(__file__).parent.parent / "CHANGELOG.md"
+    if repo_path.exists():
+        return repo_path
+    return None
+
+
+def _parse_changelog(text: str) -> list[dict]:
+    """
+    Parse Keep-a-Changelog markdown into a list of version dicts:
+      [{"label": "0.2.0", "date": "2026-03-27", "latest": True, "content": "..."}]
+    The first entry with a version number is marked latest=True.
+    The special [Unreleased] section is included if it has content.
+    """
+    import re
+    sections: list[dict] = []
+    # Split on lines that start with "## ["
+    heading_re = re.compile(r"^(## \[.+?\].*?)$", re.MULTILINE)
+    parts = heading_re.split(text)
+    # parts = [preamble, heading1, body1, heading2, body2, ...]
+    i = 1
+    found_versioned = False
+    while i < len(parts) - 1:
+        heading = parts[i].strip()
+        body = parts[i + 1].strip()
+        i += 2
+        # heading looks like: ## [0.2.0] - 2026-03-27  or  ## [Unreleased]
+        m = re.match(r"## \[(.+?)\](?:\s*-\s*(.+))?", heading)
+        if not m:
+            continue
+        label = m.group(1)
+        date = (m.group(2) or "").strip()
+        if label.lower() == "unreleased":
+            if body:
+                sections.append({"label": "Unreleased", "date": "", "latest": False, "content": body})
+        else:
+            is_latest = not found_versioned
+            found_versioned = True
+            sections.append({"label": label, "date": date, "latest": is_latest, "content": body})
+    return sections
+
+
+def _render_changelog_sections(sections: list[dict]) -> None:
+    """Render parsed changelog sections to the console with Rich."""
+    from rich.markdown import Markdown
+    from rich.rule import Rule
+
+    for sec in sections:
+        label = sec["label"]
+        date = sec["date"]
+        is_latest = sec["latest"]
+
+        # Build header line
+        if label == "Unreleased":
+            title = "[bold yellow]Unreleased[/bold yellow]"
+            border = "yellow"
+        elif is_latest:
+            title = f"[bold green]v{label}[/bold green]  [dim]{date}[/dim]  [green]← latest[/green]"
+            border = "green"
+        else:
+            title = f"[bold]v{label}[/bold]  [dim]{date}[/dim]"
+            border = "dim"
+
+        console.print(Panel(Markdown(sec["content"]), title=title, border_style=border, padding=(0, 1)))
+        console.print()
+
+
+@app.command(rich_help_panel="5. Utilities")
+def changelog(
+    latest: bool = typer.Option(False, "--latest", "-l", help="Show only the latest release"),
+    version_filter: Optional[str] = typer.Option(
+        None, "--version", "-v", metavar="VERSION",
+        help="Show a specific version (e.g. '0.2.0')"
+    ),
+    all_versions: bool = typer.Option(False, "--all", "-a", help="Show the complete release history"),
+) -> None:
+    """Show the release changelog in the terminal.
+
+    By default, displays the two most recent versions.
+    Use --latest for just the newest release, --all for the full history,
+    or --version to jump to a specific release.
+
+    Examples:
+      laravelgraph changelog               # two most recent versions
+      laravelgraph changelog --latest      # newest version only
+      laravelgraph changelog --version 0.1.0
+      laravelgraph changelog --all         # full history
+    """
+    cl_path = _find_changelog()
+    if cl_path is None:
+        console.print("[red]CHANGELOG.md not found.[/red]")
+        raise typer.Exit(1)
+
+    text = cl_path.read_text(encoding="utf-8")
+    sections = _parse_changelog(text)
+
+    if not sections:
+        console.print("[yellow]Changelog is empty.[/yellow]")
+        return
+
+    from laravelgraph import __version__
+    console.print(
+        Panel(
+            f"[bold green]LaravelGraph[/bold green] Changelog  "
+            f"[dim](current: v{__version__})[/dim]",
+            border_style="green",
+            padding=(0, 1),
+        )
+    )
+    console.print()
+
+    if version_filter:
+        matched = [s for s in sections if s["label"] == version_filter]
+        if not matched:
+            available = ", ".join(s["label"] for s in sections)
+            console.print(f"[red]Version '{version_filter}' not found.[/red]  Available: {available}")
+            raise typer.Exit(1)
+        _render_changelog_sections(matched)
+    elif latest:
+        # First versioned section (skip Unreleased)
+        versioned = [s for s in sections if s["label"] != "Unreleased"]
+        _render_changelog_sections(versioned[:1])
+    elif all_versions:
+        _render_changelog_sections(sections)
+    else:
+        # Default: show Unreleased (if non-empty) + 2 most recent versioned releases
+        unreleased = [s for s in sections if s["label"] == "Unreleased"]
+        versioned = [s for s in sections if s["label"] != "Unreleased"]
+        _render_changelog_sections(unreleased + versioned[:2])
+
+
 # ── doctor ────────────────────────────────────────────────────────────────────
 
 @app.command(rich_help_panel="5. Utilities")
 def doctor(path: Optional[Path] = PathArg) -> None:
-    """Full health check across all 10 system sections.
+    """Full health check — use this first when something seems wrong.
 
     Runs a comprehensive diagnostic and reports pass/warn/fail for each check:
 
-      1. Config         — load config from all sources, check for errors
-      2. Dependencies   — required packages (kuzu, fastmcp) and optional SDKs
-      3. Graph DB       — verify KuzuDB is accessible, report node/edge counts
-      4. MCP Tools      — smoke-test all key MCP tool queries against the graph
-      5. Context Quality — source injection, summary cache read/write, route resolution
-      6. Recent Changes  — verify fixes for known issues (snippet limits, route upsert)
-      7. Transport & Server — binary in PATH, HTTP server reachability, config snippets
-      8. LLM Provider   — active provider, model selection, live summary test
-      9. Optional Features — watchfiles (watch mode), fastembed (vector search)
-     10. Database Connections — PyMySQL, configured connections, connectivity tests, indexed DB stats
+      1. Config              — load config from all sources, check for errors
+      2. Dependencies        — required packages (kuzu, fastmcp) and optional SDKs
+      3. Graph DB            — verify KuzuDB is accessible, report total node/edge counts
+      4. Index Health        — per-type symbol counts (routes, models, events, jobs) +
+                               critical edge counts (CALLS, DISPATCHES, LISTENS_TO,
+                               QUERIES_TABLE) + index age warning
+      5. Context Quality     — source readability, summary cache read/write
+      6. Data Quality        — route resolution %, event listener coverage %,
+                               model-table link %, source readability
+      7. Transport & Server  — binary in PATH, HTTP server reachability, config snippets
+      8. LLM Provider        — active provider, model selection, live summary test
+      9. Optional Features   — watchfiles (watch mode), fastembed (vector search)
+     10. Database Connections — PyMySQL, configured connections, connectivity tests,
+                               phases 19/24/25/26 health, query cache stats
 
-    Exits with code 1 if any check fails. Use this to verify your setup after
-    install, after upgrade, or when something seems wrong.
+    Common failure patterns:
+      Events: 0    → run: laravelgraph analyze --full  (events missing = stale index)
+      CALLS: 0     → run: laravelgraph analyze --full  (request_flow will be shallow)
+      Jobs: 0      → check if jobs exist; if they do, run: laravelgraph analyze --full
+      Routes: 0    → run: laravelgraph analyze
+
+    Exits with code 1 if any check fails.
 
     Examples:
       laravelgraph doctor
@@ -2293,27 +2531,95 @@ def doctor(path: Optional[Path] = PathArg) -> None:
         else:
             fail("Graph DB error", err_str)
 
-    # ── 4. MCP Tool smoke tests ───────────────────────────────────────────────
-    section("MCP Tools")
+    # ── 4. Index Health ───────────────────────────────────────────────────────
+    section("Index Health")
     if db is None:
-        warn("Skipping tool tests — no graph DB")
+        warn("Skipping index health checks — no graph DB")
     else:
-        tool_checks = [
-            ("laravelgraph_query",   "MATCH (n) RETURN n.name AS name LIMIT 1"),
-            ("laravelgraph_routes",  "MATCH (r:Route) RETURN r.uri AS uri LIMIT 1"),
-            ("laravelgraph_models",  "MATCH (m:EloquentModel) RETURN m.name AS name LIMIT 1"),
-            ("laravelgraph_events",  "MATCH (e:Event) RETURN e.name AS name LIMIT 1"),
-            ("laravelgraph_schema",  "MATCH (t:DatabaseTable) RETURN t.name AS name LIMIT 1"),
-            ("laravelgraph_bindings","MATCH (b:ServiceBinding) RETURN b.abstract AS abs LIMIT 1"),
-        ]
-        for tool_name, query in tool_checks:
+        def _count(query: str) -> int:
             try:
-                t0 = time.perf_counter()
-                db.execute(query)
-                ms = (time.perf_counter() - t0) * 1000
-                ok(f"{tool_name} [dim]({ms:.0f}ms)[/dim]")
-            except Exception as e:
-                fail(f"{tool_name}", str(e))
+                rows = db.execute(query)
+                return rows[0].get(list(rows[0].keys())[0], 0) if rows else 0
+            except Exception:
+                return -1
+
+        # Core symbol counts
+        n_routes   = _count("MATCH (r:Route) RETURN count(r) AS n")
+        n_models   = _count("MATCH (m:EloquentModel) RETURN count(m) AS n")
+        n_events   = _count("MATCH (e:Event) RETURN count(e) AS n")
+        n_jobs     = _count("MATCH (j:Job) RETURN count(j) AS n")
+        n_classes  = _count("MATCH (c:Class_) RETURN count(c) AS n")
+        n_methods  = _count("MATCH (m:Method) RETURN count(m) AS n")
+
+        # Edge counts — these power the key tools
+        n_calls      = _count("MATCH ()-[r:CALLS]->() RETURN count(r) AS n")
+        n_dispatches = _count("MATCH ()-[r:DISPATCHES]->() RETURN count(r) AS n")
+        n_listens    = _count("MATCH ()-[r:LISTENS_TO]->() RETURN count(r) AS n")
+        n_queries_t  = _count("MATCH ()-[r:QUERIES_TABLE]->() RETURN count(r) AS n")
+
+        # Index age
+        import datetime as _dt
+        _idx_path = _index_dir(root) / "graph.kuzu"
+        try:
+            _mtime = _dt.datetime.fromtimestamp(_idx_path.stat().st_mtime)
+            _age_days = (_dt.datetime.now() - _mtime).days
+            _age_str = f"{_age_days}d ago" if _age_days > 0 else "today"
+        except Exception:
+            _age_str = "unknown"
+
+        # Report
+        if n_routes > 0:
+            ok(f"Routes: {n_routes:,}")
+        else:
+            fail("Routes: 0 — run: laravelgraph analyze", "request_flow and feature_context will not work")
+
+        if n_models > 0:
+            ok(f"Eloquent models: {n_models:,}")
+        else:
+            warn("Eloquent models: 0 — run: laravelgraph analyze")
+
+        if n_events > 0:
+            ok(f"Events: {n_events:,}")
+        else:
+            fail(
+                "Events: 0 — event dispatch graph will be empty",
+                "Run: laravelgraph analyze --full  (events are indexed in phases 12-15)",
+            )
+
+        if n_jobs > 0:
+            ok(f"Jobs: {n_jobs:,}")
+        else:
+            warn("Jobs: 0 — queued jobs will not appear in feature_context or request_flow")
+
+        ok(f"Classes: {n_classes:,}   Methods: {n_methods:,}")
+
+        if n_calls > 0:
+            ok(f"CALLS edges: {n_calls:,} — request_flow deep traversal will work")
+        else:
+            fail(
+                "CALLS edges: 0 — request_flow will only show controller, not service layer",
+                "Run: laravelgraph analyze --full",
+            )
+
+        if n_dispatches > 0:
+            ok(f"DISPATCHES edges: {n_dispatches:,}")
+        else:
+            warn("DISPATCHES edges: 0 — events/jobs will not appear in request_flow or feature_context")
+
+        if n_listens > 0:
+            ok(f"LISTENS_TO edges: {n_listens:,}")
+        else:
+            warn("LISTENS_TO edges: 0 — event listener chains will be empty")
+
+        if n_queries_t > 0:
+            ok(f"QUERIES_TABLE edges: {n_queries_t:,} — DB access tracing available")
+        else:
+            warn("QUERIES_TABLE edges: 0 — run: laravelgraph analyze --phases 26")
+
+        if _age_str != "unknown" and _age_days > 7:
+            warn(f"Index is {_age_str} old — consider re-running laravelgraph analyze")
+        else:
+            ok(f"Index last updated: {_age_str}")
 
     # ── 5. Context Quality ────────────────────────────────────────────────────
     section("Context Quality")
@@ -2375,76 +2681,117 @@ def doctor(path: Optional[Path] = PathArg) -> None:
         except Exception as e:
             warn(f"Closure route check skipped: {e}")
 
-    # ── 6. Recent Changes ─────────────────────────────────────────────────────
-    section("Recent Changes")
-    # 6a. _MAX_SNIPPET_LINES should be 300 (raised from 120 to fix source truncation)
-    try:
-        from laravelgraph.mcp.explain import _MAX_SNIPPET_LINES
-        if _MAX_SNIPPET_LINES >= 300:
-            ok(f"Source snippet limit: {_MAX_SNIPPET_LINES} lines (truncation fix active)")
-        else:
-            fail(
-                f"Source snippet limit is {_MAX_SNIPPET_LINES} — should be ≥ 300",
-                "Old value causes source truncation for large methods",
-            )
-    except Exception as e:
-        warn(f"Could not verify _MAX_SNIPPET_LINES: {e}")
-
-    # 6b. include_source parameter on laravelgraph_context (cache-warm token saving)
-    try:
-        import inspect
-        from laravelgraph.mcp.server import create_server as _cs
-        # Inspect the source of the module to find include_source param
-        import laravelgraph.mcp.server as _srv_mod
-        src_txt = inspect.getsource(_srv_mod)
-        if "include_source" in src_txt and "not cached_summary or include_source" in src_txt:
-            ok("Cache-aware source suppression active (include_source parameter)")
-        else:
-            fail(
-                "Cache-aware source suppression not detected",
-                "laravelgraph_context should omit source when cache is warm",
-            )
-    except Exception as e:
-        warn(f"Could not verify include_source: {e}")
-
-    # 6c. Route resolution quality: what % of routes have a resolved controller
-    if db is not None:
+    # ── 6. Data Quality ───────────────────────────────────────────────────────
+    section("Data Quality")
+    if db is None:
+        warn("Skipping data quality checks — no graph DB")
+    else:
+        # 6a. Route resolution: what % of routes have a controller resolved
         try:
-            total_r = db.execute("MATCH (r:Route) RETURN count(r) AS cnt")
+            total_r   = db.execute("MATCH (r:Route) RETURN count(r) AS cnt")
             resolved_r = db.execute(
                 "MATCH (r:Route) WHERE r.controller_fqn IS NOT NULL AND r.controller_fqn <> '' "
                 "AND r.controller_fqn <> 'Closure' RETURN count(r) AS cnt"
             )
-            total_cnt = total_r[0].get("cnt", 0) if total_r else 0
+            total_cnt    = total_r[0].get("cnt", 0) if total_r else 0
             resolved_cnt = resolved_r[0].get("cnt", 0) if resolved_r else 0
             if total_cnt > 0:
                 pct = resolved_cnt / total_cnt * 100
                 if pct >= 80:
-                    ok(f"Route resolution: {resolved_cnt}/{total_cnt} routes resolved ({pct:.0f}%)")
+                    ok(f"Route resolution: {resolved_cnt}/{total_cnt} ({pct:.0f}%) have a controller")
                 elif pct >= 50:
-                    warn(f"Route resolution: {resolved_cnt}/{total_cnt} routes resolved ({pct:.0f}%) — some Closure routes may be unresolved")
+                    warn(f"Route resolution: {resolved_cnt}/{total_cnt} ({pct:.0f}%) — some Closure/unresolved routes")
                 else:
                     fail(
-                        f"Route resolution low: only {resolved_cnt}/{total_cnt} routes resolved ({pct:.0f}%)",
+                        f"Route resolution low: {resolved_cnt}/{total_cnt} ({pct:.0f}%)",
                         "Run: laravelgraph analyze --phases 14",
                     )
-            else:
-                warn("No routes found — run laravelgraph analyze")
         except Exception as e:
             warn(f"Route resolution check skipped: {e}")
 
-    # 6d. Phase 14 upsert: verify routes can be re-indexed (check via route count stability)
-    # We verify this indirectly: if routes exist and are resolved, the upsert fix is working
-    if db is not None:
+        # 6b. Event listener coverage: events with at least one listener
         try:
-            route_count = db.execute("MATCH (r:Route) RETURN count(r) AS cnt")
-            cnt = route_count[0].get("cnt", 0) if route_count else 0
-            if cnt > 0:
-                ok(f"Phase 14 route upsert: {cnt} routes in graph (re-indexing safe)")
+            total_ev   = db.execute("MATCH (e:Event) RETURN count(e) AS cnt")
+            bound_ev   = db.execute(
+                "MATCH (e:Event) WHERE EXISTS { MATCH ()-[:LISTENS_TO]->(e) } RETURN count(e) AS cnt"
+            )
+            total_ev_cnt = total_ev[0].get("cnt", 0) if total_ev else 0
+            bound_ev_cnt = bound_ev[0].get("cnt", 0) if bound_ev else 0
+            if total_ev_cnt > 0:
+                pct_ev = bound_ev_cnt / total_ev_cnt * 100
+                if pct_ev >= 50:
+                    ok(f"Event listeners: {bound_ev_cnt}/{total_ev_cnt} events ({pct_ev:.0f}%) have listeners bound")
+                else:
+                    warn(f"Event listeners: only {bound_ev_cnt}/{total_ev_cnt} events ({pct_ev:.0f}%) have listeners — EventServiceProvider may need re-indexing")
             else:
-                warn("No routes — run: laravelgraph analyze --phases 14")
+                warn("No events indexed — feature_context will show empty event chains")
         except Exception as e:
-            warn(f"Phase 14 check skipped: {e}")
+            warn(f"Event listener check skipped: {e}")
+
+        # 6c. Model-table link coverage
+        try:
+            total_m  = db.execute("MATCH (m:EloquentModel) RETURN count(m) AS cnt")
+            linked_m = db.execute(
+                "MATCH (m:EloquentModel) WHERE EXISTS { MATCH (m)-[:USES_TABLE]->() } RETURN count(m) AS cnt"
+            )
+            total_m_cnt  = total_m[0].get("cnt", 0) if total_m else 0
+            linked_m_cnt = linked_m[0].get("cnt", 0) if linked_m else 0
+            if total_m_cnt > 0:
+                pct_m = linked_m_cnt / total_m_cnt * 100
+                if pct_m >= 70:
+                    ok(f"Model-table links: {linked_m_cnt}/{total_m_cnt} models ({pct_m:.0f}%) linked to a DB table")
+                else:
+                    warn(
+                        f"Model-table links: {linked_m_cnt}/{total_m_cnt} models ({pct_m:.0f}%) linked — "
+                        "run: laravelgraph analyze --phases 19,24,25"
+                    )
+        except Exception as e:
+            warn(f"Model-table link check skipped: {e}")
+
+        # 6d. Scheduler status — detect commented-out Kernel.php schedules
+        try:
+            from laravelgraph.core.registry import Registry as _DocReg
+            _doc_entry = _DocReg().get(root)
+            _doc_stats = _doc_entry.stats if _doc_entry else {}
+            _sched_disabled = bool(_doc_stats.get("scheduler_disabled", False))
+            _sched_commented = int(_doc_stats.get("scheduler_commented_tasks", 0))
+            _sched_active = int(_doc_stats.get("scheduled_tasks", 0))
+            if _sched_disabled:
+                fail(
+                    f"Scheduler disabled — {_sched_commented} task(s) commented out, 0 active",
+                    "All scheduled jobs are dead. Re-enable in Kernel.php or move to "
+                    "bootstrap/app.php (Laravel 11+). Cleanup and notification jobs won't run.",
+                )
+            elif _sched_active > 0:
+                ok(f"Scheduler: {_sched_active} active scheduled task(s)")
+            elif _sched_commented == 0 and _sched_active == 0:
+                warn("No scheduled tasks found — project may not use the scheduler")
+        except Exception as e:
+            warn(f"Scheduler check skipped: {e}")
+
+        # 6e. Source readability: sample a method and verify source can be read back
+        try:
+            sample_nodes = db.execute(
+                "MATCH (n:Method) WHERE n.file_path IS NOT NULL AND n.line_start IS NOT NULL "
+                "RETURN n.file_path AS fp, n.line_start AS ls, n.line_end AS le LIMIT 1"
+            )
+            if sample_nodes:
+                from laravelgraph.mcp.explain import read_source_snippet
+                node = sample_nodes[0]
+                fp, ls, le = node.get("fp"), node.get("ls"), node.get("le")
+                le = le or ((ls or 0) + 50)
+                snippet = read_source_snippet(fp, ls, le, root) if fp and ls else None
+                if snippet and snippet.strip():
+                    ok(f"Source readability: OK ({len(snippet.splitlines())} lines from {Path(fp).name})")
+                else:
+                    fail(
+                        "Source readability: cannot read source for indexed methods",
+                        f"File: {fp}  Lines: {ls}–{le}  Check project_root matches the indexed path",
+                    )
+            else:
+                warn("No Method nodes with file_path — source injection unavailable")
+        except Exception as e:
+            fail("Source readability check failed", str(e))
 
     # ── 7. Transport & Server ─────────────────────────────────────────────────
     section("Transport & Server")
@@ -2724,6 +3071,112 @@ def doctor(path: Optional[Path] = PathArg) -> None:
             ok("Query cache: empty (populated on first db-query call)")
     except Exception:
         pass
+
+    # ── MCP Tool Signatures ────────────────────────────────────────────────────
+    # Validates that every tool accepts the parameter aliases agents commonly use.
+    # Catches regressions where a parameter rename breaks agent compatibility.
+    section("MCP Tool Signatures")
+    try:
+        import asyncio as _asyncio
+        from laravelgraph.mcp.server import create_server as _create_server
+        _mcp_server = _create_server(root)
+
+        # list_tools() is async in FastMCP — fetch all registered tools once
+        _tools_list: list = []
+        try:
+            _raw = _mcp_server.list_tools()
+            if _asyncio.iscoroutine(_raw):
+                _tools_list = _asyncio.run(_raw)
+            else:
+                _tools_list = list(_raw)
+        except Exception:
+            _tools_list = []
+
+        # Build map: tool_name → set of accepted parameter names
+        # FastMCP FunctionTool exposes parameters dict OR inputSchema dict depending on version
+        _tool_params: dict[str, set[str]] = {}
+        for _t in _tools_list:
+            _name = getattr(_t, "name", None)
+            if not _name:
+                continue
+            # Try .parameters first (FastMCP ≥0.4 FunctionTool)
+            _params_raw = getattr(_t, "parameters", None)
+            if isinstance(_params_raw, dict) and "properties" in _params_raw:
+                _tool_params[_name] = set(_params_raw["properties"].keys())
+            else:
+                # Fall back to inputSchema (older FastMCP versions)
+                _schema = getattr(_t, "inputSchema", None) or {}
+                _props = _schema.get("properties", {}) if isinstance(_schema, dict) else {}
+                _tool_params[_name] = set(_props.keys())
+
+        # Define expected parameter scenarios for each tool.
+        # Each entry: (tool_name, scenario_label, required_params)
+        _scenarios: list[tuple[str, str, list[str]]] = [
+            # laravelgraph_query
+            ("laravelgraph_query",           "query= param",          ["query"]),
+            ("laravelgraph_query",           "q= alias",              ["q"]),
+            # laravelgraph_routes
+            ("laravelgraph_routes",          "filter= shorthand",     ["filter"]),
+            ("laravelgraph_routes",          "filter_uri= param",     ["filter_uri"]),
+            ("laravelgraph_routes",          "filter_method= param",  ["filter_method"]),
+            # laravelgraph_context
+            ("laravelgraph_context",         "symbol= param",         ["symbol"]),
+            # laravelgraph_impact
+            ("laravelgraph_impact",          "symbol= param",         ["symbol"]),
+            # laravelgraph_request_flow
+            ("laravelgraph_request_flow",    "route= param",          ["route"]),
+            # laravelgraph_models
+            ("laravelgraph_models",          "model_name= param",     ["model_name"]),
+            ("laravelgraph_models",          "name= alias",           ["name"]),
+            ("laravelgraph_models",          "model= alias",          ["model"]),
+            # laravelgraph_config_usage
+            ("laravelgraph_config_usage",    "key= param",            ["key"]),
+            ("laravelgraph_config_usage",    "symbol= alias",         ["symbol"]),
+            # laravelgraph_db_context
+            ("laravelgraph_db_context",      "table= param",          ["table"]),
+            # laravelgraph_schema
+            ("laravelgraph_schema",          "table_name= param",     ["table_name"]),
+            # laravelgraph_explain
+            ("laravelgraph_explain",         "feature= param",        ["feature"]),
+            # laravelgraph_feature_context
+            ("laravelgraph_feature_context", "feature= param",        ["feature"]),
+            # laravelgraph_suggest_tests
+            ("laravelgraph_suggest_tests",   "symbol= param",         ["symbol"]),
+            # laravelgraph_cypher
+            ("laravelgraph_cypher",          "query= param",          ["query"]),
+            # laravelgraph_db_query
+            ("laravelgraph_db_query",        "sql= param",            ["sql"]),
+            # laravelgraph_db_impact
+            ("laravelgraph_db_impact",       "table= param",          ["table"]),
+        ]
+
+        # Verify that ALL expected tools were actually registered
+        _expected_tools = {s[0] for s in _scenarios}
+        _missing_tools = _expected_tools - set(_tool_params.keys())
+        if _missing_tools:
+            for _mt in sorted(_missing_tools):
+                fail(f"Tool not registered: {_mt}", "Check create_server() in mcp/server.py")
+
+        _tool_failures: list[str] = []
+        _tool_passes = 0
+        for _tool_name, _label, _required in _scenarios:
+            _found_params = _tool_params.get(_tool_name, set())
+            _missing = [p for p in _required if p not in _found_params]
+            if _missing:
+                _tool_failures.append(
+                    f"{_tool_name} ({_label}): missing params {_missing}"
+                )
+            else:
+                _tool_passes += 1
+
+        if _tool_failures:
+            for _msg in _tool_failures:
+                fail(_msg, "Add parameter alias to tool definition in mcp/server.py")
+        else:
+            ok(f"All {_tool_passes} tool signature scenarios pass")
+
+    except Exception as _e:
+        warn(f"Tool signature check skipped: {_e}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     console.print()

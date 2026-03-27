@@ -564,6 +564,7 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
         ("dispatch_type", "STRING"),  # event|job|notification
         ("is_queued", "BOOLEAN"),
         ("line", "INT32"),
+        ("condition", "STRING"),  # guarding if/case text, e.g. "$plan == 1"
     ]),
     ("LISTENS_TO", [
         ("Listener", "Event"),

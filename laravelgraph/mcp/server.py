@@ -47,39 +47,64 @@ def create_server(project_root: Path, config: Config | None = None) -> Any:
         instructions="""LaravelGraph is a graph-powered code intelligence engine for Laravel/PHP codebases.
 
 Use these tools to understand any Laravel codebase:
-- laravelgraph_feature_context: ONE CALL to get the complete picture of any feature — routes, controllers (with source), models, events, jobs, views, config. Start here for any feature exploration.
-- laravelgraph_query: Search for symbols (classes, methods, routes, models)
-- laravelgraph_context: Get 360° view of any symbol with source code and semantic summary
-- laravelgraph_explain: Natural language explanation of how a feature works end-to-end
-- laravelgraph_impact: Find blast radius of changes
-- laravelgraph_routes: Explore the route table
-- laravelgraph_models: Explore Eloquent model relationships (shows linked DB tables)
-- laravelgraph_request_flow: Trace a complete HTTP request lifecycle
-- laravelgraph_events: Explore the event/listener/job dispatch graph
-- laravelgraph_dead_code: Find unreachable code
-- laravelgraph_schema: Database schema (live DB + migrations) with code access summary
-- laravelgraph_db_context: Full semantic picture of a DB table — columns, FK/inferred relations, code access patterns, lazy LLM annotation
-- laravelgraph_resolve_column: Deep-dive on a single column — write-path evidence, polymorphic hints, guard conditions, lazy LLM resolution
-- laravelgraph_procedure_context: Stored procedure details with lazy semantic annotation
-- laravelgraph_connection_map: Map of all configured DB connections, table counts, cross-DB access
-- laravelgraph_db_query: Run a live read-only SQL query (SELECT/SHOW/DESCRIBE) — use this to see actual data values, lookup table rows, enum meanings
-- laravelgraph_db_impact: Trace what fires when a table is written to — events dispatched, listeners, downstream jobs. Use this for "when X happens in the DB, what runs in code?"
+
+## Feature exploration (start here)
+- laravelgraph_feature_context: ONE CALL for the complete picture — routes table, controller source,
+  models (discovered via BFS call chain, not just name matching), events, jobs dispatched
+  (including from service layer), views, config. Always start here.
+- laravelgraph_explain: Best-anchor end-to-end explanation — uses semantic search to pick the
+  right entry point (service class, route, or event) instead of blindly matching route names.
+- laravelgraph_request_flow: Full HTTP lifecycle with BFS call-chain traversal (3 hops deep) —
+  controller → service → dependencies, events dispatched at every level, queued jobs section.
+
+## Symbol lookup
+- laravelgraph_query: Hybrid search (BM25 + semantic + fuzzy) across all indexed symbols
+- laravelgraph_context: 360° view of any symbol — source, summary, callers, relationships
+- laravelgraph_impact: Blast radius of a change
+- laravelgraph_routes: Browse the full route table
+- laravelgraph_models: Eloquent model relationships with linked DB tables
+- laravelgraph_events: Event/listener/job dispatch graph
+- laravelgraph_dead_code: Unreachable code report
 - laravelgraph_bindings: Service container binding map
 - laravelgraph_config_usage: Config/env dependency map
+
+## Database intelligence
+- laravelgraph_schema: Full schema (live DB + migrations) with code access summary
+- laravelgraph_db_context: Full picture of a table — columns, FK/inferred relations, code access,
+  value distribution for discriminator columns (type/status/state), lazy LLM annotation
+- laravelgraph_resolve_column: Deep-dive on a single column — polymorphic detection, write-path
+  evidence, guard conditions, live value distribution for enum/tinyint columns
+- laravelgraph_procedure_context: Stored procedure details with table access map
+- laravelgraph_connection_map: All configured DB connections, table counts, cross-DB access
+- laravelgraph_db_query: Live read-only SQL (SELECT/SHOW/DESCRIBE) — see actual data values,
+  lookup rows, enum IDs. Results are cached (TTL-based).
+- laravelgraph_db_impact: Cross-layer trace — DB write site → events dispatched → listeners → jobs
+
+## Change analysis
 - laravelgraph_detect_changes: Map git diff to affected symbols
 - laravelgraph_suggest_tests: Find tests to run after a change
-- laravelgraph_provider_status: Show which LLM providers are configured for semantic summaries
-- laravelgraph_cypher: Raw Cypher graph queries (read-only)
+- laravelgraph_cypher: Raw read-only Cypher queries
 
-IMPORTANT: For understanding any feature, ALWAYS call laravelgraph_feature_context FIRST.
-It returns routes + controller source + models + events + config in a single call,
-saving you from making 10+ individual tool calls.
+## Utilities
+- laravelgraph_provider_status: LLM providers configured for semantic summaries
 
-For database questions: use laravelgraph_connection_map first to see all DBs, then
-laravelgraph_db_context for a specific table. For mystery columns like reference_id,
-use laravelgraph_resolve_column for inferred relationships and polymorphic detection.
-To see actual data values (lookup rows, enum IDs, reference data), use laravelgraph_db_query.
-For cross-layer tracing ("when this table is written to, what events/jobs fire?"), use laravelgraph_db_impact.
+---
+IMPORTANT WORKFLOW:
+
+1. For any feature question → laravelgraph_feature_context FIRST (single call covers routes,
+   source, models from service layer, events, jobs, config).
+
+2. For "how does X work end-to-end" → laravelgraph_explain (picks best anchor — may be a
+   service class, not a route, if the service scores higher semantically).
+
+3. For "trace this HTTP request" → laravelgraph_request_flow (walks 3 hops deep into service
+   layer, collects events + jobs at every level).
+
+4. For DB questions → laravelgraph_connection_map → laravelgraph_db_context → laravelgraph_db_query
+   for actual values. For mystery columns → laravelgraph_resolve_column.
+
+5. When feature_context or request_flow shows empty events/jobs → the index may be stale.
+   Tell the user to run: laravelgraph analyze --full
 """,
     )
 
@@ -196,11 +221,66 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
                 return c
         return None
 
+    def _fetch_varchar_sample(
+        table: str, column: str, conn_cfg: Any, max_distinct: int = 30
+    ) -> list[dict] | None:
+        """Sample distinct values for a varchar/text column via the query cache.
+
+        Only runs when the result fits within `max_distinct` distinct values —
+        i.e. the column is categorical enough to be useful.  Returns a list of
+        {val, cnt} dicts ordered by count desc, or None when unavailable.
+        """
+        safe_table = table.replace("`", "")
+        safe_col = column.replace("`", "")
+        sql = (
+            f"SELECT `{safe_col}` AS val, COUNT(*) AS cnt "
+            f"FROM `{safe_table}` "
+            f"WHERE `{safe_col}` IS NOT NULL AND `{safe_col}` != '' "
+            f"GROUP BY `{safe_col}` "
+            f"ORDER BY cnt DESC "
+            f"LIMIT {max_distinct + 1}"  # fetch one extra to detect overflow
+        )
+        ttl = getattr(conn_cfg, "query_cache_ttl", 300)
+        key = _query_cache.make_key(conn_cfg.name, sql)
+
+        cached = _query_cache.get(key, ttl=ttl)
+        if cached is not None:
+            rows = cached.get("rows", [])
+            if len(rows) > max_distinct:
+                return None  # too many distinct values — not useful
+            return rows
+
+        if ttl == 0:
+            return None
+
+        try:
+            from laravelgraph.pipeline.phase_24_db_introspect import _connect_mysql
+            mc = _connect_mysql(conn_cfg)
+            try:
+                with mc.cursor() as cur:
+                    cur.execute(sql)
+                    raw = cur.fetchall()
+                    cols_desc = [d[0] for d in (cur.description or [])]
+                rows_data = [dict(zip(cols_desc, row)) for row in raw]
+            finally:
+                try:
+                    mc.close()
+                except Exception:
+                    pass
+            _query_cache.set(key, sql, conn_cfg.name, cols_desc, rows_data, ttl=ttl)
+            if len(rows_data) > max_distinct:
+                return None  # too many distinct values
+            return rows_data
+        except Exception as e:
+            logger.debug("_fetch_varchar_sample failed", table=table, column=column, error=str(e))
+            return None
+
     # ── Tool: laravelgraph_query ─────────────────────────────────────────────
 
     @mcp.tool()
     def laravelgraph_query(
-        query: str,
+        query: str = "",
+        q: str = "",
         limit: int = 20,
         role_filter: str = "",
         file_filter: str = "",
@@ -209,10 +289,13 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
 
         Args:
             query: Search query — symbol name, concept, or natural language phrase
+            q: Alias for query — use either parameter name
             limit: Maximum results to return (default 20)
             role_filter: Filter by Laravel role (model|controller|middleware|job|event|listener|route|...)
             file_filter: Filter to symbols in files matching this path fragment
         """
+        if not query and q:
+            query = q
         start = time.perf_counter()
         try:
             from laravelgraph.search.hybrid import HybridSearch
@@ -389,15 +472,28 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
         try:
             dispatches = db.execute(
                 "MATCH (n)-[d:DISPATCHES]->(t) WHERE n.node_id = $id "
-                "RETURN t.name AS name, t.fqn AS fqn, d.dispatch_type AS dtype, d.is_queued AS queued LIMIT 10",
+                "RETURN t.name AS name, t.fqn AS fqn, d.dispatch_type AS dtype, "
+                "d.is_queued AS queued, d.condition AS cond LIMIT 20",
                 {"id": node_id},
             )
             if dispatches:
-                lines.append(f"### Dispatches ({len(dispatches)})")
+                has_conditions = any(d.get("cond") for d in dispatches)
+                multi = len(dispatches) > 1
+                header = f"### Dispatches ({len(dispatches)})"
+                if multi and has_conditions:
+                    header += " — conditional dispatch (not all targets fire on every call)"
+                lines.append(header)
                 for d in dispatches:
                     dtype = d.get("dtype") or "event"
                     q = " *(queued)*" if d.get("queued") else ""
-                    lines.append(f"- **{dtype}:** `{d.get('name', '?')}`{q}")
+                    cond = d.get("cond") or ""
+                    cond_str = f" `when: {cond}`" if cond else ""
+                    lines.append(f"- **{dtype}:** `{d.get('name', '?')}`{q}{cond_str}")
+                if multi and not has_conditions:
+                    lines.append(
+                        "_Multiple dispatch targets detected — read source to understand "
+                        "branching conditions (use `include_source=True`)._"
+                    )
                 lines.append("")
         except Exception:
             pass
@@ -560,6 +656,34 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
                 lines.append(f"- `{m.get('fqn', '?')}` via {m.get('relationship', '?')}")
             lines.append("")
 
+        # ── Route entry-point detection ───────────────────────────────────────
+        # Webhook handlers, API endpoints, and other route handlers are called by
+        # the HTTP router — not by PHP code — so they naturally have 0 callers and
+        # may have 0 impact according to the static call graph.  Detect this and
+        # explain it rather than leaving the agent with a silent "0 symbols" result.
+        if impact.total == 0:
+            try:
+                route_rows = db.execute(
+                    "MATCH (r:Route)-[:ROUTES_TO]->(n) WHERE n.node_id = $nid "
+                    "RETURN r.method AS method, r.uri AS uri, r.name AS rname LIMIT 5",
+                    {"nid": node_id},
+                )
+            except Exception:
+                route_rows = []
+
+            if route_rows:
+                lines.append(
+                    "> **Note:** This symbol is a **route entry point** — it is invoked by the "
+                    "HTTP router, not called from other PHP code. The static call graph has no "
+                    "callers pointing toward it, so impact analysis cannot trace upstream. "
+                    "Use `laravelgraph_request_flow(route)` to trace what this handler "
+                    "dispatches downstream.\n"
+                )
+                for r in route_rows:
+                    rname = f" — `{r.get('rname')}`" if r.get("rname") else ""
+                    lines.append(f"> Route: `{r.get('method', '?')} /{r.get('uri', '?')}`{rname}")
+                lines.append("")
+
         elapsed = (time.perf_counter() - start) * 1000
         _log_tool("laravelgraph_impact", {"symbol": symbol, "depth": depth}, impact.total, elapsed)
 
@@ -573,6 +697,7 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
 
     @mcp.tool()
     def laravelgraph_routes(
+        filter: str = "",
         filter_method: str = "",
         filter_uri: str = "",
         filter_middleware: str = "",
@@ -581,11 +706,15 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
         """Full route map with middleware stacks, controller bindings, and parameters.
 
         Args:
+            filter: General search — filters by URI fragment OR controller name (shorthand for filter_uri)
             filter_method: Filter by HTTP method (GET|POST|PUT|PATCH|DELETE)
             filter_uri: Filter routes containing this URI fragment
             filter_middleware: Filter routes using this middleware
             limit: Max routes to return (default 50)
         """
+        # filter is a shorthand for filter_uri
+        if filter and not filter_uri:
+            filter_uri = filter
         start = time.perf_counter()
         db = _db()
 
@@ -647,12 +776,16 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
     # ── Tool: laravelgraph_models ────────────────────────────────────────────
 
     @mcp.tool()
-    def laravelgraph_models(model_name: str = "") -> str:
+    def laravelgraph_models(model_name: str = "", name: str = "", model: str = "") -> str:
         """Eloquent model relationship graph with foreign keys and pivot tables.
 
         Args:
             model_name: Optional — filter to a specific model (name or FQN). Omit for all models.
+            name: Alias for model_name
+            model: Alias for model_name
         """
+        if not model_name:
+            model_name = name or model
         start = time.perf_counter()
         db = _db()
 
@@ -845,42 +978,135 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
             except Exception:
                 pass
 
-            # Trace calls from the controller method
+            # ── Deep call-chain traversal (BFS, max 3 hops) ─────────────────
+            # Collects called methods/classes AND dispatched events/jobs at
+            # every level — not just from the controller method directly.
             try:
-                called = db.execute(
-                    "MATCH (m:Method)-[r:CALLS]->(target) WHERE m.node_id = $id "
-                    "RETURN target.fqn AS fqn, target._label AS label, r.confidence AS conf LIMIT 15",
-                    {"id": f"method:{controller_fqn}::{action}"},
-                )
-                if called:
-                    lines.append("")
-                    lines.append("### 4. Called Services/Models")
-                    for c in called:
-                        lines.append(f"   - `{c.get('fqn', '?')}` ({c.get('label', '?')}, conf: {c.get('conf', '?')})")
-            except Exception:
-                pass
+                frontier: list[str] = [f"method:{controller_fqn}::{action}"]
+                visited: set[str] = set(frontier)
+                call_tree: list[tuple[int, str, str]] = []   # (depth, fqn, label)
+                dispatched_events: list[dict] = []
+                dispatched_jobs: list[dict] = []
+                MAX_HOPS = 3
+                MAX_CALLS_PER_LEVEL = 10
 
-            # Events dispatched
-            try:
-                events = db.execute(
-                    "MATCH (m:Method)-[:DISPATCHES]->(e:Event) WHERE m.fqn STARTS WITH $fqn "
-                    "RETURN e.name AS event_name, e.fqn AS event_fqn LIMIT 10",
-                    {"fqn": controller_fqn},
-                )
-                if events:
-                    lines.append("")
-                    lines.append("### 5. Events Dispatched")
-                    for ev in events:
-                        lines.append(f"   - `{ev.get('event_name')}` (`{ev.get('event_fqn')}`)")
+                for hop in range(MAX_HOPS):
+                    if not frontier:
+                        break
+                    next_frontier: list[str] = []
+                    for node_id in frontier:
+                        # CALLS edges — follow the call chain
+                        for _calls_label in ("Method", "Class_", "Function_", "Trait_"):
+                            try:
+                                called = db.execute(
+                                    f"MATCH (m:Method)-[r:CALLS]->(target:{_calls_label}) WHERE m.node_id = $id "
+                                    "RETURN target.node_id AS tid, target.fqn AS fqn, "
+                                    f"r.confidence AS conf, '{_calls_label}' AS label "
+                                    f"LIMIT {MAX_CALLS_PER_LEVEL}",
+                                    {"id": node_id},
+                                )
+                                for c in called:
+                                    tid = c.get("tid", "")
+                                    fqn = c.get("fqn", "")
+                                    if fqn and fqn not in visited:
+                                        visited.add(fqn)
+                                        call_tree.append((hop + 1, fqn, c.get("label", "?")))
+                                        if tid:
+                                            next_frontier.append(tid)
+                            except Exception:
+                                pass
 
-                        # Listeners for this event
-                        listeners = db.execute(
-                            "MATCH (l:Listener)-[:LISTENS_TO]->(e:Event) WHERE e.fqn = $fqn "
-                            "RETURN l.name AS listener LIMIT 5",
-                            {"fqn": ev.get("event_fqn", "")},
+                        # DISPATCHES — events and jobs from this method
+                        for _disp_label in ("Event", "Job"):
+                            try:
+                                dispatches = db.execute(
+                                    f"MATCH (m:Method)-[d:DISPATCHES]->(target:{_disp_label}) WHERE m.node_id = $id "
+                                    f"RETURN target.name AS tname, target.fqn AS tfqn, "
+                                    f"d.dispatch_type AS dtype, '{_disp_label}' AS tlabel LIMIT 10",
+                                    {"id": node_id},
+                                )
+                                for d in dispatches:
+                                    dtype = (d.get("dtype") or d.get("tlabel", "")).lower()
+                                    entry = {
+                                        "name": d.get("tname", "?"),
+                                        "fqn": d.get("tfqn", ""),
+                                        "depth": hop + 1,
+                                        "from": node_id,
+                                    }
+                                    if "job" in dtype:
+                                        dispatched_jobs.append(entry)
+                                    else:
+                                        dispatched_events.append(entry)
+                            except Exception:
+                                pass
+
+                    frontier = next_frontier
+
+                if call_tree:
+                    lines.append("")
+                    lines.append("### 4. Call Chain (controller → services → dependencies)\n")
+                    for depth, fqn, label in call_tree[:30]:
+                        indent = "   " * depth
+                        lines.append(f"{indent}- `{fqn}` _{label}_")
+                elif not dispatched_events and not dispatched_jobs:
+                    # BFS found nothing — likely because the controller FQN in the
+                    # route index is from a sub-namespace (e.g. Reseller\BookingController)
+                    # while CALLS edges were indexed against a different FQN.
+                    # Provide a fallback: search for the method by name across all classes.
+                    lines.append("")
+                    lines.append(
+                        f"> ⚠ No call chain found for `{controller_fqn}::{action}` — "
+                        "the route may store a sub-namespace FQN that doesn't match the indexed controller. "
+                        f"Try: `laravelgraph_context(\"{controller_fqn.split(chr(92))[-1]}\")`"
+                    )
+                    try:
+                        alt_methods = db.execute(
+                            "MATCH (m:Method) WHERE m.name = $mname "
+                            "RETURN m.node_id AS nid, m.fqn AS fqn, m.file_path AS fp LIMIT 5",
+                            {"mname": action},
                         )
-                        for li in listeners:
-                            lines.append(f"     → listener: `{li.get('listener')}`")
+                        if alt_methods:
+                            lines.append("\n**Possible matches by method name:**")
+                            for am in alt_methods:
+                                lines.append(f"- `{am.get('fqn')}` — {Path(am.get('fp', '?')).name}")
+                    except Exception:
+                        pass
+
+                if dispatched_events:
+                    lines.append("")
+                    lines.append("### 5. Events Dispatched (across full call chain)\n")
+                    seen_ev: set[str] = set()
+                    for ev in dispatched_events:
+                        fqn = ev.get("fqn", ev.get("name", "?"))
+                        if fqn in seen_ev:
+                            continue
+                        seen_ev.add(fqn)
+                        depth_note = f" (hop {ev['depth']})" if ev["depth"] > 1 else ""
+                        lines.append(f"   - `{ev.get('name')}`{depth_note} (`{fqn}`)")
+                        # Listeners
+                        try:
+                            listeners = db.execute(
+                                "MATCH (l:Listener)-[:LISTENS_TO]->(e:Event) WHERE e.fqn = $fqn "
+                                "RETURN l.name AS lname, l.fqn AS lfqn LIMIT 5",
+                                {"fqn": fqn},
+                            )
+                            for li in listeners:
+                                lines.append(f"     → `{li.get('lname')}` (listener)")
+                        except Exception:
+                            pass
+
+                if dispatched_jobs:
+                    lines.append("")
+                    lines.append("### 6. Queued Jobs Dispatched (across full call chain)\n")
+                    seen_job: set[str] = set()
+                    for job in dispatched_jobs:
+                        fqn = job.get("fqn", job.get("name", "?"))
+                        if fqn in seen_job:
+                            continue
+                        seen_job.add(fqn)
+                        depth_note = f" (hop {job['depth']})" if job["depth"] > 1 else ""
+                        lines.append(f"   - `{job.get('name')}`{depth_note} (`{fqn}`)")
+
             except Exception:
                 pass
 
@@ -1570,10 +1796,11 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
         except Exception:
             pass
 
-        # ── Value semantics (discriminator detection) ─────────────────────────
+        # ── Value semantics (discriminator detection + varchar sampling) ─────────
         disc_dist: list[dict] | None = None
+        resolve_conn_cfg = _get_conn_cfg_for_table(conn_name)
+
         if _is_discriminator_column(column, full_t, guard_raw if isinstance(guard_raw, str) else ""):
-            resolve_conn_cfg = _get_conn_cfg_for_table(conn_name)
             if resolve_conn_cfg:
                 disc_dist = _fetch_col_distribution(table, column, resolve_conn_cfg)
             if disc_dist:
@@ -1582,6 +1809,24 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
                 lines.append("|-------|-----------|")
                 for drow in disc_dist[:30]:
                     lines.append(f"| `{drow.get('val')}` | {drow.get('cnt'):,} |")
+
+        # For plain varchar/text columns that aren't already covered by the
+        # discriminator path, try to sample distinct values from the live DB.
+        # Skipped for polymorphic ID columns (would return IDs, not meaningful values).
+        _ctype_lower = full_t.lower()
+        _is_varchar = (
+            any(t in _ctype_lower for t in ("varchar", "char", "text"))
+            and "enum" not in _ctype_lower
+        )
+        if _is_varchar and not col_data.get("polymorphic_candidate") and disc_dist is None:
+            if resolve_conn_cfg:
+                varchar_sample = _fetch_varchar_sample(table, column, resolve_conn_cfg)
+                if varchar_sample:
+                    lines.append("\n### Value Sample (live DB)\n")
+                    lines.append("| Value | Count |")
+                    lines.append("|-------|-------|")
+                    for srow in varchar_sample:
+                        lines.append(f"| `{srow.get('val')}` | {srow.get('cnt'):,} |")
 
         # ── Lazy LLM resolution ───────────────────────────────────────────────
         schema_sig = f"{full_t}:{col_data.get('polymorphic_candidate', False)}:{wpe_raw}"
@@ -2189,7 +2434,7 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
 
     @mcp.tool()
     def laravelgraph_events() -> str:
-        """Full event → listener → job dispatch map."""
+        """Full event → listener → job dispatch map plus scheduled task summary."""
         db = _db()
         start = time.perf_counter()
 
@@ -2203,35 +2448,80 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
         elapsed = (time.perf_counter() - start) * 1000
         _log_tool("laravelgraph_events", {}, len(events), elapsed)
 
+        lines: list[str] = []
+
         if not events:
-            return "No events found. Ensure the project has been indexed with event analysis."
+            lines.append("No events found. Ensure the project has been indexed with event analysis.\n")
+        else:
+            lines.append(f"## Event → Listener → Job Map ({len(events)} events)\n")
+            for ev in events:
+                fqn = ev.get("fqn", "")
+                bcast = " 📡 (broadcastable)" if ev.get("bcast") else ""
+                lines.append(f"### `{ev.get('name', '?')}`{bcast}")
+                lines.append(f"- FQN: `{fqn}`")
 
-        lines = [f"## Event → Listener → Job Map ({len(events)} events)\n"]
-        for ev in events:
-            fqn = ev.get("fqn", "")
-            bcast = " 📡 (broadcastable)" if ev.get("bcast") else ""
-            lines.append(f"### `{ev.get('name', '?')}`{bcast}")
-            lines.append(f"- FQN: `{fqn}`")
-
-            try:
-                listeners = db.execute(
-                    "MATCH (l:Listener)-[:LISTENS_TO]->(e:Event) WHERE e.fqn = $fqn "
-                    "RETURN l.name AS name, l.fqn AS lfqn, l.is_queued AS queued",
-                    {"fqn": fqn},
-                )
-                for li in listeners:
-                    queued = " (queued)" if li.get("queued") else ""
-                    lines.append(f"- → Listener: `{li.get('name')}`{queued}")
-
-                    jobs = db.execute(
-                        "MATCH (l:Listener)-[:DISPATCHES]->(j:Job) WHERE l.fqn = $fqn "
-                        "RETURN j.name AS job_name",
-                        {"fqn": li.get("lfqn", "")},
+                try:
+                    listeners = db.execute(
+                        "MATCH (l:Listener)-[:LISTENS_TO]->(e:Event) WHERE e.fqn = $fqn "
+                        "RETURN l.name AS name, l.fqn AS lfqn, l.is_queued AS queued",
+                        {"fqn": fqn},
                     )
-                    for job in jobs:
-                        lines.append(f"    → Job: `{job.get('job_name')}`")
-            except Exception:
-                pass
+                    for li in listeners:
+                        queued = " (queued)" if li.get("queued") else ""
+                        lines.append(f"- → Listener: `{li.get('name')}`{queued}")
+
+                        jobs = db.execute(
+                            "MATCH (l:Listener)-[:DISPATCHES]->(j:Job) WHERE l.fqn = $fqn "
+                            "RETURN j.name AS job_name",
+                            {"fqn": li.get("lfqn", "")},
+                        )
+                        for job in jobs:
+                            lines.append(f"    → Job: `{job.get('job_name')}`")
+                except Exception:
+                    pass
+                lines.append("")
+
+        # ── Scheduled tasks ───────────────────────────────────────────────────
+        try:
+            tasks = db.execute(
+                "MATCH (t:ScheduledTask) "
+                "RETURN t.name AS name, t.command AS cmd, t.frequency AS freq, "
+                "t.cron_expression AS cron, t.file_path AS fp, t.line AS ln "
+                "ORDER BY t.name LIMIT 100"
+            )
+        except Exception:
+            tasks = []
+
+        # Check registry for scheduler_disabled flag
+        _sched_disabled = False
+        _sched_commented = 0
+        try:
+            from laravelgraph.core.registry import Registry as _Reg
+            _entry = _Reg().get(project_root)
+            if _entry and _entry.stats:
+                _sched_disabled = bool(_entry.stats.get("scheduler_disabled", False))
+                _sched_commented = int(_entry.stats.get("scheduler_commented_tasks", 0))
+        except Exception:
+            pass
+
+        if tasks or _sched_disabled:
+            lines.append(f"## Scheduled Tasks ({len(tasks)} active)\n")
+            if _sched_disabled:
+                lines.append(
+                    f"> **⚠ Scheduler disabled** — {_sched_commented} task definition(s) are "
+                    "commented out in Kernel.php. All cleanup, notification, and maintenance "
+                    "jobs are effectively dead. No automated processing will run until the "
+                    "schedule() method is re-enabled (or tasks are moved to bootstrap/app.php "
+                    "for Laravel 11+).\n"
+                )
+            if tasks:
+                lines.append("| Task | Frequency | File |")
+                lines.append("|------|-----------|------|")
+                for t in tasks:
+                    freq = t.get("cron") or t.get("freq") or "custom"
+                    fname = t.get("fp", "").split("/")[-1] if t.get("fp") else "?"
+                    ln = f":{t.get('ln')}" if t.get("ln") else ""
+                    lines.append(f"| `{t.get('name')}` | `{freq}` | `{fname}{ln}` |")
             lines.append("")
 
         return "\n".join(lines) + _next_steps(
@@ -2283,12 +2573,15 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
     # ── Tool: laravelgraph_config_usage ──────────────────────────────────────
 
     @mcp.tool()
-    def laravelgraph_config_usage(key: str) -> str:
+    def laravelgraph_config_usage(key: str = "", symbol: str = "") -> str:
         """Show all code depending on a config key or environment variable.
 
         Args:
             key: Config key (e.g. "app.name") or env variable name (e.g. "APP_KEY")
+            symbol: Alias for key — use either parameter name
         """
+        if not key and symbol:
+            key = symbol
         db = _db()
         start = time.perf_counter()
 
@@ -2747,6 +3040,7 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
         ctrl_fqns_seen: set[str] = set()
         model_nids_seen: set[str] = set()
         event_nids_seen: set[str] = set()
+        job_nids_seen: set[str] = set()
 
         if matched_routes:
             lines.append(f"### HTTP Entry Points ({len(matched_routes)} routes)\n")
@@ -2873,7 +3167,7 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
                 except Exception:
                     pass
 
-                # Dispatches
+                # Dispatches (controller method, hop 0)
                 try:
                     disps = db.execute(
                         "MATCH (m:Method)-[d:DISPATCHES]->(t) WHERE m.fqn = $fqn "
@@ -2882,10 +3176,12 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
                         {"fqn": ctrl_action},
                     )
                     for d in disps:
-                        dtype = d.get("dtype") or "event"
+                        dtype = (d.get("dtype") or "event").lower()
                         q = " *(queued)*" if d.get("queued") else ""
                         lines.append(f"**Dispatches {dtype}:** `{d.get('name', '?')}`{q}")
-                        if dtype == "event" and d.get("nid"):
+                        if dtype == "job" and d.get("nid"):
+                            job_nids_seen.add(d["nid"])
+                        elif d.get("nid"):
                             event_nids_seen.add(d["nid"])
                 except Exception:
                     pass
@@ -2903,16 +3199,61 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
                 except Exception:
                     pass
 
-                # Models touched (via calls to EloquentModel)
+                # ── BFS: walk CALLS 2 hops to collect models, events, jobs ──
+                # A controller typically calls a service which calls models/dispatches.
+                # 1-hop misses everything behind the service layer.
                 try:
-                    model_calls = db.execute(
-                        "MATCH (m:Method)-[:CALLS]->(mdl:EloquentModel) WHERE m.fqn = $fqn "
-                        "RETURN mdl.node_id AS nid, mdl.name AS name LIMIT 5",
-                        {"fqn": ctrl_action},
-                    )
-                    for mc in model_calls:
-                        if mc.get("nid"):
-                            model_nids_seen.add(mc["nid"])
+                    bfs_frontier_fqns: list[str] = [ctrl_action]
+                    bfs_frontier_nids: list[str] = [f"method:{ctrl_fqn}::{action}"]
+                    bfs_visited_fqns: set[str] = {ctrl_action}
+                    for _hop in range(2):
+                        next_fqns: list[str] = []
+                        next_nids: list[str] = []
+                        for _nid in bfs_frontier_nids:
+                            # Follow CALLS — query each target label separately
+                            # (KuzuDB does not support polymorphic target._label access)
+                            for _target_lbl in ("Method", "Class_", "EloquentModel", "Function_"):
+                                try:
+                                    _called = db.execute(
+                                        f"MATCH (m:Method)-[:CALLS]->(t:{_target_lbl}) WHERE m.node_id = $nid "
+                                        f"RETURN t.node_id AS tid, t.fqn AS fqn, '{_target_lbl}' AS lbl LIMIT 12",
+                                        {"nid": _nid},
+                                    )
+                                    for _c in _called:
+                                        _fqn = _c.get("fqn", "")
+                                        _lbl = _c.get("lbl", "")
+                                        if not _fqn or _fqn in bfs_visited_fqns:
+                                            continue
+                                        bfs_visited_fqns.add(_fqn)
+                                        if _lbl == "EloquentModel":
+                                            if _c.get("tid"):
+                                                model_nids_seen.add(_c["tid"])
+                                        else:
+                                            if _c.get("tid"):
+                                                next_fqns.append(_fqn)
+                                                next_nids.append(_c["tid"])
+                                except Exception:
+                                    pass
+                            # Collect DISPATCHES from this node
+                            try:
+                                _disps = db.execute(
+                                    "MATCH (m:Method)-[d:DISPATCHES]->(t) WHERE m.node_id = $nid "
+                                    "RETURN t.node_id AS tnid, t.name AS tname, d.dispatch_type AS dtype",
+                                    {"nid": _nid},
+                                )
+                                for _d in _disps:
+                                    _dtype = (_d.get("dtype") or "event").lower()
+                                    if _d.get("tnid"):
+                                        if _dtype == "job":
+                                            job_nids_seen.add(_d["tnid"])
+                                        else:
+                                            event_nids_seen.add(_d["tnid"])
+                            except Exception:
+                                pass
+                        bfs_frontier_fqns = next_fqns
+                        bfs_frontier_nids = next_nids
+                        if not bfs_frontier_nids:
+                            break
                 except Exception:
                     pass
 
@@ -3023,22 +3364,42 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
                 except Exception:
                     pass
 
-        # ── 5. Jobs matching feature ──────────────────────────────────────────
+        # ── 5. Jobs (call-chain discovered + name term matching) ─────────────
+        # job_nids_seen is populated by the BFS in the controller section above.
+        # Also add any jobs whose name matches the search terms directly.
         try:
-            jobs = db.execute(
-                "MATCH (j:Job) RETURN j.name AS name, j.fqn AS fqn, j.queue AS queue, "
-                "j.is_queued AS queued, j.tries AS tries, j.timeout AS timeout LIMIT 100"
+            all_jobs = db.execute(
+                "MATCH (j:Job) RETURN j.node_id AS nid, j.name AS name, j.fqn AS fqn, "
+                "j.queue AS queue, j.tries AS tries, j.timeout AS timeout LIMIT 200"
             )
-            matched_jobs = [j for j in jobs if any(t in (j.get("name") or "").lower() for t in terms)]
-            if matched_jobs:
-                lines.append(f"### Jobs ({len(matched_jobs)})\n")
-                for j in matched_jobs[:5]:
-                    q = f" (queue: `{j.get('queue')}`)" if j.get("queue") else ""
-                    tries = f", tries: {j.get('tries')}" if j.get("tries") else ""
-                    lines.append(f"- `{j.get('name', '?')}`{q}{tries}")
-                lines.append("")
+            for j in all_jobs:
+                if any(t in (j.get("name") or "").lower() for t in terms):
+                    if j.get("nid"):
+                        job_nids_seen.add(j["nid"])
         except Exception:
             pass
+
+        if job_nids_seen:
+            lines.append(f"### Jobs Dispatched ({len(job_nids_seen)})\n")
+            for jnid in list(job_nids_seen)[:8]:
+                try:
+                    jrows = db.execute(
+                        "MATCH (j:Job) WHERE j.node_id = $nid "
+                        "RETURN j.name AS name, j.fqn AS fqn, j.queue AS queue, "
+                        "j.tries AS tries, j.timeout AS timeout",
+                        {"nid": jnid},
+                    )
+                    if not jrows:
+                        continue
+                    j = jrows[0]
+                    q = f" (queue: `{j.get('queue')}`)" if j.get("queue") else ""
+                    tries = f", tries: {j.get('tries')}" if j.get("tries") else ""
+                    timeout = f", timeout: {j.get('timeout')}s" if j.get("timeout") else ""
+                    lines.append(f"- `{j.get('name', '?')}`{q}{tries}{timeout}")
+                    symbol_count += 1
+                except Exception:
+                    pass
+            lines.append("")
 
         # ── 6. Config/Env dependencies ────────────────────────────────────────
         if ctrl_fqns_seen:
@@ -3136,9 +3497,26 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
         """List all indexed repositories with their stats."""
         from laravelgraph.core.registry import Registry
         import datetime
+        import re as _re
+
+        _TEMP_PATH_RE = _re.compile(
+            r"[/\\]pytest-\d+[/\\]|[/\\]var[/\\]folders[/\\]|[/\\]T[/\\]pytest|"
+            r"[/\\]tmp[/\\]|\\Temp\\|/__pycache__/"
+        )
 
         registry = Registry()
-        repos = registry.all()
+        all_repos = registry.all()
+
+        # Filter out pytest/CI temp paths and deduplicate by canonical path
+        seen_paths: set[str] = set()
+        repos = []
+        for repo in sorted(all_repos, key=lambda r: -r.indexed_at):  # newest first
+            if _TEMP_PATH_RE.search(repo.path):
+                continue
+            if repo.path in seen_paths:
+                continue
+            seen_paths.add(repo.path)
+            repos.append(repo)
 
         if not repos:
             return "No repositories indexed yet. Run: `laravelgraph analyze /path/to/laravel-project`"
@@ -3152,8 +3530,13 @@ For cross-layer tracing ("when this table is written to, what events/jobs fire?"
             lines.append(f"- **PHP:** {repo.php_version}")
             lines.append(f"- **Indexed:** {indexed_at}")
             if repo.stats:
-                top_stats = list(repo.stats.items())[:5]
-                lines.append(f"- **Stats:** " + ", ".join(f"{k}: {v}" for k, v in top_stats))
+                # Show key stats, skip internal counters
+                _SKIP = {"scheduler_disabled", "scheduler_commented_tasks"}
+                top_stats = [(k, v) for k, v in repo.stats.items() if k not in _SKIP][:8]
+                lines.append("- **Stats:** " + ", ".join(f"{k}: {v}" for k, v in top_stats))
+                if repo.stats.get("scheduler_disabled"):
+                    n = repo.stats.get("scheduler_commented_tasks", "?")
+                    lines.append(f"- **⚠ Scheduler disabled** — {n} task(s) commented out in Kernel.php")
             lines.append("")
 
         return "\n".join(lines)
@@ -3371,13 +3754,30 @@ def _resolve_symbol(db: GraphDB, symbol: str) -> dict | None:
         except Exception:
             continue
 
-    # 3. Class name match
+    # 3. Class name match — with disambiguation when multiple classes share a name.
+    # Prefer canonical app paths over sub-namespaces (e.g. App\Http\Controllers\BookingController
+    # over App\Http\Controllers\Reseller\BookingController).
     try:
         results = db.execute(
-            "MATCH (n:Class_) WHERE n.name = $s RETURN n.*, 'Class_' AS _label LIMIT 1",
+            "MATCH (n:Class_) WHERE n.name = $s RETURN n.*, 'Class_' AS _label LIMIT 10",
             {"s": symbol},
         )
         if results:
+            if len(results) == 1:
+                return _normalize_node(results[0])
+            # Multiple matches — rank by FQN depth (fewer segments = more canonical)
+            # and by preferred path prefixes.
+            def _class_rank(row: dict) -> tuple:
+                fqn = row.get("n.fqn", "") or ""
+                fp  = row.get("n.file_path", "") or ""
+                # Prefer paths in app/Http/Controllers/ directly (not sub-dirs)
+                canonical = (
+                    ("Http\\Controllers\\" in fqn and fqn.count("\\") <= fqn.index("Controllers\\") // 1 + 4)
+                    or "/Http/Controllers/" in fp
+                )
+                depth = fqn.count("\\")
+                return (0 if canonical else 1, depth)
+            results.sort(key=_class_rank)
             return _normalize_node(results[0])
     except Exception:
         pass
@@ -3393,14 +3793,15 @@ def _resolve_symbol(db: GraphDB, symbol: str) -> dict | None:
     except Exception:
         pass
 
-    # 5. FQN contains (partial match)
+    # 5. FQN contains (partial match) — with disambiguation: prefer shorter FQN.
     for label in _fqn_labels:
         try:
             results = db.execute(
-                f"MATCH (n:{label}) WHERE n.fqn CONTAINS $s RETURN n.*, '{label}' AS _label LIMIT 1",
+                f"MATCH (n:{label}) WHERE n.fqn CONTAINS $s RETURN n.*, '{label}' AS _label LIMIT 10",
                 {"s": symbol},
             )
             if results:
+                results.sort(key=lambda r: len(r.get("n.fqn", "") or ""))
                 return _normalize_node(results[0])
         except Exception:
             continue

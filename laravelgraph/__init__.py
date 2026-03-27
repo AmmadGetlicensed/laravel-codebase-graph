@@ -13,6 +13,6 @@ Analyzes Laravel projects into a rich, queryable knowledge graph exposing:
 - MCP server for AI agent integration
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "LaravelGraph Contributors"
 __license__ = "MIT"

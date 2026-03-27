@@ -141,10 +141,12 @@ class GraphDB:
         # Serialize list/dict values to JSON strings for storage
         clean = {k: self._serialize(v) for k, v in props.items()}
 
-        # Kuzu doesn't have native MERGE, so we delete + create
+        # Kuzu doesn't have native MERGE, so we delete + create.
+        # DETACH DELETE removes the node and all its relationships so the subsequent
+        # INSERT doesn't fail with a duplicate primary key error.
         try:
             self._conn.execute(
-                f"MATCH (n:{table} {{{pk_field}: $pk}}) DELETE n",
+                f"MATCH (n:{table} {{{pk_field}: $pk}}) DETACH DELETE n",
                 parameters={"pk": pk_val},
             )
         except Exception:

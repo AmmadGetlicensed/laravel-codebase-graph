@@ -88,12 +88,26 @@ def _extract_schedule_body(source: str) -> str:
 
 
 def _split_statements(body: str) -> list[str]:
-    """Split schedule body into individual $schedule->... chains."""
-    # Split on new $schedule-> occurrences
+    """Split schedule body into individual $schedule->... chains (active lines only)."""
+    # Strip commented lines before extracting statements so commented-out tasks
+    # are not counted as active scheduled tasks.
+    clean_lines = []
+    in_block = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if "/*" in stripped and "*/" not in stripped:
+            in_block = True
+        if "*/" in stripped:
+            in_block = False
+            continue
+        if in_block or stripped.startswith("//") or stripped.startswith("#") or stripped.startswith("*"):
+            continue
+        clean_lines.append(line)
+    clean_body = "\n".join(clean_lines)
+
     statements: list[str] = []
-    # A statement starts at $schedule-> and ends at ; (accounting for method chains)
     pattern = re.compile(r"\$schedule\s*->.*?;", re.DOTALL)
-    for m in pattern.finditer(body):
+    for m in pattern.finditer(clean_body):
         statements.append(m.group(0))
     return statements
 
@@ -103,6 +117,46 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+
+
+# Matches any $schedule-> occurrence (active or commented)
+_ANY_SCHEDULE_RE = re.compile(r"\$schedule\s*->")
+
+
+def _detect_commented_tasks(source: str) -> tuple[int, int]:
+    """Return (active_count, commented_count) of $schedule-> lines.
+
+    Walks the source line by line.  A line is "commented" when it is stripped
+    to start with ``//``, ``#``, or ``*`` (inside a block comment).
+    Returns (active, commented) counts so callers can determine whether the
+    scheduler is effectively disabled.
+    """
+    active = 0
+    commented = 0
+    in_block_comment = False
+
+    for line in source.splitlines():
+        stripped = line.strip()
+
+        # Track /* ... */ block comments (simplified — assumes one per line)
+        if "/*" in stripped and "*/" not in stripped:
+            in_block_comment = True
+        if "*/" in stripped:
+            in_block_comment = False
+
+        if _ANY_SCHEDULE_RE.search(stripped):
+            is_commented = (
+                in_block_comment
+                or stripped.startswith("//")
+                or stripped.startswith("#")
+                or stripped.startswith("*")
+            )
+            if is_commented:
+                commented += 1
+            else:
+                active += 1
+
+    return active, commented
 
 
 def run(ctx: PipelineContext) -> None:
@@ -130,6 +184,8 @@ def run(ctx: PipelineContext) -> None:
     if not candidate_paths:
         logger.info("No schedule definition file found; skipping phase 23")
         ctx.stats["scheduled_tasks"] = 0
+        ctx.stats["scheduler_disabled"] = False
+        ctx.stats["scheduler_commented_tasks"] = 0
         return
 
     for source_path in candidate_paths:
@@ -240,4 +296,25 @@ def run(ctx: PipelineContext) -> None:
                     logger.debug("SCHEDULES→Job rel failed", task=task_key, error=str(exc))
 
     ctx.stats["scheduled_tasks"] = scheduled_tasks
+
+    # Detect whether the scheduler appears to be disabled (all $schedule-> calls commented out)
+    total_active = 0
+    total_commented = 0
+    for source_path in candidate_paths:
+        source = _read_text(source_path)
+        if source and "$schedule" in source:
+            a, c = _detect_commented_tasks(source)
+            total_active += a
+            total_commented += c
+
+    scheduler_disabled = total_commented > 0 and total_active == 0
+    ctx.stats["scheduler_disabled"] = scheduler_disabled
+    ctx.stats["scheduler_commented_tasks"] = total_commented
+    if scheduler_disabled:
+        logger.warning(
+            "Scheduler appears disabled — all $schedule-> calls are commented out",
+            commented=total_commented,
+            path=str(candidate_paths[0]),
+        )
+
     logger.info("Scheduled task parsing complete", tasks=scheduled_tasks)

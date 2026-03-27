@@ -125,14 +125,24 @@ def run(ctx: PipelineContext) -> None:
                 break
 
     if not esp_path.exists():
-        logger.info("EventServiceProvider.php not found; skipping phase 17")
+        logger.info("EventServiceProvider.php not found; skipping event/listener graph")
         ctx.stats["events_mapped"] = 0
         ctx.stats["listeners_mapped"] = 0
+        # Still run dispatch detection — it scans ALL method bodies for dispatch patterns
+        # and does not depend on EventServiceProvider.
+        from laravelgraph.pipeline.phase_05_calls import run_dispatch_pass
+        run_dispatch_pass(ctx)
         return
 
     source = _read_source(esp_path)
     listen_map = _parse_listen_array(source)
-    logger.info("Parsed EventServiceProvider", events=len(listen_map))
+    logger.info("Parsed EventServiceProvider", path=str(esp_path), events=len(listen_map))
+    if not listen_map:
+        logger.warning(
+            "EventServiceProvider found but $listen array is empty or could not be parsed. "
+            "The project may use Event::listen() in boot(), auto-discovery, or a non-standard pattern.",
+            path=str(esp_path),
+        )
 
     for event_class, listener_classes in listen_map.items():
         # Create or update Event node
@@ -274,3 +284,8 @@ def run(ctx: PipelineContext) -> None:
         events=events_mapped,
         listeners=listeners_mapped,
     )
+
+    # Run the dispatch detection pass now that Event/Job nodes exist.
+    # This must happen AFTER Event/Job nodes are created (hence here, not in phase_05).
+    from laravelgraph.pipeline.phase_05_calls import run_dispatch_pass
+    run_dispatch_pass(ctx)
