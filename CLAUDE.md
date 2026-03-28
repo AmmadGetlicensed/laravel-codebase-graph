@@ -21,6 +21,26 @@ mypy laravelgraph/
 # Install as CLI tool (production)
 pipx install .
 pipx reinstall laravelgraph   # After any source changes — required because MCP uses the pipx binary
+
+# Plugin management
+laravelgraph plugin list .              # list all plugins with health/contribution
+laravelgraph plugin suggest .           # suggest applicable domain plugins
+laravelgraph plugin scaffold <name> .   # scaffold plugin from graph context
+laravelgraph plugin validate <file>     # validate plugin safety
+laravelgraph plugin enable <name> .     # enable disabled plugin
+laravelgraph plugin disable <name> .    # disable plugin (keep file)
+laravelgraph plugin delete <name> .     # permanently delete plugin + data
+laravelgraph plugin prompt <name> "..." # attach system prompt to plugin
+
+# Log management
+laravelgraph logs                        # show recent logs
+laravelgraph logs --level error         # filter by level
+laravelgraph logs --tool <name>         # filter by MCP tool
+laravelgraph logs --since 2h            # last 2 hours
+laravelgraph logs tail                  # live tail (Ctrl+C to stop)
+laravelgraph logs stats                 # log statistics
+laravelgraph logs clear                 # clear old logs (>30 days)
+laravelgraph logs clear --all           # clear all logs (with confirmation)
 ```
 
 > **Important:** The MCP server (`laravelgraph serve`) is launched by Claude Code via `pipx`. Any change to source files must be followed by `pipx reinstall laravelgraph` before the changes take effect in the running MCP server.
@@ -87,6 +107,61 @@ MySQL/RDS databases
 ### Adding a new MCP tool
 
 Add a `@mcp.tool()` decorated function to `mcp/server.py`. Update the server instructions string at the top of `create_server()`.
+
+### Plugin System
+
+```
+Plugin System:
+  plugins/plugin_graph.py  DualDB + PluginGraphDB (writable runtime graph)
+  plugins/meta.py          PluginMetaStore (status, usage, contribution scoring)
+  plugins/generator.py     Domain-anchored generation + 4-layer validation
+  plugins/loader.py        MCP + pipeline plugin loading; scan_plugin_manifests; _ToolCollector
+  plugins/self_improve.py  Proactive self-improvement on server startup
+  logging_manager.py       Log reading, filtering, tailing utilities
+```
+
+**What plugins are:** Product-specific domain lenses over the graph. Built-in MCP tools give generic Laravel intelligence (routes, models, events, dead code). Plugins give intelligence about a specific product's domain — "what is the order lifecycle?", "how does driver assignment work?" These are questions that require knowing the actual routes, models, and events in that particular app.
+
+**How generation works (`plugins/generator.py`):**
+
+1. **Stage 1 — Domain anchor resolution (no LLM):** `_resolve_domain_anchors()` runs pure Python + Cypher to find which Feature nodes, Routes, EloquentModels, Events, and Jobs in the graph implement the requested domain. Uses a two-phase approach:
+   - Phase A: Match against Feature nodes (phase 27 clusters) by token overlap
+   - Phase B fallback: Scan Route URIs, EloquentModel names, Event names by substring
+   - Phase C: Expand events to their listener classes via `LISTENS_TO`
+
+2. **Stage 2 — LLM spec generation:** The LLM receives real node names from the graph (not invented) and produces a compact JSON spec: `{ slug, prefix, tools: [{name, description, cypher_query, result_format}] }`. The LLM only chooses query patterns and substitutes real node names.
+
+3. **Stage 3 — Deterministic code assembly:** Python is assembled from the spec — the LLM never writes Python. Every plugin gets 3 guaranteed tools:
+   - `{prefix}summary` — hard-coded domain overview from anchors (no LLM, always works)
+   - `{prefix}X` — LLM-specified query tools (Cypher populated from real node names)
+   - `{prefix}store_discoveries` — writes findings to the plugin graph via `db().plugin().upsert_plugin_node()`
+
+4. **Stage 4 — Validation:** 4-layer validation: AST/static → schema → execution sandbox → LLM judge. On judge failure the loop retries (up to `max_iterations`) with critique. On LLM failure after all retries, falls back to a template skeleton the user edits manually.
+
+**Plugin graph writes:** `db().plugin().upsert_plugin_node(plugin_source, node_id, label, properties)` — plugins accumulate product-specific domain knowledge across sessions. Future agent calls can read these discoveries.
+
+**Plugins live in the product:** `.laravelgraph/plugins/` inside the Laravel project — they are specific to that product's domain, not to Laravel in general.
+
+**Plugin discovery at server startup (`plugins/loader.py`):**
+
+`scan_plugin_manifests(plugins_dir)` reads every `.py` file via AST (no import, no side effects) and extracts `PLUGIN_MANIFEST` + tool function names. Called before `FastMCP()` is created so the results can be injected into the server instructions string. This means Claude sees all installed plugin names, descriptions, and tool names at the very start of every conversation — no `laravelgraph_suggest_plugins()` call needed.
+
+**Hot dispatch — using plugins without restart (`laravelgraph_run_plugin_tool`):**
+
+MCP tool lists are sent to the client at connection start. Native plugin tools only appear after the server restarts. `laravelgraph_run_plugin_tool(plugin_name, tool_name)` bypasses this by dynamically loading the plugin file via `_import_plugin_module`, registering its tools into a `_ToolCollector` (a lightweight mock that collects `@mcp.tool()` functions without touching FastMCP), then calling the requested function directly.
+
+This means:
+- Generate a plugin → call it immediately in the **same conversation** via `laravelgraph_run_plugin_tool`
+- Next conversation: native tools are registered at startup AND listed in instructions automatically
+
+```python
+# Typical agent workflow after plugin generation:
+laravelgraph_request_plugin("user management domain")
+# → success message lists tool names
+laravelgraph_run_plugin_tool("user-explorer", "usr_summary")    # immediate
+laravelgraph_run_plugin_tool("user-explorer", "usr_routes")     # immediate
+# Next conversation: usr_summary() / usr_routes() are native tools
+```
 
 ## HTTP Serving (EC2 / Shared Server)
 

@@ -655,7 +655,12 @@ class _TSVisitor:
         for child in node.children:
             if child.type == "name":
                 name = self._text(child)
+            elif child.type == "primitive_type":
+                # Backed type — appears directly as a child of enum_declaration
+                # (tree-sitter-php grammar: `enum Foo: string { ... }`)
+                backed_type = self._text(child)
             elif child.type == "enum_backed_type":
+                # Older grammar variant wraps it in enum_backed_type
                 for c in child.children:
                     if c.type == "primitive_type":
                         backed_type = self._text(c)
@@ -663,7 +668,7 @@ class _TSVisitor:
                 for c in child.children:
                     if c.type in ("name", "qualified_name"):
                         implements.append(self._text(c))
-            elif child.type == "declaration_list":
+            elif child.type in ("declaration_list", "enum_declaration_list"):
                 for member in child.children:
                     if member.type == "enum_case":
                         for c in member.children:
@@ -773,7 +778,8 @@ class _TSVisitor:
         return calls
 
     def _walk_calls(self, node: Any, calls: list[ParsedCall]) -> None:
-        if node.type == "static_call_expression":
+        if node.type in ("static_call_expression", "scoped_call_expression"):
+            # tree-sitter-php uses "scoped_call_expression" for Foo::bar()
             receiver = ""
             method = ""
             for child in node.children:

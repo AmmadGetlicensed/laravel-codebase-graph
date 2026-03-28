@@ -41,71 +41,291 @@ def create_server(project_root: Path, config: Config | None = None) -> Any:
     cfg = config or Config.load(project_root)
     configure(cfg.log.level, cfg.log.dir)
 
+    # ── Scan plugins before server creation so we can inject them into instructions ──
+    from laravelgraph.plugins.loader import scan_plugin_manifests as _scan_manifests
+    _plugins_dir_early = project_root / ".laravelgraph" / "plugins"
+    _plugin_manifests = _scan_manifests(_plugins_dir_early)
+
+    def _build_loaded_plugins_section(manifests: list) -> str:
+        if not manifests:
+            return ""
+        lines = [
+            "\n═══════════════════════════════════════════════════════════",
+            "LOADED PLUGINS (active this conversation)",
+            "═══════════════════════════════════════════════════════════",
+            "",
+            "These plugins were generated for THIS product's domain and are",
+            "available RIGHT NOW — no restart, no discovery call needed.",
+            "",
+            "TWO ways to use them:",
+            "  1. Native tool call  — e.g. usr_summary()  (registered at startup)",
+            "  2. Hot dispatch      — laravelgraph_run_plugin_tool(plugin, tool)",
+            "     Use hot dispatch when you generated a plugin THIS conversation",
+            "     and want to use it immediately without waiting for a restart.",
+            "",
+        ]
+        for m in manifests:
+            lines.append(f"▸ {m['name']}  (prefix: {m['tool_prefix']})")
+            if m["description"]:
+                lines.append(f"  \"{m['description']}\"")
+            if m["tool_names"]:
+                lines.append(f"  Tools: {', '.join(m['tool_names'])}")
+                lines.append(f"  Hot:   laravelgraph_run_plugin_tool(\"{m['name']}\", \"<tool_name>\")")
+            lines.append("")
+        lines.append("If a plugin was just generated this session, use hot dispatch above.")
+        lines.append("Native tools are only visible after the next MCP server restart.")
+        return "\n".join(lines)
+
+    _loaded_plugins_section = _build_loaded_plugins_section(_plugin_manifests)
+
     mcp = FastMCP(
         name="LaravelGraph",
-        version="0.1.0",
-        instructions="""LaravelGraph is a graph-powered code intelligence engine for Laravel/PHP codebases.
+        version="0.2.0",
+        instructions="""YOU HAVE ACCESS TO THE COMPLETE KNOWLEDGE GRAPH OF THIS PRODUCT.
+This is not a search tool — this is the product's brain. It knows every class, method,
+route, model, database table, column, stored procedure, event, job, and their relationships.
+It sees live production data distributions. It traces code → DB → event → job chains.
+It understands product features, behavioral contracts, API surfaces, and performance risks.
 
-Use these tools to understand any Laravel codebase:
+YOUR JOB: Use these tools as the SINGLE SOURCE OF TRUTH for any question about this product.
+Do NOT read files manually when you can query the graph. Do NOT guess — query first.
+When one tool returns sparse results, ALWAYS escalate to the next step. Never stop at empty.
 
-## Feature exploration (start here)
-- laravelgraph_feature_context: ONE CALL for the complete picture — routes table, controller source,
-  models (discovered via BFS call chain, not just name matching), events, jobs dispatched
-  (including from service layer), views, config. Always start here.
-- laravelgraph_explain: Best-anchor end-to-end explanation — uses semantic search to pick the
-  right entry point (service class, route, or event) instead of blindly matching route names.
-- laravelgraph_request_flow: Full HTTP lifecycle with BFS call-chain traversal (3 hops deep) —
-  controller → service → dependencies, events dispatched at every level, queued jobs section.
+When a result shows "AMBIGUOUS NAME" warning, it means multiple classes share that name.
+Use the full FQN shown in the warning to target the exact class you need.
 
-## Symbol lookup
-- laravelgraph_query: Hybrid search (BM25 + semantic + fuzzy) across all indexed symbols
-- laravelgraph_context: 360° view of any symbol — source, summary, callers, relationships
-- laravelgraph_impact: Blast radius of a change
-- laravelgraph_routes: Browse the full route table
-- laravelgraph_models: Eloquent model relationships with linked DB tables
-- laravelgraph_events: Event/listener/job dispatch graph
-- laravelgraph_dead_code: Unreachable code report
-- laravelgraph_bindings: Service container binding map
-- laravelgraph_config_usage: Config/env dependency map
+═══════════════════════════════════════════════════════════
+HOW TO UNDERSTAND ANY FEATURE
+═══════════════════════════════════════════════════════════
 
-## Database intelligence
-- laravelgraph_schema: Full schema (live DB + migrations) with code access summary
-- laravelgraph_db_context: Full picture of a table — columns, FK/inferred relations, code access,
-  value distribution for discriminator columns (type/status/state), lazy LLM annotation
-- laravelgraph_resolve_column: Deep-dive on a single column — polymorphic detection, write-path
-  evidence, guard conditions, live value distribution for enum/tinyint columns
-- laravelgraph_procedure_context: Stored procedure details with table access map
-- laravelgraph_connection_map: All configured DB connections, table counts, cross-DB access
-- laravelgraph_db_query: Live read-only SQL (SELECT/SHOW/DESCRIBE) — see actual data values,
-  lookup rows, enum IDs. Results are cached (TTL-based).
-- laravelgraph_db_impact: Cross-layer trace — DB write site → events dispatched → listeners → jobs
+1 → laravelgraph_feature_context(feature="booking")
+  ONE CALL: routes + controller source + models + events + jobs + views + config.
+  If rich → done. If sparse → step 2.
 
-## Change analysis
-- laravelgraph_detect_changes: Map git diff to affected symbols
-- laravelgraph_suggest_tests: Find tests to run after a change
-- laravelgraph_cypher: Raw read-only Cypher queries
+2 → laravelgraph_explain(feature="booking flow")
+  Semantic search finds the best anchor — may be a service class, not a route.
+  If found → done. If need HTTP detail → step 3.
 
-## Utilities
-- laravelgraph_provider_status: LLM providers configured for semantic summaries
+3 → laravelgraph_request_flow(route="/api/bookings")
+  Controller → service → dependencies (3 hops), events/jobs at every level.
 
----
-IMPORTANT WORKFLOW:
+4 → laravelgraph_context(symbol="Booking::insertBooking", include_source=True)
+  360° view: callers, callees, dispatches, Eloquent relationships, source code.
+  Use include_source=True to see the actual PHP logic — switch maps, thresholds,
+  hardcoded IDs, email recipients, cache locks — everything static analysis misses.
 
-1. For any feature question → laravelgraph_feature_context FIRST (single call covers routes,
-   source, models from service layer, events, jobs, config).
+5 → laravelgraph_features(feature="booking")
+  Auto-clustered Feature nodes: all routes, models, events, jobs grouped by URI segment.
+  Use this when you need the PRODUCT BOUNDARY view — what belongs to a feature.
+  Call laravelgraph_features() with no args to list all detected product features.
 
-2. For "how does X work end-to-end" → laravelgraph_explain (picks best anchor — may be a
-   service class, not a route, if the service scores higher semantically).
+═══════════════════════════════════════════════════════════
+HOW TO UNDERSTAND ANY DATABASE TABLE
+═══════════════════════════════════════════════════════════
 
-3. For "trace this HTTP request" → laravelgraph_request_flow (walks 3 hops deep into service
-   layer, collects events + jobs at every level).
+1 → laravelgraph_db_context(table="orders")
+  Columns, FKs, inferred relations, code access, enum value distributions, annotation.
 
-4. For DB questions → laravelgraph_connection_map → laravelgraph_db_context → laravelgraph_db_query
-   for actual values. For mystery columns → laravelgraph_resolve_column.
+2 → laravelgraph_resolve_column(table="orders", column="status")
+  Write-path evidence, guard conditions, polymorphic hints, live value sample.
 
-5. When feature_context or request_flow shows empty events/jobs → the index may be stale.
-   Tell the user to run: laravelgraph analyze --full
-""",
+3 → laravelgraph_db_query(sql="SELECT col, COUNT(*) cnt FROM table GROUP BY col ORDER BY cnt DESC")
+  Live SQL — ALWAYS use this for real numbers. Code cannot tell you Gold plan = 75%.
+
+4 → laravelgraph_db_impact(table="orders", operation="write")
+  Write site → events dispatched → listeners → downstream jobs. Full chain.
+  When 0 sites: auto-fallback searches linked Eloquent model methods.
+
+═══════════════════════════════════════════════════════════
+HOW TO TRACE ASYNC CHAINS (jobs, commands, schedulers)
+═══════════════════════════════════════════════════════════
+
+1 → laravelgraph_job_chain(job="MatchAndUploadCertificatesJob", depth=5)
+  Job → Event → Listener → more Jobs (up to 8 hops). For non-HTTP flows.
+
+2 → laravelgraph_context(symbol, include_source=True) when chain is empty.
+
+3 → laravelgraph_events() for the full event → listener → job map.
+
+═══════════════════════════════════════════════════════════
+HOW TO UNDERSTAND STORED PROCEDURES & DB-LEVEL LOGIC
+═══════════════════════════════════════════════════════════
+
+1 → laravelgraph_connection_map()
+  ALL procedure names with last-modified dates. Tells you what's active vs legacy.
+
+2 → laravelgraph_procedure_context(name="sp_course_finder_events_cards_new")
+  Parameters, body, tables read/written, annotation.
+
+Stored procedures are called by the DB layer, not PHP. Zero PHP CALL statements is normal.
+
+═══════════════════════════════════════════════════════════
+HOW TO ASSESS CHANGE IMPACT
+═══════════════════════════════════════════════════════════
+
+1 → laravelgraph_impact(symbol) — BFS blast radius: callers + callees + DB tables + events.
+
+2 → laravelgraph_context(symbol) if impact seems low — check if route handler or magic method.
+
+3 → laravelgraph_suggest_tests(symbol) → which tests to run.
+
+4 → laravelgraph_detect_changes(base="HEAD~5") → git diff → affected symbols.
+
+5 → laravelgraph_test_coverage(symbol) → which TestCase nodes cover this route or class.
+  If coverage is 0: the symbol has no known tests — flag as untested before merging.
+
+═══════════════════════════════════════════════════════════
+HOW TO AUDIT BEHAVIORAL CONTRACTS
+═══════════════════════════════════════════════════════════
+
+laravelgraph_contracts(symbol="OrderController")
+  Returns all behavioral contracts that govern a class or route:
+  • validation — FormRequest rules() extracted (field constraints, required/optional)
+  • authorization — Policy method names and rules applied to the route
+  • lifecycle — Observer hooks (creating, updating, deleting, saved, etc.)
+  • mass_assignment — $fillable / $guarded arrays on Eloquent models
+
+  Use contract_type="validation" to filter to one type.
+  ALWAYS check contracts when reviewing a PR — they reveal implicit rules not in the method.
+
+═══════════════════════════════════════════════════════════
+HOW TO UNDERSTAND CODE INTENT (LAZY LLM)
+═══════════════════════════════════════════════════════════
+
+laravelgraph_intent(symbol="OrderService::processRefund")
+  Returns structured intent extracted by LLM on first call, then cached forever:
+  • purpose — one-sentence plain-English description
+  • reads — list of data it reads (models, tables, config keys)
+  • writes — list of data it mutates
+  • side_effects — emails sent, jobs dispatched, external APIs called
+  • guards — preconditions checked (auth, status checks, locks)
+
+  Intent is generated LAZILY — zero LLM cost during analyze. Only runs when you call this tool.
+  Cached in .laravelgraph/intent.json, auto-invalidated when the source file changes.
+
+═══════════════════════════════════════════════════════════
+HOW TO FIND PERFORMANCE RISKS
+═══════════════════════════════════════════════════════════
+
+laravelgraph_performance_risks()                    → all risks, sorted by severity
+laravelgraph_performance_risks(severity="high")     → high-severity only
+laravelgraph_performance_risks(symbol="OrderCtrl")  → risks in a specific class/method
+
+Risk types detected:
+  • n_plus_one        — foreach + relationship access without eager loading
+  • missing_eager_load — relationship access inside loops
+  • repeated_count    — ->count() called in a loop
+  • raw_query_bypass  — DB::select() / DB::statement() bypassing Eloquent (no query logging)
+
+═══════════════════════════════════════════════════════════
+HOW TO AUDIT THE API SURFACE
+═══════════════════════════════════════════════════════════
+
+laravelgraph_api_surface()                    → all public routes with middleware, auth, contracts
+laravelgraph_api_surface(route="/api/orders") → single-route deep audit
+laravelgraph_api_surface(method="POST")       → filter by HTTP method
+
+Shows for each route: middleware stack, auth guards, FormRequest validation rules, Policy,
+bound Observer hooks, and which test files cover it.
+Use this for security audits, API documentation, and onboarding.
+
+═══════════════════════════════════════════════════════════
+HOW TO EXPLORE & SEARCH
+═══════════════════════════════════════════════════════════
+
+laravelgraph_query(query="payment")        → Hybrid search (BM25 + semantic + fuzzy)
+laravelgraph_routes(filter="booking")      → Route table with controllers & middleware
+laravelgraph_models(model="Order")         → Eloquent relationships + linked DB table
+laravelgraph_dead_code()                   → Unreachable code report
+laravelgraph_bindings()                    → Service container bindings
+laravelgraph_config_usage(key="APP_KEY")   → All code depending on a config/env value
+laravelgraph_cypher(query="MATCH ...")     → Raw Cypher (labels use _ suffix: Class_, Function_)
+laravelgraph_schema(table_name="orders")   → Full table schema
+laravelgraph_provider_status()             → Which LLM provider generates annotations
+
+═══════════════════════════════════════════════════════════
+PLUGIN SYSTEM — EXTENDING THE GRAPH
+═══════════════════════════════════════════════════════════
+
+LaravelGraph supports project-specific plugins that add domain knowledge without
+touching the core codebase. Plugins live in .laravelgraph/plugins/*.py.
+
+laravelgraph_suggest_plugins()
+  Runs domain-signal detection across 7 built-in recipes against the live graph.
+  Recipes: payment-lifecycle, tenant-isolation, booking-state-machine,
+           subscription-lifecycle, rbac-coverage, audit-trail, feature-flags.
+  Returns ranked recommendations with evidence and scaffold commands.
+
+PLUGIN MANAGEMENT TOOLS (use these to build, update, and prune plugins at runtime):
+
+laravelgraph_request_plugin(description)
+  Auto-generate a new MCP tool plugin from a plain-English description.
+  Validates through 4 layers (AST + schema + execution + LLM judge).
+  AFTER generation: use laravelgraph_run_plugin_tool() immediately this session.
+  Native tool names also registered on the NEXT server start.
+
+laravelgraph_run_plugin_tool(plugin_name, tool_name)
+  *** USE THIS IMMEDIATELY AFTER GENERATING A PLUGIN ***
+  Dynamically loads any plugin from disk and calls the named tool — NO restart.
+  Works for plugins generated this conversation AND plugins from previous sessions.
+  Example: laravelgraph_run_plugin_tool("user-explorer", "usr_summary")
+  Example: laravelgraph_run_plugin_tool("order-lifecycle", "order_flow")
+  To see available tool names: check LOADED PLUGINS section above, or call
+  laravelgraph_suggest_plugins() which lists all installed plugins with their tools.
+
+laravelgraph_update_plugin(name, critique)
+  Regenerate an existing plugin with a specific critique of what's wrong.
+  Replaces the plugin file immediately if validation passes.
+  Use laravelgraph_run_plugin_tool() to test the updated plugin immediately.
+
+laravelgraph_remove_plugin(name, reason)
+  Remove a plugin that provides no benefit. Logs the reason to prevent
+  auto-regeneration of the same unhelpful plugin in the future.
+
+PLUGIN WORKFLOW:
+  1. laravelgraph_suggest_plugins()             → see what plugins exist + what's recommended
+  2. laravelgraph_request_plugin(description)   → generate plugin from description
+  3. laravelgraph_run_plugin_tool(name, tool)   → USE IT IMMEDIATELY, same conversation
+  4. laravelgraph_update_plugin(name, critique) → improve if output is wrong/shallow
+  5. laravelgraph_run_plugin_tool(name, tool)   → verify the improvement immediately
+  6. Next conversation: native tools registered automatically, shown in LOADED PLUGINS
+
+  If you already see the plugin in LOADED PLUGINS above:
+    • Call its native tool directly (e.g. usr_summary()) — fastest path
+    • OR use laravelgraph_run_plugin_tool() — works the same way
+
+PLUGIN SAFETY RULES (enforced, cannot be bypassed):
+  • tool_prefix must NOT start with "laravelgraph_" (reserved namespace)
+  • Plugins cannot DELETE, DROP, or TRUNCATE graph data — read + write only
+  • Network access (requests, httpx, urllib) is blocked
+  • All nodes written by a plugin are tagged with plugin_source automatically
+  • tool_prefix is validated at registration time — mismatch = plugin rejected
+
+═══════════════════════════════════════════════════════════
+MANDATORY RULES
+═══════════════════════════════════════════════════════════
+
+1. QUERY BEFORE GUESSING. This graph knows more than you can infer from file names.
+2. COMBINE CODE + DATA. Example: feature_context → db_context → db_query → context(source=True).
+   Code tells you the logic. Data tells you the reality. Both are required for truth.
+3. USE FULL FQN when context() warns about ambiguous names. The tool ALWAYS warns you.
+4. NEVER stop at empty results. Escalate: feature_context → explain → context(include_source).
+5. Model→table names are UNRELIABLE. ALWAYS verify via laravelgraph_models or laravelgraph_db_context.
+6. For business logic details (email recipients, capacity thresholds, cache lock durations,
+   hardcoded IDs): use laravelgraph_context(symbol, include_source=True). The graph auto-extracts
+   switch/match maps. For everything else, the source is the final authority.
+7. Live data distributions reveal what code CANNOT: which plans are actually used (Gold=75%),
+   which gateways handle real volume, which columns are functionally dead (value=0 across
+   all rows). ALWAYS check laravelgraph_db_query for the real numbers.
+8. BEHAVIORAL CONTRACTS are invisible without the graph. Always check laravelgraph_contracts
+   before reviewing or modifying a route — FormRequest rules, Policies, and Observer hooks
+   may enforce business logic that is not obvious from the controller code.
+9. PERFORMANCE RISKS are pre-computed. Run laravelgraph_performance_risks() early in any
+   refactor — N+1 patterns are the most common source of production slowdowns in Laravel.
+10. INTENT is lazy. laravelgraph_intent() costs one LLM call per symbol but is then cached.
+    Use it when you need a concise human-readable explanation of what a method actually does.
+"""
+        + _loaded_plugins_section,
     )
 
     # Lazy semantic summary cache — stored in .laravelgraph/summaries.json
@@ -117,22 +337,51 @@ IMPORTANT WORKFLOW:
     # TTL-based query result cache — stored in .laravelgraph/query_cache.json
     _query_cache = QueryResultCache(index_dir(project_root))
 
+    # Plugin graph and meta store — initialized early so all tools can access them
+    from laravelgraph.plugins.plugin_graph import init_plugin_graph
+    from laravelgraph.plugins.meta import PluginMetaStore
+    _plugin_db = init_plugin_graph(index_dir(project_root))
+    _meta_store = PluginMetaStore(index_dir(project_root))
+
     # Evict expired query cache entries on startup — cheap disk cleanup so
     # stale results from previous sessions don't accumulate indefinitely.
     _expired_on_startup = _query_cache.evict_expired()
     if _expired_on_startup:
         logger.info("Query cache: evicted expired entries on startup", count=_expired_on_startup)
 
-    db_ref: list[GraphDB | None] = [None]
+    _db_path = index_dir(project_root) / "graph.kuzu"
 
     def _db() -> GraphDB:
-        if db_ref[0] is None:
-            db_ref[0] = _load_db(project_root)
-        if db_ref[0] is None:
+        """Open a fresh DB connection for this request.
+
+        KuzuDB holds its write lock for the lifetime of the connection object.
+        By opening a new connection per tool call and closing it when done,
+        we never hold a persistent lock — so `laravelgraph analyze` can always
+        acquire the write lock regardless of whether the MCP server is running.
+        Plugin tools retain full read/write capability since the connection is
+        opened without read_only restriction.
+        """
+        if not _db_path.exists():
             raise ValueError(
                 f"No index found at {project_root}. Run: laravelgraph analyze {project_root}"
             )
-        return db_ref[0]
+        return GraphDB(_db_path)
+
+    def _sql_db():
+        """Return a live pymysql connection to the first configured database.
+
+        Plugins that declare ``sql_db=None`` in ``register_tools`` receive this
+        factory so they can run raw SQL queries alongside Cypher graph queries.
+        Returns None if no databases are configured or pymysql is unavailable.
+        """
+        db_configs = cfg.databases if hasattr(cfg, "databases") else []
+        if not db_configs:
+            return None
+        try:
+            from laravelgraph.pipeline.phase_24_db_introspect import _connect_mysql
+            return _connect_mysql(db_configs[0])
+        except Exception:
+            return None
 
     def _log_tool(name: str, params: dict, result_count: int, duration_ms: float) -> None:
         mcp_logger.info(
@@ -145,6 +394,21 @@ IMPORTANT WORKFLOW:
 
     def _next_steps(*hints: str) -> str:
         return "\n\n---\n**Next steps:**\n" + "\n".join(f"- {h}" for h in hints)
+
+    def _error_response(severity: str, message: str) -> str:
+        icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(severity, "⚪")
+        return f"# {icon} Error ({severity})\n\n{message}"
+
+    def _with_confidence(
+        level: str,
+        reason: str,
+        gaps: list[str] | None = None,
+    ) -> str:
+        tag = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(level, "⚪")
+        result = f"\n\n---\n**Confidence:** {tag} **{level}** — {reason}"
+        if gaps:
+            result += "\n**Coverage gaps:**\n" + "\n".join(f"- {g}" for g in gaps)
+        return result
 
     # ── Discriminator column helpers ─────────────────────────────────────────
 
@@ -215,30 +479,63 @@ IMPORTANT WORKFLOW:
             return None
 
     def _get_conn_cfg_for_table(conn_name: str) -> Any | None:
-        """Return the DatabaseConnectionConfig for a given connection name, or None."""
         for c in (cfg.databases if hasattr(cfg, "databases") else []):
             if c.name == conn_name:
                 return c
         return None
 
+    def _extract_switch_map(source: str) -> list[tuple[str, str]] | None:
+        import re
+
+        switch_match = re.search(r"\bswitch\s*\([^)]+\)\s*\{", source, re.MULTILINE)
+        if not switch_match:
+            return None
+
+        switch_body = source[switch_match.end():]
+        brace_depth = 1
+        end_pos = 0
+        for i, ch in enumerate(switch_body):
+            if ch == "{":
+                brace_depth += 1
+            elif ch == "}":
+                brace_depth -= 1
+                if brace_depth == 0:
+                    end_pos = i
+                    break
+        switch_body = switch_body[:end_pos]
+
+        case_blocks = re.split(r"\bcase\b", switch_body)
+        result: list[tuple[str, str]] = []
+        for block in case_blocks[1:]:
+            key_m = re.search(r"^\s*(?:(\d+)|'([^']+)'|\"([^\"]+)\")\s*:", block)
+            if not key_m:
+                continue
+            case_key = key_m.group(1) or key_m.group(2) or key_m.group(3) or ""
+            if not case_key:
+                continue
+
+            prop_m = re.search(r"return\s+\$\w+->(\w+)", block)
+            str_m = re.search(r"return\s+'([^']+)'", block) or re.search(r'return\s+"([^"]+)"', block)
+            if prop_m:
+                result.append((case_key, prop_m.group(1)))
+            elif str_m:
+                result.append((case_key, f'"{str_m.group(1)}"'))
+
+        return result if len(result) >= 2 else None
+
     def _fetch_varchar_sample(
         table: str, column: str, conn_cfg: Any, max_distinct: int = 30
-    ) -> list[dict] | None:
-        """Sample distinct values for a varchar/text column via the query cache.
-
-        Only runs when the result fits within `max_distinct` distinct values —
-        i.e. the column is categorical enough to be useful.  Returns a list of
-        {val, cnt} dicts ordered by count desc, or None when unavailable.
-        """
+    ) -> tuple[list[dict], bool] | None:
         safe_table = table.replace("`", "")
         safe_col = column.replace("`", "")
+        fetch_limit = max_distinct + 1
         sql = (
             f"SELECT `{safe_col}` AS val, COUNT(*) AS cnt "
             f"FROM `{safe_table}` "
             f"WHERE `{safe_col}` IS NOT NULL AND `{safe_col}` != '' "
             f"GROUP BY `{safe_col}` "
             f"ORDER BY cnt DESC "
-            f"LIMIT {max_distinct + 1}"  # fetch one extra to detect overflow
+            f"LIMIT {fetch_limit}"
         )
         ttl = getattr(conn_cfg, "query_cache_ttl", 300)
         key = _query_cache.make_key(conn_cfg.name, sql)
@@ -246,9 +543,8 @@ IMPORTANT WORKFLOW:
         cached = _query_cache.get(key, ttl=ttl)
         if cached is not None:
             rows = cached.get("rows", [])
-            if len(rows) > max_distinct:
-                return None  # too many distinct values — not useful
-            return rows
+            overflow = len(rows) >= fetch_limit
+            return rows[:max_distinct], overflow
 
         if ttl == 0:
             return None
@@ -268,9 +564,8 @@ IMPORTANT WORKFLOW:
                 except Exception:
                     pass
             _query_cache.set(key, sql, conn_cfg.name, cols_desc, rows_data, ttl=ttl)
-            if len(rows_data) > max_distinct:
-                return None  # too many distinct values
-            return rows_data
+            overflow = len(rows_data) >= fetch_limit
+            return rows_data[:max_distinct], overflow
         except Exception as e:
             logger.debug("_fetch_varchar_sample failed", table=table, column=column, error=str(e))
             return None
@@ -379,6 +674,21 @@ IMPORTANT WORKFLOW:
         raw_doc  = node.get("docblock", "")
 
         lines = [f"## Context: `{fqn}`\n"]
+
+        if node.get("_disambiguation_warning"):
+            lines.append(f"> **⚠ AMBIGUOUS NAME:** {node['_disambiguation_warning']}")
+            all_m = node.get("_all_matches", [])
+            if all_m:
+                lines.append(">")
+                lines.append("> | FQN | Methods | Routes | File |")
+                lines.append("> |-----|---------|--------|------|")
+                for am in all_m:
+                    lines.append(
+                        f"> | `{am.get('fqn', '')}` | {am.get('methods_count', '?')} "
+                        f"| {am.get('routes_count', '?')} | {am.get('file', '')!s:.60} |"
+                    )
+            lines.append("")
+
         lines.append(f"- **Type:** {label}")
         lines.append(f"- **File:** {fp or 'unknown'}")
         if ls:
@@ -413,10 +723,26 @@ IMPORTANT WORKFLOW:
             from laravelgraph.mcp.explain import _append_source_block
             _append_source_block(fp, ls, le, project_root, lines)
 
+        if fp and ls and label in ("Method", "Function_"):
+            try:
+                from laravelgraph.mcp.explain import read_source_snippet
+                src_for_map = read_source_snippet(fp, ls, le, project_root)
+                if src_for_map:
+                    switch_map = _extract_switch_map(src_for_map)
+                    if switch_map:
+                        lines.append("\n### Switch/Match Map (extracted)\n")
+                        lines.append("| Key | Maps To |")
+                        lines.append("|-----|---------|")
+                        for k, v in switch_map:
+                            lines.append(f"| `{k}` | `{v}` |")
+                        lines.append("")
+            except Exception:
+                pass
+
         lines.append("")
 
         # ── Generate and cache summary if we have source and API key ────────
-        if not cached_summary and fp and ls and cfg.summary.enabled:
+        if not cached_summary and fp and ls and cfg.llm.enabled:
             from laravelgraph.mcp.explain import read_source_snippet
             source_text = read_source_snippet(fp, ls, le, project_root)
             if source_text:
@@ -426,7 +752,7 @@ IMPORTANT WORKFLOW:
                     node_type=node_type,
                     source=source_text,
                     docblock=raw_doc,
-                    summary_cfg=cfg.summary,
+                    summary_cfg=cfg.llm,
                 )
                 if summary:
                     _summary_cache.set(node_id, summary, provider_used, file_path=fp)
@@ -438,15 +764,21 @@ IMPORTANT WORKFLOW:
         try:
             callers = db.execute(
                 "MATCH (caller)-[r:CALLS]->(target) WHERE target.node_id = $id "
-                "RETURN caller.fqn AS caller_fqn, r.confidence AS conf LIMIT 20",
+                "RETURN caller.fqn AS caller_fqn, r.confidence AS conf LIMIT 30",
                 {"id": node_id},
             )
             if callers:
-                lines.append(f"### Callers ({len(callers)})")
-                for c in callers:
-                    conf = c.get("conf")
-                    conf_str = f" (conf: {conf:.2f})" if conf is not None else ""
-                    lines.append(f"- `{c.get('caller_fqn', '?')}`{conf_str}")
+                own_class = fqn.rsplit("::", 1)[0] if "::" in fqn else fqn
+                external = [c for c in callers if not (c.get("caller_fqn") or "").startswith(own_class + "::")]
+                if external:
+                    lines.append(f"### Callers ({len(external)})")
+                    for c in external:
+                        conf = c.get("conf")
+                        conf_str = f" (conf: {conf:.2f})" if conf is not None else ""
+                        lines.append(f"- `{c.get('caller_fqn', '?')}`{conf_str}")
+                else:
+                    lines.append("### Callers")
+                    lines.append("No external callers detected — may be invoked via route registration or service container.")
                 lines.append("")
         except Exception:
             pass
@@ -594,7 +926,14 @@ IMPORTANT WORKFLOW:
         elapsed = (time.perf_counter() - start) * 1000
         _log_tool("laravelgraph_context", {"symbol": symbol}, 1, elapsed)
 
-        return "\n".join(lines) + _next_steps(
+        has_warning = bool(node.get("_disambiguation_warning"))
+        ctx_conf = "MEDIUM" if has_warning else "HIGH"
+        ctx_reason = (
+            "Ambiguous name — multiple classes matched, showing best guess"
+            if has_warning else "Exact symbol match from indexed graph"
+        )
+
+        return "\n".join(lines) + _with_confidence(ctx_conf, ctx_reason) + _next_steps(
             "Use laravelgraph_feature_context(feature) for a complete feature picture",
             "Use laravelgraph_impact(symbol) to see the full blast radius",
             "Use laravelgraph_suggest_tests(symbol) to find related tests",
@@ -687,7 +1026,18 @@ IMPORTANT WORKFLOW:
         elapsed = (time.perf_counter() - start) * 1000
         _log_tool("laravelgraph_impact", {"symbol": symbol, "depth": depth}, impact.total, elapsed)
 
-        return "\n".join(lines) + _next_steps(
+        conf_level = "HIGH" if impact.total > 0 else "LOW"
+        conf_reason = (
+            f"BFS traversal found {impact.total} affected symbols across callers, callees, DB tables, and dispatches"
+            if impact.total > 0
+            else "Zero impact detected — may indicate incomplete call graph indexing or a dynamic entry point"
+        )
+        conf_gaps = []
+        if impact.total == 0:
+            conf_gaps.append("Dynamic dispatch ($this->$method()) not traceable by static analysis")
+            conf_gaps.append("String-based route registration may not create CALLS edges")
+
+        return "\n".join(lines) + _with_confidence(conf_level, conf_reason, conf_gaps) + _next_steps(
             "Use laravelgraph_suggest_tests(symbol) to find tests covering these symbols",
             "Use laravelgraph_context(symbol) on any affected symbol for more details",
             "Run your test suite on the suggested test files before committing",
@@ -1158,27 +1508,54 @@ IMPORTANT WORKFLOW:
         elapsed = (time.perf_counter() - start) * 1000
         _log_tool("laravelgraph_dead_code", {}, len(all_dead), elapsed)
 
+        eloquent_live: list[dict] = []
+        try:
+            eloquent_live = db.execute(
+                "MATCH (c:Class_ {laravel_role: 'model'})-[:DEFINES]->(m:Method {is_dead_code: false}) "
+                "WHERE m.laravel_role IN ['accessor', 'mutator', 'scope', 'relationship'] "
+                "OR m.name STARTS WITH 'get' AND m.name ENDS WITH 'Attribute' "
+                "OR m.name STARTS WITH 'set' AND m.name ENDS WITH 'Attribute' "
+                "OR m.name STARTS WITH 'scope' "
+                "RETURN m.fqn AS fqn, m.name AS name, m.laravel_role AS role, "
+                "c.name AS model_name LIMIT 100"
+            )
+        except Exception:
+            pass
+
         if not all_dead:
-            return "✅ No dead code detected. (Or the index needs refreshing — run `laravelgraph analyze`.)"
+            lines = ["✅ No dead code detected.\n"]
+        else:
+            lines = [f"## Dead Code Report ({len(all_dead)} unreachable symbols)\n"]
 
-        lines = [f"## Dead Code Report ({len(all_dead)} unreachable symbols)\n"]
-        lines.append("> **Note:** Laravel-aware exemptions applied: route handlers, event listeners,")
-        lines.append("> Artisan commands, magic methods, Eloquent accessors/scopes, and policy methods")
-        lines.append("> are never flagged as dead code.\n")
+            by_file: dict[str, list] = {}
+            for d in all_dead:
+                f = d.get("file", "unknown")
+                by_file.setdefault(f, []).append(d)
 
-        # Group by file
-        by_file: dict[str, list] = {}
-        for d in all_dead:
-            f = d.get("file", "unknown")
-            by_file.setdefault(f, []).append(d)
+            for file_path, symbols in sorted(by_file.items())[:30]:
+                lines.append(f"### `{file_path}`")
+                for s in symbols:
+                    lines.append(f"- **DEAD** Line {s.get('line', '?')}: `{s.get('fqn', '?')}` ({s.get('_type', '?')})")
+                lines.append("")
 
-        for file_path, symbols in sorted(by_file.items())[:30]:
-            lines.append(f"### `{file_path}`")
-            for s in symbols:
-                lines.append(f"- Line {s.get('line', '?')}: `{s.get('fqn', '?')}` ({s.get('_type', '?')})")
+        if eloquent_live:
+            lines.append(f"\n## Eloquent-Dynamic Methods ({len(eloquent_live)} — status: LIVE)\n")
+            lines.append("These methods have no direct PHP callers but are invoked via Eloquent magic:")
+            lines.append("")
+            for el in eloquent_live[:50]:
+                role_tag = el.get("role") or "relationship"
+                lines.append(
+                    f"- **LIVE** `{el.get('fqn', '?')}` — {role_tag} on {el.get('model_name', '?')} "
+                    f"(evidence: eloquent_dynamic, confidence: HIGH)"
+                )
             lines.append("")
 
-        return "\n".join(lines) + _next_steps(
+        return "\n".join(lines) + _with_confidence(
+            "MEDIUM",
+            "Static call graph analysis — exempts Eloquent relationships, route handlers, accessors/mutators/scopes",
+            ["String-based dynamic dispatch (app()->make(), resolve()) not traced",
+             "Event subscriber methods registered in $subscribe property may be missed"],
+        ) + _next_steps(
             "Review each flagged symbol — dead code may still be useful if called via reflection",
             "Use laravelgraph_context(symbol) to double-check before deleting",
             "Run laravelgraph_detect_changes after cleanup to see the impact",
@@ -1599,7 +1976,7 @@ IMPORTANT WORKFLOW:
         cache_key = f"dbctx:table:{conn_name}:{t_name}"
         annotation = _db_cache.get(cache_key, current_hash=col_hash)
 
-        if not annotation and cfg.summary.enabled:
+        if not annotation and cfg.llm.enabled:
             # Build a rich prompt — include columns, models, and top callers so the
             # LLM doesn't have to guess from the table name alone (e.g. "locations"
             # could be course events, not geography).
@@ -1653,7 +2030,7 @@ IMPORTANT WORKFLOW:
                 fqn=f"db.table.{t_name}",
                 node_type="database table",
                 source=prompt_source,
-                summary_cfg=cfg.summary,
+                summary_cfg=cfg.llm,
             )
             if annotation:
                 _db_cache.set(cache_key, annotation, used_provider, schema_hash=col_hash)
@@ -1820,13 +2197,18 @@ IMPORTANT WORKFLOW:
         )
         if _is_varchar and not col_data.get("polymorphic_candidate") and disc_dist is None:
             if resolve_conn_cfg:
-                varchar_sample = _fetch_varchar_sample(table, column, resolve_conn_cfg)
-                if varchar_sample:
-                    lines.append("\n### Value Sample (live DB)\n")
-                    lines.append("| Value | Count |")
-                    lines.append("|-------|-------|")
-                    for srow in varchar_sample:
-                        lines.append(f"| `{srow.get('val')}` | {srow.get('cnt'):,} |")
+                varchar_result = _fetch_varchar_sample(table, column, resolve_conn_cfg)
+                if varchar_result is not None:
+                    varchar_rows, varchar_overflow = varchar_result
+                    if varchar_rows:
+                        header = "### Value Sample (live DB — top values by frequency)"
+                        if varchar_overflow:
+                            header += " *(more values exist — use laravelgraph_db_query for full distribution)*"
+                        lines.append(f"\n{header}\n")
+                        lines.append("| Value | Count |")
+                        lines.append("|-------|-------|")
+                        for srow in varchar_rows:
+                            lines.append(f"| `{srow.get('val')}` | {srow.get('cnt'):,} |")
 
         # ── Lazy LLM resolution ───────────────────────────────────────────────
         schema_sig = f"{full_t}:{col_data.get('polymorphic_candidate', False)}:{wpe_raw}"
@@ -1834,7 +2216,7 @@ IMPORTANT WORKFLOW:
         cache_key = f"dbctx:column:{conn_name}:{table}.{column}"
         annotation = _db_cache.get(cache_key, current_hash=col_hash)
 
-        if not annotation and cfg.summary.enabled:
+        if not annotation and cfg.llm.enabled:
             guard_summary = guard_raw[:200] if isinstance(guard_raw, str) else ""
             wpe_summary = wpe_raw[:400] if isinstance(wpe_raw, str) else ""
             dist_summary = ""
@@ -1859,7 +2241,7 @@ IMPORTANT WORKFLOW:
                 fqn=f"db.column.{table}.{column}",
                 node_type="database column",
                 source=prompt_source,
-                summary_cfg=cfg.summary,
+                summary_cfg=cfg.llm,
             )
             if annotation:
                 _db_cache.set(cache_key, annotation, used_provider, schema_hash=col_hash)
@@ -1966,7 +2348,7 @@ IMPORTANT WORKFLOW:
         cache_key = f"dbctx:proc:{conn_name}:{name}"
         annotation = _db_cache.get(cache_key, current_hash=body_hash)
 
-        if not annotation and cfg.summary.enabled:
+        if not annotation and cfg.llm.enabled:
             prompt_source = (
                 f"Stored procedure: {name}\n"
                 f"Connection: {conn_name}\n"
@@ -1977,7 +2359,7 @@ IMPORTANT WORKFLOW:
                 fqn=f"db.procedure.{name}",
                 node_type="stored procedure",
                 source=prompt_source,
-                summary_cfg=cfg.summary,
+                summary_cfg=cfg.llm,
             )
             if annotation:
                 _db_cache.set(cache_key, annotation, used_provider, schema_hash=body_hash)
@@ -2055,15 +2437,35 @@ IMPORTANT WORKFLOW:
 
         # ── Stored procedures per connection ──────────────────────────────────
         try:
-            proc_summary = db.execute(
-                "MATCH (p:StoredProcedure) RETURN p.connection AS conn, count(*) AS cnt"
+            proc_rows = db.execute(
+                "MATCH (p:StoredProcedure) "
+                "RETURN p.name AS name, p.connection AS conn, p.last_altered AS modified "
+                "ORDER BY p.connection, p.name"
             )
-            if proc_summary:
+            if proc_rows:
                 lines.append("### Stored Procedures\n")
-                for row in proc_summary:
+                by_conn: dict[str, list[dict]] = {}
+                for row in proc_rows:
                     conn_label = row.get("conn") or "unknown"
-                    lines.append(f"- `{conn_label}`: {row.get('cnt')} procedure(s)")
-                lines.append("")
+                    by_conn.setdefault(conn_label, []).append({
+                        "name": row.get("name") or "?",
+                        "modified": row.get("modified") or "",
+                    })
+                for conn_label, procs in sorted(by_conn.items()):
+                    lines.append(f"**`{conn_label}`** ({len(procs)} procedures)")
+                    has_dates = any(p["modified"] for p in procs)
+                    if has_dates:
+                        lines.append("| Procedure | Last Modified |")
+                        lines.append("|-----------|---------------|")
+                        for p in procs:
+                            mod = p["modified"][:10] if p["modified"] else "—"
+                            lines.append(f"| `{p['name']}` | {mod} |")
+                    else:
+                        lines.append("| Procedure |")
+                        lines.append("|-----------|")
+                        for p in procs:
+                            lines.append(f"| `{p['name']}` |")
+                    lines.append("")
         except Exception:
             pass
 
@@ -2264,7 +2666,38 @@ IMPORTANT WORKFLOW:
             f"Run again with bypass_cache=True to force a fresh query",
         )
 
-    # ── Tool: laravelgraph_db_impact ──────────────────────────────────────────
+    def _db_impact_model_fallback(
+        db: GraphDB, table: str, operation: str
+    ) -> list[dict]:
+        try:
+            model_rows = db.execute(
+                "MATCH (m:EloquentModel)-[:USES_TABLE]->(t:DatabaseTable) "
+                "WHERE t.name = $tname RETURN m.fqn AS mfqn LIMIT 3",
+                {"tname": table},
+            )
+        except Exception:
+            return []
+        if not model_rows:
+            return []
+
+        results = []
+        for mr in model_rows:
+            mfqn = mr.get("mfqn", "")
+            if not mfqn:
+                continue
+            try:
+                methods = db.execute(
+                    "MATCH (c:Class_)-[:DEFINES]->(m:Method) "
+                    "WHERE c.fqn = $fqn "
+                    "RETURN m.fqn AS src_fqn, m.name AS src_name, 'write' AS op, "
+                    "'eloquent_model' AS via, m.line_start AS line",
+                    {"fqn": mfqn},
+                )
+                for row in methods:
+                    results.append(row)
+            except Exception:
+                pass
+        return results[:30]
 
     @mcp.tool()
     def laravelgraph_db_impact(
@@ -2323,11 +2756,34 @@ IMPORTANT WORKFLOW:
             return f"Error querying write sites: {e}"
 
         if not sites:
-            op_label = "access" if operation == "any" else operation
-            return (
-                f"No `{op_label}` sites found for table `{table}`. "
-                "Run `laravelgraph analyze` to index DB access patterns."
-            )
+            fallback_sites = _db_impact_model_fallback(db, table, operation)
+            if fallback_sites:
+                sites = fallback_sites
+            else:
+                op_label = "access" if operation == "any" else operation
+                model_hint = ""
+                try:
+                    model_rows = db.execute(
+                        "MATCH (m:EloquentModel)-[:USES_TABLE]->(t:DatabaseTable) "
+                        "WHERE t.name = $tname RETURN m.name AS mname, m.fqn AS mfqn LIMIT 3",
+                        {"tname": table},
+                    )
+                    if model_rows:
+                        names = [r.get("mfqn", r.get("mname", "")) for r in model_rows]
+                        model_hint = (
+                            f"\n\nLinked Eloquent models: {', '.join(f'`{n}`' for n in names)}. "
+                            "Try laravelgraph_context(model, include_source=True) to read the "
+                            "model's methods that write to this table, or "
+                            "laravelgraph_db_query(sql=\"SELECT ...\") for live data."
+                        )
+                except Exception:
+                    pass
+                return (
+                    f"No indexed `{op_label}` sites for table `{table}`. "
+                    "The table may be written via $instance->save(), relationship methods, "
+                    "or raw SQL not captured by static analysis."
+                    + model_hint
+                )
 
         lines = [
             f"## DB Impact: `{table}` ({operation} paths)\n",
@@ -2424,7 +2880,16 @@ IMPORTANT WORKFLOW:
         elapsed = (time.perf_counter() - start) * 1000
         _log_tool("laravelgraph_db_impact", {"table": table, "operation": operation}, len(sites), elapsed)
 
-        return "\n".join(lines) + _next_steps(
+        has_dynamic = any(s.get("via") == "eloquent_model" for s in sites)
+        conf_gaps = []
+        if has_dynamic:
+            conf_gaps.append("Some write sites from Eloquent model fallback — may include non-write methods")
+        conf_level = "MEDIUM" if has_dynamic else "HIGH"
+        conf_reason = "Write-path index covers static calls, query builder, and Eloquent instance writes"
+        if has_dynamic:
+            conf_reason = "Includes fallback model method scan — verify specific write methods in source"
+
+        return "\n".join(lines) + _with_confidence(conf_level, conf_reason, conf_gaps) + _next_steps(
             f"Use laravelgraph_db_context('{table}') for full table schema and column details",
             "Use laravelgraph_events() for the complete event → listener → job map",
             f"Use laravelgraph_impact(ClassName) to trace the blast radius from any of the write sites above",
@@ -2527,6 +2992,125 @@ IMPORTANT WORKFLOW:
         return "\n".join(lines) + _next_steps(
             "Use laravelgraph_context(EventName) for full event details",
             "Use laravelgraph_impact(EventName) to see what breaks if the event changes",
+            "Use laravelgraph_job_chain(job) to trace the full execution chain from any Job entry point",
+        )
+
+    @mcp.tool()
+    def laravelgraph_job_chain(job: str, depth: int = 5) -> str:
+        """Trace the full execution chain from a Job or Artisan Command entry point.
+
+        Walks: Job/Command → dispatched Events → Listeners → further dispatched Jobs/Events,
+        up to `depth` hops. Reveals multi-level chains that laravelgraph_request_flow misses
+        because they originate outside the HTTP layer (queued jobs, scheduled commands, etc.).
+
+        Args:
+            job: Job class name, FQN, or Artisan command name (e.g. "MatchAndUploadCertificatesJob")
+            depth: Max hops to trace (default 5, max 8)
+        """
+        start = time.perf_counter()
+        db = _db()
+        depth = min(depth, 8)
+
+        node = _resolve_symbol(db, job)
+        if not node:
+            return f"Symbol '{job}' not found. Try laravelgraph_query('{job}')."
+
+        root_nid = node.get("node_id", "")
+        root_fqn = node.get("fqn", node.get("name", job))
+        root_label = node.get("_label", "?")
+
+        lines = [f"## Job Chain: `{root_fqn}`\n"]
+        lines.append(f"Entry point type: **{root_label}**\n")
+
+        visited: set[str] = {root_nid}
+        queue: list[tuple[str, str, int, str]] = [(root_nid, root_fqn, 0, "")]
+        chain_lines: list[str] = []
+
+        while queue:
+            cur_nid, cur_fqn, cur_depth, via = queue.pop(0)
+            if cur_depth >= depth:
+                continue
+
+            indent = "  " * cur_depth
+
+            if cur_depth == 0:
+                chain_lines.append(f"**`{cur_fqn}`** ← entry point")
+            else:
+                chain_lines.append(f"{indent}↳ `{cur_fqn}` (via {via})")
+
+            try:
+                method_rows = db.execute(
+                    "MATCH (c)-[:DEFINES]->(m:Method) WHERE c.node_id = $nid "
+                    "RETURN m.node_id AS mnid, m.name AS mname, m.fqn AS mfqn",
+                    {"nid": cur_nid},
+                )
+            except Exception:
+                method_rows = []
+
+            for mrow in method_rows:
+                mnid = mrow.get("mnid", "")
+                if not mnid or mnid in visited:
+                    continue
+
+                try:
+                    dispatched = db.execute(
+                        "MATCH (m:Method)-[d:DISPATCHES]->(t) WHERE m.node_id = $mnid "
+                        "RETURN t.node_id AS tnid, t.fqn AS tfqn, t.name AS tname, "
+                        "labels(t)[0] AS tlabel, d.dispatch_type AS dtype, d.condition AS cond",
+                        {"mnid": mnid},
+                    )
+                except Exception:
+                    dispatched = []
+
+                for d in dispatched:
+                    tnid = d.get("tnid", "")
+                    if not tnid or tnid in visited:
+                        continue
+                    visited.add(tnid)
+                    tfqn = d.get("tfqn") or d.get("tname") or "?"
+                    dtype = d.get("dtype") or "event"
+                    cond = f" when `{d.get('cond')}`" if d.get("cond") else ""
+                    queue.append((tnid, tfqn, cur_depth + 1, f"{dtype}{cond}"))
+
+                try:
+                    listeners = db.execute(
+                        "MATCH (m:Method)-[:DISPATCHES]->(e:Event)<-[:LISTENS_TO]-(l:Listener) "
+                        "WHERE m.node_id = $mnid "
+                        "RETURN l.node_id AS lnid, l.fqn AS lfqn, l.name AS lname",
+                        {"mnid": mnid},
+                    )
+                except Exception:
+                    listeners = []
+
+                for li in listeners:
+                    lnid = li.get("lnid", "")
+                    if not lnid or lnid in visited:
+                        continue
+                    visited.add(lnid)
+                    lfqn = li.get("lfqn") or li.get("lname") or "?"
+                    queue.append((lnid, lfqn, cur_depth + 1, "listener"))
+
+        lines.extend(chain_lines)
+        lines.append("")
+
+        total = len(visited) - 1
+        if total == 0:
+            lines.append(
+                "> No dispatch chain detected. This may mean:\n"
+                "> - The job dispatches events/jobs dynamically (not statically traceable)\n"
+                "> - The index is stale — run `laravelgraph analyze --full`\n"
+                "> - Dispatch uses string-based class names not resolvable statically\n"
+                "> \n"
+                "> Use `laravelgraph_context(job, include_source=True)` to read the source directly."
+            )
+
+        elapsed = (time.perf_counter() - start) * 1000
+        _log_tool("laravelgraph_job_chain", {"job": job, "depth": depth}, total, elapsed)
+
+        return "\n".join(lines) + _next_steps(
+            "Use laravelgraph_context(symbol, include_source=True) to read source at any node",
+            "Use laravelgraph_events for the full event → listener map",
+            "Use laravelgraph_suggest_tests(job) to find tests covering this chain",
         )
 
     # ── Tool: laravelgraph_bindings ──────────────────────────────────────────
@@ -2569,6 +3153,972 @@ IMPORTANT WORKFLOW:
             "Use laravelgraph_context(ClassName) to see where a bound class is injected",
             "Use laravelgraph_impact(InterfaceName) to see what depends on a binding",
         )
+
+    @mcp.tool()
+    def laravelgraph_list_procedures(keyword: str = "", connection: str = "") -> str:
+        """List stored procedures with modification dates, parameter counts, table access, PHP references, and internal CALL chains."""
+        db = _db()
+        start = time.perf_counter()
+        try:
+            rows = db.execute(
+                "MATCH (p:StoredProcedure) RETURN p.node_id AS nid, p.name AS name, p.connection AS conn, "
+                "p.parameters AS params, p.full_body AS body, p.body_preview AS preview"
+            )
+            procs = [r for r in rows if (not connection or (r.get("conn") or "") == connection)]
+            if keyword:
+                kw = keyword.lower()
+                procs = [r for r in procs if kw in (r.get("name") or "").lower()]
+            proc_names = {r.get("name") or "" for r in procs}
+
+            mod_dates: dict[str, str] = {}
+            try:
+                from laravelgraph.pipeline.phase_24_db_introspect import _connect_mysql
+                db_configs = list(getattr(cfg, "databases", []) or [])
+                for conn_cfg in db_configs:
+                    if connection and conn_cfg.name != connection:
+                        continue
+                    mc = _connect_mysql(conn_cfg)
+                    try:
+                        with mc.cursor() as cur:
+                            cur.execute(
+                                "SELECT ROUTINE_NAME, LAST_ALTERED FROM information_schema.ROUTINES "
+                                "WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = 'PROCEDURE'"
+                            )
+                            for row in cur.fetchall():
+                                name_val = str(row[0]) if row[0] else ""
+                                mod_val = str(row[1])[:19] if row[1] else "—"
+                                mod_dates[name_val] = mod_val
+                    finally:
+                        try:
+                            mc.close()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            lines = [f"## Stored Procedures ({len(procs)})\n"]
+            if not procs:
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_list_procedures", {"keyword": keyword, "connection": connection}, 0, elapsed)
+                return "No stored procedures matched the current filters." + _with_confidence(
+                    "HIGH",
+                    "Result derived from indexed live DB procedure metadata.",
+                ) + _next_steps(
+                    "Use laravelgraph_connection_map to see all configured DB connections",
+                    "Use laravelgraph_procedure_context(name) to inspect a specific procedure",
+                )
+            lines.append("| Procedure | Connection | Modified | Params | Reads | Writes | CALLs | Status |")
+            lines.append("|-----------|------------|----------|--------|-------|--------|-------|--------|")
+            for p in sorted(procs, key=lambda r: ((r.get("conn") or ""), (r.get("name") or "")))[:100]:
+                nid, name = p.get("nid") or "", p.get("name") or "?"
+                try:
+                    params = json.loads(p.get("params") or "[]")
+                    param_count = len(params) if isinstance(params, list) else 0
+                except Exception:
+                    raw = p.get("params") or ""
+                    param_count = raw.count(",") + 1 if raw.strip() else 0
+                try:
+                    reads = db.execute(
+                        "MATCH (p:StoredProcedure)-[:PROCEDURE_READS]->(t:DatabaseTable) WHERE p.node_id = $nid RETURN t.name AS name",
+                        {"nid": nid},
+                    )
+                except Exception:
+                    reads = []
+                try:
+                    writes = db.execute(
+                        "MATCH (p:StoredProcedure)-[:PROCEDURE_WRITES]->(t:DatabaseTable) WHERE p.node_id = $nid RETURN t.name AS name",
+                        {"nid": nid},
+                    )
+                except Exception:
+                    writes = []
+                try:
+                    ref_rows = db.execute(
+                        "MATCH (m:Method) WHERE m.fqn CONTAINS $proc_name RETURN count(m) AS cnt",
+                        {"proc_name": name},
+                    )
+                except Exception:
+                    ref_rows = []
+                body = ""
+                try:
+                    body = (p.get("body") or p.get("preview") or "").lower()
+                except Exception:
+                    pass
+                calls = sorted({pn for pn in proc_names if pn and pn != name and f"call {pn.lower()}" in body})[:3]
+                reads_s = ", ".join(f"`{r.get('name')}`" for r in reads[:3]) or "—"
+                writes_s = ", ".join(f"`{r.get('name')}`" for r in writes[:3]) or "—"
+                status = "PHP_UNREFERENCED" if (ref_rows[0].get("cnt", 0) if ref_rows else 0) == 0 else "PHP_MATCHED"
+                call_s = ", ".join(f"`{c}`" for c in calls) or "—"
+                mod = mod_dates.get(name, "—")
+                lines.append(
+                    f"| `{name}` | `{p.get('conn') or 'unknown'}` | {mod} | {param_count} | {reads_s} | {writes_s} | {call_s} | {status} |"
+                )
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_list_procedures", {"keyword": keyword, "connection": connection}, len(procs), elapsed)
+            return "\n".join(lines) + _with_confidence(
+                "HIGH",
+                "Derived from indexed stored procedures produced by live DB introspection.",
+            ) + _next_steps(
+                "Use laravelgraph_procedure_context(name) to inspect SQL body and table access",
+                "Use laravelgraph_connection_map to compare procedures across connections",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_list_procedures", {"keyword": keyword, "connection": connection}, 0, elapsed)
+            return f"Error listing stored procedures: {e}" + _with_confidence(
+                "LOW",
+                "The query failed before stored procedure metadata could be assembled.",
+                ["Stored procedure nodes or live DB metadata may be unavailable."],
+            ) + _next_steps(
+                "Use laravelgraph_connection_map to confirm procedure indexing exists",
+                "Re-run laravelgraph analyze --full after configuring DB connections",
+            )
+
+    @mcp.tool()
+    def laravelgraph_cross_cutting_concerns(min_call_sites: int = 3, min_layers: int = 2) -> str:
+        """Find methods called from many files across multiple architectural layers to surface cross-cutting concerns."""
+        db = _db()
+        start = time.perf_counter()
+        try:
+            rows = db.execute(
+                "MATCH (caller)-[:CALLS]->(target:Method) WHERE caller.file_path IS NOT NULL AND caller.file_path <> '' "
+                "RETURN target.fqn AS target_fqn, target.node_id AS nid, caller.file_path AS file_path, caller.laravel_role AS role"
+            )
+            role_layer_map = {
+                "model": "Model", "controller": "Controller", "service": "Service", "job": "Job",
+                "listener": "Listener", "middleware": "Middleware", "command": "Command",
+            }
+            path_layer_map = {
+                "/Controllers/": "Controller", "\\Controllers\\": "Controller",
+                "/Models/": "Model", "\\Models\\": "Model",
+                "/Services/": "Service", "\\Services\\": "Service",
+                "/Jobs/": "Job", "\\Jobs\\": "Job",
+                "/Listeners/": "Listener", "\\Listeners\\": "Listener",
+                "/Helpers/": "Helper", "\\Helpers\\": "Helper",
+                "/Commands/": "Command", "\\Commands\\": "Command",
+                "/Middleware/": "Middleware", "\\Middleware\\": "Middleware",
+            }
+            grouped: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                key = row.get("nid") or row.get("target_fqn") or "?"
+                file_path = row.get("file_path") or ""
+                role = (row.get("role") or "").lower()
+                layer = role_layer_map.get(role, "")
+                if not layer:
+                    for path_fragment, path_layer in path_layer_map.items():
+                        if path_fragment in file_path:
+                            layer = path_layer
+                            break
+                bucket = grouped.setdefault(key, {"fqn": row.get("target_fqn") or "?", "files": set(), "sites": 0, "layers": set()})
+                bucket["sites"] += 1
+                bucket["files"].add(file_path)
+                if layer:
+                    bucket["layers"].add(layer)
+            hits = []
+            for bucket in grouped.values():
+                if len(bucket["files"]) >= min_call_sites and len(bucket["layers"]) >= min_layers:
+                    risk = "HIGH" if len(bucket["files"]) >= 8 or len(bucket["layers"]) >= 4 else "MEDIUM"
+                    hits.append((bucket["sites"], len(bucket["files"]), bucket["fqn"], sorted(bucket["layers"]), risk))
+            hits.sort(reverse=True)
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool(
+                "laravelgraph_cross_cutting_concerns",
+                {"min_call_sites": min_call_sites, "min_layers": min_layers},
+                len(hits),
+                elapsed,
+            )
+            if not hits:
+                return "No cross-cutting concern candidates met the current thresholds." + _with_confidence(
+                    "MEDIUM",
+                    "This depends on how complete the indexed static call graph is.",
+                    ["Dynamic dispatch and framework magic may hide some call sites."],
+                ) + _next_steps(
+                    "Lower min_call_sites or min_layers to widen the search",
+                    "Use laravelgraph_context(symbol) on a likely utility method to inspect callers directly",
+                )
+            lines = [f"## Cross-Cutting Concern Candidates ({len(hits)})\n"]
+            lines.append("| Symbol | Call Sites | Files | Layers | Risk |")
+            lines.append("|--------|------------|-------|--------|------|")
+            for sites, files, fqn, layers, risk in hits[:50]:
+                lines.append(f"| `{fqn}` | {sites} | {files} | {', '.join(layers)} | {risk} |")
+            return "\n".join(lines) + _with_confidence(
+                "MEDIUM",
+                "Cross-layer fan-in is inferred from static CALLS edges and file-role metadata.",
+                ["Dynamic method calls and unresolved container dispatches reduce completeness."],
+            ) + _next_steps(
+                "Use laravelgraph_context(symbol, include_source=True) to inspect a high-risk concern",
+                "Use laravelgraph_impact(symbol) to measure the blast radius before refactoring",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_cross_cutting_concerns", {"min_call_sites": min_call_sites, "min_layers": min_layers}, 0, elapsed)
+            return f"Error finding cross-cutting concerns: {e}" + _with_confidence(
+                "LOW",
+                "The analysis failed before call graph aggregation completed.",
+                ["CALLS edges or laravel_role metadata may be missing."],
+            ) + _next_steps(
+                "Use laravelgraph_query(query='service helper util') to find shared utilities manually",
+                "Re-run laravelgraph analyze --full if call graph data seems stale",
+            )
+
+    @mcp.tool()
+    def laravelgraph_boundary_map(table: str = "") -> str:
+        """Show which PHP and stored procedure layers access a table and flag mixed-boundary conflicts."""
+        db = _db()
+        start = time.perf_counter()
+        try:
+            meta_rows = db.execute(
+                "MATCH (t:DatabaseTable) RETURN t.name AS tname, t.connection AS conn, t.source AS source"
+            )
+            meta = {
+                (r.get("tname") or "", r.get("conn") or ""): {"source": r.get("source") or "migration"}
+                for r in meta_rows if not table or (r.get("tname") or "") == table
+            }
+            import re as _re
+            all_models = db.execute(
+                "MATCH (m:EloquentModel) RETURN m.name AS model_name, m.fqn AS model_fqn, "
+                "m.db_table AS graph_table, m.file_path AS fp"
+            )
+            model_table_map: dict[tuple[str, str], list[str]] = {}
+            for r in all_models:
+                fp = r.get("fp") or ""
+                graph_tbl = r.get("graph_table") or ""
+                actual_tbl = graph_tbl
+                if fp:
+                    try:
+                        _fp = Path(fp)
+                        if not _fp.is_absolute():
+                            _fp = project_root / _fp
+                        head = _fp.read_text(errors="replace")[:3000]
+                        tm = _re.search(r"\$table\s*=\s*['\"]([^'\"]+)['\"]", head)
+                        if tm:
+                            actual_tbl = tm.group(1)
+                    except OSError:
+                        pass
+                if actual_tbl:
+                    for (tname, conn) in meta:
+                        if tname == actual_tbl:
+                            model_table_map.setdefault((tname, conn), []).append(
+                                r.get("model_fqn") or r.get("model_name") or ""
+                            )
+                            break
+            code_rows = db.execute(
+                "MATCH (src)-[q:QUERIES_TABLE]->(t:DatabaseTable) RETURN t.name AS tname, t.connection AS conn, "
+                "q.operation AS op, q.via AS via"
+            )
+            proc_r = db.execute(
+                "MATCH (p:StoredProcedure)-[:PROCEDURE_READS]->(t:DatabaseTable) RETURN t.name AS tname, t.connection AS conn"
+            )
+            proc_w = db.execute(
+                "MATCH (p:StoredProcedure)-[:PROCEDURE_WRITES]->(t:DatabaseTable) RETURN t.name AS tname, t.connection AS conn"
+            )
+            buckets: dict[tuple[str, str], dict[str, Any]] = {
+                k: {
+                    "markers": set(),
+                    "php_read": False,
+                    "php_write": False,
+                    "proc_read": False,
+                    "proc_write": False,
+                    "source": v["source"],
+                    "notes": set(),
+                }
+                for k, v in meta.items()
+            }
+            for row in code_rows:
+                key = (row.get("tname") or "", row.get("conn") or "")
+                if key not in buckets:
+                    continue
+                via = (row.get("via") or "").lower()
+                op = (row.get("op") or "").lower()
+                if via == "eloquent":
+                    if op in ("read", "readwrite"):
+                        buckets[key]["markers"].add("PHP_Eloquent_Read")
+                        buckets[key]["php_read"] = True
+                    if op != "read":
+                        buckets[key]["markers"].add("PHP_Eloquent_Write")
+                        buckets[key]["php_write"] = True
+                if via in ("query_builder", "raw_sql"):
+                    buckets[key]["markers"].add("PHP_QueryBuilder")
+                    buckets[key]["php_read"] = buckets[key]["php_read"] or op in ("read", "readwrite")
+                    buckets[key]["php_write"] = buckets[key]["php_write"] or op != "read"
+            for row in proc_r:
+                key = (row.get("tname") or "", row.get("conn") or "")
+                if key in buckets:
+                    buckets[key]["markers"].add("StoredProcedure_Read")
+                    buckets[key]["proc_read"] = True
+            for row in proc_w:
+                key = (row.get("tname") or "", row.get("conn") or "")
+                if key in buckets:
+                    buckets[key]["markers"].add("StoredProcedure_Write")
+                    buckets[key]["proc_write"] = True
+            for (tname, conn), models in model_table_map.items():
+                if table and tname != table:
+                    continue
+                key = (tname, conn)
+                if key not in buckets:
+                    key = next((k for k in buckets if k[0] == tname), None)
+                if not key or key not in buckets:
+                    continue
+                for model_fqn in models:
+                    if not model_fqn:
+                        continue
+                    short_name = model_fqn.rsplit(chr(92), 1)[-1]
+                    buckets[key]["notes"].add(
+                        f"PHP access resolved via $table = '{tname}' override on {short_name}"
+                    )
+
+                    try:
+                        qt_rows = db.execute(
+                            "MATCH (c:Class_)-[:DEFINES]->(m:Method)-[q:QUERIES_TABLE]->(t:DatabaseTable) "
+                            "WHERE c.fqn = $fqn AND t.name = $tname "
+                            "RETURN m.name AS mname, q.operation AS op",
+                            {"fqn": model_fqn, "tname": tname},
+                        )
+                    except Exception:
+                        qt_rows = []
+
+                    try:
+                        all_methods = db.execute(
+                            "MATCH (c:Class_)-[:DEFINES]->(m:Method) "
+                            "WHERE c.fqn = $fqn "
+                            "RETURN m.name AS mname, m.file_path AS fp, m.line_start AS ls, m.line_end AS le",
+                            {"fqn": model_fqn},
+                        )
+                    except Exception:
+                        all_methods = []
+
+                    if qt_rows:
+                        for mrow in qt_rows:
+                            op = (mrow.get("op") or "").lower()
+                            if op in ("read", "readwrite"):
+                                buckets[key]["markers"].add("PHP_Eloquent_Read")
+                                buckets[key]["php_read"] = True
+                            if op != "read":
+                                buckets[key]["markers"].add("PHP_Eloquent_Write")
+                                buckets[key]["php_write"] = True
+                    elif all_methods:
+                        buckets[key]["markers"].add("PHP_Eloquent_Read")
+                        buckets[key]["php_read"] = True
+                        from laravelgraph.mcp.explain import read_source_snippet as _read_src
+                        _write_keywords = ("->save(", "->update(", "->delete(", "::create(", "->insert(")
+                        for m in all_methods[:20]:
+                            try:
+                                src = _read_src(m.get("fp", ""), m.get("ls", 0), m.get("le", 0), project_root) or ""
+                                if any(kw in src for kw in _write_keywords):
+                                    buckets[key]["markers"].add("PHP_Eloquent_Write")
+                                    buckets[key]["php_write"] = True
+                                    break
+                            except Exception:
+                                pass
+            rows_out = []
+            for (tname, conn), info in buckets.items():
+                conflicts = []
+                if info["proc_read"] and info["php_write"]:
+                    conflicts.append("PROC_READS_vs_PHP_WRITES")
+                if info["proc_write"] and info["php_read"]:
+                    conflicts.append("PROC_WRITES_vs_PHP_READS")
+                if not table and len(info["markers"]) < 2 and not conflicts:
+                    continue
+                rows_out.append((
+                    tname,
+                    conn or "migration",
+                    sorted(info["markers"]),
+                    conflicts,
+                    info["source"],
+                    sorted(info["notes"]),
+                ))
+            rows_out.sort(key=lambda x: (0 if x[3] else 1, x[0], x[1]))
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_boundary_map", {"table": table}, len(rows_out), elapsed)
+            if not rows_out:
+                return "No multi-boundary table access patterns matched the current filter." + _with_confidence(
+                    "MEDIUM",
+                    "No mixed PHP/procedure access was found in the indexed graph for this scope.",
+                ) + _next_steps(
+                    "Use laravelgraph_db_context(table) to inspect one table in detail",
+                    "Run laravelgraph_connection_map to confirm live DB and procedure indexing coverage",
+                )
+            lines = [f"## Boundary Map{' for `' + table + '`' if table else ''} ({len(rows_out)})\n"]
+            lines.append("| Table | Connection | Access Layers | Conflicts | Notes |")
+            lines.append("|-------|------------|---------------|-----------|-------|")
+            for tname, conn, markers, conflicts, _source, notes in rows_out[:50]:
+                lines.append(
+                    f"| `{tname}` | `{conn}` | {', '.join(markers) or '—'} | {', '.join(conflicts) or '—'} | {', '.join(notes) or '—'} |"
+                )
+            has_model_override = any("$table override" in n for item in rows_out for n in item[5])
+            has_live = any(item[4] == "live_db" for item in rows_out)
+            if has_live and not has_model_override:
+                conf_level = "HIGH"
+                conf_reason = "Live DB table metadata backs these boundary relationships."
+            elif has_live and has_model_override:
+                conf_level = "HIGH"
+                conf_reason = "Live DB + Eloquent $table override resolved PHP access layers."
+            else:
+                conf_level = "MEDIUM"
+                conf_reason = "Derived from indexed code and migration-level metadata."
+            return "\n".join(lines) + _with_confidence(
+                conf_level,
+                conf_reason,
+                None if conf_level == "HIGH" else ["Migration-only tables may miss production-only procedure access."],
+            ) + _next_steps(
+                "Use laravelgraph_db_impact(table, operation='write') to trace downstream effects",
+                "Use laravelgraph_procedure_context(name) on any procedure touching a conflicted table",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_boundary_map", {"table": table}, 0, elapsed)
+            return f"Error building boundary map: {e}" + _with_confidence(
+                "LOW",
+                "The map failed before table access patterns could be consolidated.",
+                ["QUERIES_TABLE or PROCEDURE_* edges may be missing."],
+            ) + _next_steps(
+                "Use laravelgraph_db_context(table) for single-table analysis",
+                "Re-run laravelgraph analyze --full after DB introspection if procedure data is missing",
+            )
+
+    @mcp.tool()
+    def laravelgraph_data_quality_report(
+        connection: str = "",
+        table_filter: str = "",
+        min_rows: int = 100,
+    ) -> str:
+        """Scan live DB for data quality issues: boolean columns storing non-boolean values,
+        near-duplicate enum strings, and broken status/state fields with empty/None mixed in.
+
+        Optimized: batches queries, skips tables under min_rows, caches results.
+        Use table_filter to scan a single table (fast) or omit for full scan.
+
+        Args:
+            connection: DB connection name (optional — scans all if omitted)
+            table_filter: Scan only this table (fast mode — recommended for first use)
+            min_rows: Skip tables with fewer rows than this (default 100)
+        """
+        start = time.perf_counter()
+        timeout_seconds = 30.0
+        db = _db()
+        db_configs = [
+            c for c in (cfg.databases if hasattr(cfg, "databases") else [])
+            if not connection or c.name == connection
+        ]
+        if not db_configs:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_data_quality_report", {}, 0, elapsed)
+            return "No configured database connections." + _with_confidence(
+                "LOW", "Requires a configured live MySQL connection.",
+            )
+
+        try:
+            from laravelgraph.pipeline.phase_24_db_introspect import _connect_mysql
+
+            table_where = ""
+            if table_filter:
+                safe_tf = table_filter.replace("`", "")
+                table_where = f" AND t.name = '{safe_tf}'"
+
+            cols = db.execute(
+                "MATCH (t:DatabaseTable)-[:HAS_COLUMN]->(c:DatabaseColumn) "
+                f"WHERE t.source = 'live_db'{table_where} "
+                "RETURN t.name AS tname, t.connection AS conn, c.name AS cname, c.full_type AS ftype"
+            )
+            if connection:
+                cols = [c for c in cols if (c.get("conn") or "") == connection]
+
+            bool_cols: dict[str, list[str]] = {}
+            varchar_cols: list[dict] = []
+            for c in cols:
+                tname = c.get("tname") or ""
+                cname = c.get("cname") or ""
+                ftype = (c.get("ftype") or "").lower()
+                if not tname or not cname:
+                    continue
+                if "tinyint(1" in ftype:
+                    bool_cols.setdefault(tname, []).append(cname)
+                if "varchar" in ftype or any(
+                    k in cname.lower() for k in ("status", "state", "type")
+                ):
+                    varchar_cols.append(c)
+
+            issues: list[dict[str, Any]] = []
+            writers_cache: dict[str, str] = {}
+
+            def writers(tname: str) -> str:
+                if tname not in writers_cache:
+                    try:
+                        rows = db.execute(
+                            "MATCH (src:Method)-[q:QUERIES_TABLE]->(t:DatabaseTable) "
+                            "WHERE t.name = $t AND q.operation <> 'read' "
+                            "RETURN src.fqn AS fqn LIMIT 3",
+                            {"t": tname},
+                        )
+                        writers_cache[tname] = ", ".join(f"`{r.get('fqn')}`" for r in rows) or "—"
+                    except Exception:
+                        writers_cache[tname] = "—"
+                return writers_cache[tname]
+
+            for conn_cfg in db_configs:
+                mc = _connect_mysql(conn_cfg)
+                try:
+                    with mc.cursor() as cur:
+                        if min_rows > 0 and not table_filter:
+                            cur.execute(
+                                "SELECT TABLE_NAME FROM information_schema.TABLES "
+                                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_ROWS >= %s",
+                                (min_rows,),
+                            )
+                            big_tables = {row[0] for row in cur.fetchall()}
+                        else:
+                            big_tables = None
+
+                        batch_size = 10
+                        bool_tables = list(bool_cols.keys())
+                        if big_tables is not None:
+                            bool_tables = [t for t in bool_tables if t in big_tables]
+
+                        for i in range(0, len(bool_tables), batch_size):
+                            if time.perf_counter() - start > timeout_seconds:
+                                issues.append({
+                                    "table": "—", "column": "—",
+                                    "type": "SCAN_TIMEOUT",
+                                    "expected": "—", "actual": "—", "count": 0,
+                                    "risk": f"Scan stopped at {timeout_seconds}s. Use table_filter for targeted checks.",
+                                    "writers": "—",
+                                })
+                                break
+
+                            batch_tables = bool_tables[i:i + batch_size]
+                            unions = []
+                            for tname in batch_tables:
+                                safe_t = tname.replace("`", "")
+                                for cname in bool_cols[tname]:
+                                    safe_c = cname.replace("`", "")
+                                    unions.append(
+                                        f"SELECT '{safe_t}' AS tbl, '{safe_c}' AS col, "
+                                        f"CAST(`{safe_c}` AS CHAR) AS val, COUNT(*) AS cnt "
+                                        f"FROM `{safe_t}` "
+                                        f"WHERE `{safe_c}` IS NOT NULL AND `{safe_c}` NOT IN (0,1) "
+                                        f"GROUP BY `{safe_c}` ORDER BY cnt DESC LIMIT 5"
+                                    )
+                            if not unions:
+                                continue
+
+                            for sql in unions:
+                                try:
+                                    cur.execute(sql)
+                                    bad = cur.fetchall()
+                                    if bad:
+                                        tbl = bad[0][0]
+                                        col = bad[0][1]
+                                        detail = ", ".join(f"{r[2]} ({r[3]})" for r in bad)
+                                        total = sum(int(r[3]) for r in bad)
+                                        issues.append({
+                                            "table": tbl, "column": col,
+                                            "type": "BOOLEAN_DRIFT",
+                                            "expected": "0, 1, NULL",
+                                            "actual": detail,
+                                            "count": total,
+                                            "risk": "Column used as counter or flag with non-boolean values.",
+                                            "writers": writers(tbl),
+                                        })
+                                except Exception:
+                                    continue
+
+                        scanned_varchar = 0
+                        for vc in varchar_cols:
+                            if time.perf_counter() - start > timeout_seconds:
+                                break
+                            tname = vc.get("tname") or ""
+                            cname = vc.get("cname") or ""
+                            if big_tables is not None and tname not in big_tables:
+                                continue
+
+                            sample = _fetch_varchar_sample(tname, cname, conn_cfg, max_distinct=30)
+                            if not sample:
+                                continue
+                            rows_data, overflow = sample
+                            if overflow or not rows_data:
+                                continue
+
+                            norm: dict[str, list[dict]] = {}
+                            for r in rows_data:
+                                norm.setdefault(
+                                    str(r.get("val") or "").strip().lower(), []
+                                ).append(r)
+
+                            dup_groups = [
+                                grp for key, grp in norm.items()
+                                if key and len({str(x.get("val") or "") for x in grp}) > 1
+                            ]
+                            if dup_groups:
+                                actual = "; ".join(
+                                    " / ".join(f"{x.get('val')} ({x.get('cnt')})" for x in grp)
+                                    for grp in dup_groups[:3]
+                                )
+                                issues.append({
+                                    "table": tname, "column": cname,
+                                    "type": "ENUM_NEAR_DUPLICATE",
+                                    "expected": "Canonicalized enum values",
+                                    "actual": actual,
+                                    "count": sum(int(x.get("cnt") or 0) for grp in dup_groups for x in grp),
+                                    "risk": "Near-duplicate text values split state reporting.",
+                                    "writers": writers(tname),
+                                })
+
+                            bad_keys = [
+                                k for k in norm
+                                if k in ("", "none")
+                                and any(other not in ("", "none") for other in norm)
+                            ]
+                            if bad_keys and any(k in cname.lower() for k in ("status", "state")):
+                                actual = ", ".join(
+                                    f"{x.get('val')!r} ({x.get('cnt')})"
+                                    for k in bad_keys for x in norm[k]
+                                )
+                                issues.append({
+                                    "table": tname, "column": cname,
+                                    "type": "STATUS_MIXED_EMPTY",
+                                    "expected": "Non-empty status values",
+                                    "actual": actual,
+                                    "count": sum(int(x.get("cnt") or 0) for k in bad_keys for x in norm[k]),
+                                    "risk": "Empty/None mixed with real workflow states.",
+                                    "writers": writers(tname),
+                                })
+                            scanned_varchar += 1
+                finally:
+                    try:
+                        mc.close()
+                    except Exception:
+                        pass
+
+            issues.sort(key=lambda x: int(x.get("count") or 0), reverse=True)
+            issues = issues[:50]
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_data_quality_report", {"table_filter": table_filter}, len(issues), elapsed)
+
+            if not issues:
+                scope = f"table `{table_filter}`" if table_filter else f"all tables with ≥{min_rows} rows"
+                return f"No data quality issues detected in {scope}." + _with_confidence(
+                    "HIGH", f"Scanned {scope} via live DB queries in {elapsed:.0f}ms.",
+                ) + _next_steps(
+                    "Use table_filter to scan a specific table: data_quality_report(table_filter='orders')",
+                    "Use laravelgraph_db_query for ad-hoc distribution checks",
+                )
+
+            timed_out = any(i["type"] == "SCAN_TIMEOUT" for i in issues)
+            scope = f"table `{table_filter}`" if table_filter else f"tables with ≥{min_rows} rows"
+            lines = [f"## Data Quality Report ({len(issues)} issues from {scope})\n"]
+            lines.append("| Table | Column | Issue | Actual Values | Affected Rows | Write Paths |")
+            lines.append("|-------|--------|-------|---------------|---------------|-------------|")
+            for issue in issues:
+                if issue["type"] == "SCAN_TIMEOUT":
+                    lines.append(f"| ⏱ | — | **TIMEOUT** | — | — | {issue['risk']} |")
+                    continue
+                lines.append(
+                    f"| `{issue['table']}` | `{issue['column']}` | {issue['type']} "
+                    f"| {issue['actual'][:80]} | {issue['count']:,} | {issue['writers']} |"
+                )
+
+            conf = "MEDIUM" if timed_out else "HIGH"
+            conf_reason = f"Live DB scan completed in {elapsed:.0f}ms"
+            if timed_out:
+                conf_reason = f"Scan hit {timeout_seconds}s timeout — partial results"
+
+            return "\n".join(lines) + _with_confidence(conf, conf_reason) + _next_steps(
+                "Use data_quality_report(table_filter='table_name') to scan a specific table",
+                "Use laravelgraph_resolve_column(table, column) for deep-dive on any flagged column",
+                "Use laravelgraph_db_query for ad-hoc verification of any finding",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_data_quality_report", {}, 0, elapsed)
+            return f"Error: {e}" + _with_confidence(
+                "LOW", "Live DB scan failed.",
+                [str(e)],
+            )
+
+    @mcp.tool()
+    def laravelgraph_race_conditions() -> str:
+        """Search for likely check-then-act race conditions that mutate shared counters without transaction or lock protection."""
+        db = _db()
+        start = time.perf_counter()
+        try:
+            import re
+            from laravelgraph.mcp.explain import read_source_snippet
+            rows = db.execute(
+                "MATCH (c:Class_)-[:DEFINES]->(m:Method) WHERE c.laravel_role IN ['model','controller','service','job'] "
+                "RETURN c.laravel_role AS role, m.fqn AS fqn, m.name AS mname, m.file_path AS fp, m.line_start AS ls, m.line_end AS le ORDER BY m.fqn LIMIT 800"
+            )
+            _ANALYTICS_NAMES = re.compile(
+                r"(avg|trend|insight|report|stats|analytics|export|download|index$|list$|show$|get[A-Z])",
+                re.IGNORECASE,
+            )
+
+            def _strip_comments(code: str) -> str:
+                code = re.sub(r"//[^\n]*", "", code)
+                code = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
+                return code
+
+            findings = []
+            for row in rows:
+                fp = row.get("fp") or ""
+                mname = row.get("mname") or ""
+                if not fp or "/tests/" in fp or fp.endswith(".blade.php"):
+                    continue
+                if _ANALYTICS_NAMES.search(mname):
+                    continue
+                raw_src = read_source_snippet(fp, row.get("ls", 0), row.get("le", 0), project_root)
+                if not raw_src:
+                    continue
+                src = _strip_comments(raw_src)
+                low = src.lower()
+                if any(tok in low for tok in ("db::transaction", "lockforupdate", "sharedlock", "cache::lock", "->lock(")):
+                    continue
+                if "$request->" in low and "->save()" not in low:
+                    continue
+                pattern_hits: list[dict[str, str]] = []
+
+                # Multi-line window: $var->prop = ... $var->prop ... followed by $var->save()
+                # Scans line-by-line to avoid Python regex backreference issues with dollar signs.
+                _SKIP_VARS = frozenset({"request", "response", "this", "data", "input", "params"})
+                _SKIP_COLS = frozenset({"id", "created_at", "updated_at", "deleted_at"})
+                src_lines = src.splitlines()
+                for _li, _line in enumerate(src_lines):
+                    _assign_m = re.search(r'\$(\w+)->(\w+)\s*=', _line)
+                    if not _assign_m:
+                        continue
+                    _var, _col = _assign_m.group(1), _assign_m.group(2)
+                    if _var in _SKIP_VARS or _col in _SKIP_COLS:
+                        continue
+                    # RHS must reference the same $var->col (read-modify-write)
+                    _rhs = _line[_assign_m.end():]
+                    if not re.search(r'\$' + re.escape(_var) + r'->' + re.escape(_col) + r'(?:\s|[-+*/;]|$)', _rhs):
+                        continue
+                    # Skip atomic ops
+                    if re.search(r'(?:decrement|increment)\(\s*[\'"]' + re.escape(_col) + r'[\'"]', src):
+                        continue
+                    # $var->save() must appear within 10 lines
+                    _window = '\n'.join(src_lines[_li:_li + 10])
+                    if not re.search(r'\$' + re.escape(_var) + r'->\s*save\s*\(', _window):
+                        continue
+                    pattern_hits.append({
+                        "pattern_type": "ELOQUENT_PROPERTY",
+                        "cols": _col,
+                        "evidence": _line.strip()[:120],
+                    })
+
+                count_m = re.search(
+                    r"(->count\(\)|->sum\([^)]*\))\s*;\s*\n[^;]*if\s*\(\s*\$\w+\s*(?:<|<=|>=|>)\s*\$?\w+",
+                    src, re.DOTALL,
+                )
+                if count_m and re.search(r"::create\(|->insert\(", src):
+                    evidence = count_m.group(0)[:100].strip()
+                    pattern_hits.append({
+                        "pattern_type": "CAPACITY_CHECK",
+                        "cols": "count/capacity",
+                        "evidence": evidence,
+                    })
+
+                for match in re.finditer(
+                    r"if\s*\(\s*\$(\w+)->\s*(\w+)\s*(?:==|===)\s*['\"](\w+)['\"]", src
+                ):
+                    var, col, _val = match.group(1), match.group(2), match.group(3)
+                    if var == "request":
+                        continue
+                    if not col.endswith(("status", "state", "stage")):
+                        continue
+                    write_pat = re.compile(rf"\${re.escape(var)}->\s*{re.escape(col)}\s*=\s*['\"]")
+                    if not write_pat.search(src):
+                        continue
+                    if not re.search(rf"\${re.escape(var)}->\s*save\s*\(", src):
+                        continue
+                    evidence = next(
+                        (line.strip() for line in src.splitlines()
+                         if col in line and ("if" in line.lower() or "=" in line)),
+                        match.group(0),
+                    )
+                    pattern_hits.append({
+                        "pattern_type": "STATUS_GATE",
+                        "cols": col,
+                        "evidence": evidence[:120],
+                    })
+
+                seen_patterns: set[tuple[str, ...]] = set()
+                for hit in pattern_hits:
+                    dedupe_key = (row.get("fqn") or "?", hit["pattern_type"], hit["cols"])
+                    if dedupe_key in seen_patterns:
+                        continue
+                    seen_patterns.add(dedupe_key)
+                    findings.append({
+                        "fqn": row.get("fqn") or "?",
+                        "role": row.get("role") or "?",
+                        "file": Path(fp).name,
+                        "evidence": hit["evidence"],
+                        "cols": hit["cols"],
+                        "pattern_type": hit["pattern_type"],
+                    })
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_race_conditions", {}, len(findings), elapsed)
+            if not findings:
+                return "No obvious check-then-act race condition candidates were detected." + _with_confidence(
+                    "LOW",
+                    "This tool uses source-pattern heuristics and may miss framework-specific locking strategies.",
+                ) + _next_steps(
+                    "Use laravelgraph_query(query='decrement stock seats') to inspect high-risk counters manually",
+                    "Use laravelgraph_context(symbol, include_source=True) on inventory-like methods to confirm locking",
+                )
+            lines = [f"## Possible Race Conditions ({len(findings)})\n"]
+            lines.append("| Method | Role | File | Pattern Type | Columns | Evidence |")
+            lines.append("|--------|------|------|--------------|---------|----------|")
+            for item in findings[:30]:
+                lines.append(
+                    f"| `{item['fqn']}` | {item['role']} | `{item['file']}` | {item['pattern_type']} | {item['cols']} | `{item['evidence']}` |"
+                )
+            return "\n".join(lines) + _with_confidence(
+                "LOW",
+                "Findings are produced by static regex matching over method source snippets.",
+                ["False positives are possible when locking happens in a caller or helper.", "False negatives are possible for indirect condition checks."],
+            ) + _next_steps(
+                "Use laravelgraph_context(symbol, include_source=True) to validate each candidate in full source",
+                "Search for DB::transaction or Cache::lock in callers with laravelgraph_impact(symbol)",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_race_conditions", {}, 0, elapsed)
+            return f"Error searching for race conditions: {e}" + _with_confidence(
+                "LOW",
+                "The heuristic source scan did not complete successfully.",
+                ["Method source snippets or class-role metadata may be incomplete."],
+            ) + _next_steps(
+                "Use laravelgraph_query(query='decrement') to search high-risk code paths manually",
+                "Re-run laravelgraph analyze if file paths or method ranges look stale",
+            )
+
+    @mcp.tool()
+    def laravelgraph_security_surface() -> str:
+        """Prioritize webhook verification gaps, sensitive payment data retention, and missing auth middleware across the indexed security surface."""
+        db = _db()
+        start = time.perf_counter()
+        try:
+            import re
+            from laravelgraph.mcp.explain import read_source_snippet
+            issues: list[dict[str, Any]] = []
+            route_rows = db.execute(
+                "MATCH (r:Route) RETURN r.http_method AS method, r.uri AS uri, r.controller_fqn AS ctrl, r.action_method AS action, r.middleware_stack AS mw"
+            )
+            src_cache: dict[str, str] = {}
+            for row in route_rows:
+                uri = (row.get("uri") or "").lower()
+                if (row.get("method") or "").upper() != "POST" or not any(k in uri for k in ("webhook", "callback", "notify", "ipn")):
+                    continue
+                mids = json.loads(row.get("mw") or "[]") if row.get("mw") else []
+                mid_text = " ".join(mids).lower()
+                if "auth" in mid_text or "csrf" in mid_text or "verifycsrftoken" in mid_text:
+                    continue
+                key = f"{row.get('ctrl') or ''}::{row.get('action') or ''}"
+                if key not in src_cache and row.get("ctrl") and row.get("action"):
+                    method_rows = db.execute(
+                        "MATCH (c:Class_)-[:DEFINES]->(m:Method) WHERE c.fqn = $cfqn AND m.name = $mname RETURN m.file_path AS fp, m.line_start AS ls, m.line_end AS le",
+                        {"cfqn": row.get("ctrl"), "mname": row.get("action")},
+                    )
+                    src_cache[key] = read_source_snippet(method_rows[0].get("fp", ""), method_rows[0].get("ls", 0), method_rows[0].get("le", 0), project_root).lower() if method_rows else ""
+                src = src_cache.get(key, "")
+                if not any(tok in src for tok in ("hash_hmac", "constructevent", "signature", "verifysignature", "validate")):
+                    issues.append({"severity": "CRITICAL", "kind": "UNVERIFIED_WEBHOOK", "location": f"{row.get('method')} {row.get('uri')}", "evidence": key or "route handler unresolved", "fix": "Verify provider signatures before processing webhook payloads."})
+            sens_rows = db.execute(
+                "MATCH (t:DatabaseTable)-[:HAS_COLUMN]->(c:DatabaseColumn) WHERE t.connection IS NOT NULL AND t.connection <> '' RETURN t.name AS tname, c.name AS cname"
+            )
+            sensitive_patterns = [
+                "card_number", "card_last_four", "card_last4", "card_brand", "name_on_card",
+                "payment_method_id", "client_secret", "stripe_token", "stripetoken",
+                "stripeToken", "access_token", "secret_key", "private_key", "api_key",
+                "card_name", "cvv", "pan_number",
+            ]
+            exclude_patterns = [
+                "card_title", "enable_card", "card_id", "company_name",
+                "company_logo", "company_address", "rate_", "expected_", "occupancy",
+                "enable_", "token_2fa",
+            ]
+            exclude_tables: list[str] = []
+            sensitive = []
+            for row in sens_rows:
+                tname = (row.get("tname") or "").lower()
+                cname = (row.get("cname") or "").lower()
+                if not tname or not cname:
+                    continue
+                if not any(p.lower() in cname for p in sensitive_patterns):
+                    continue
+                if any(p.lower() in cname for p in exclude_patterns):
+                    continue
+                if any(t.lower() in tname for t in exclude_tables):
+                    continue
+                sensitive.append(row)
+            for row in sensitive[:30]:
+                accessors = db.execute(
+                    "MATCH (src)-[q:QUERIES_TABLE]->(t:DatabaseTable) WHERE t.name = $t AND q.operation <> 'read' RETURN src.fqn AS fqn, src.file_path AS fp, src.line_start AS ls, src.line_end AS le LIMIT 20",
+                    {"t": row.get("tname")},
+                )
+                clear_found = False
+                for src in accessors:
+                    code = read_source_snippet(src.get("fp", ""), src.get("ls", 0), src.get("le", 0), project_root).lower()
+                    col = (row.get("cname") or "").lower()
+                    if re.search(rf"{re.escape(col)}\s*['\"]?\s*=>\s*null|{re.escape(col)}\s*=\s*null", code):
+                        clear_found = True
+                        break
+                if not clear_found:
+                    issues.append({"severity": "HIGH", "kind": "SENSITIVE_DATA_RETENTION", "location": f"{row.get('tname')}.{row.get('cname')}", "evidence": "No indexed nullify/clear path detected in write methods", "fix": "Store tokens in a vault or clear sensitive columns after use."})
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for row in route_rows:
+                uri = "/" + ((row.get("uri") or "").strip("/").split("/")[0] if row.get("uri") else "")
+                groups.setdefault(uri, []).append(row)
+            for prefix, routes in groups.items():
+                if len(routes) < 3:
+                    continue
+                auth_count = 0
+                for route in routes:
+                    mids = json.loads(route.get("mw") or "[]") if route.get("mw") else []
+                    auth_count += 1 if any("auth" in str(m).lower() for m in mids) else 0
+                if auth_count <= len(routes) / 2:
+                    continue
+                for route in routes:
+                    mids = json.loads(route.get("mw") or "[]") if route.get("mw") else []
+                    if not any("auth" in str(m).lower() for m in mids):
+                        issues.append({"severity": "MEDIUM", "kind": "MISSING_AUTH", "location": f"{route.get('method')} {route.get('uri')}", "evidence": f"Peer routes under `{prefix}` mostly use auth middleware", "fix": "Add the appropriate auth/guard middleware or document why this route is public."})
+            order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+            issues.sort(key=lambda x: (order.get(x["severity"], 9), x["kind"], x["location"]))
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_security_surface", {}, len(issues), elapsed)
+            if not issues:
+                return "No prioritized security surface issues were detected with the current heuristics." + _with_confidence(
+                    "MEDIUM",
+                    "This report is heuristic and focuses on high-signal patterns only.",
+                ) + _next_steps(
+                    "Use laravelgraph_routes(filter='webhook') to inspect public callback routes manually",
+                    "Use laravelgraph_db_context(table) on payment tables to review sensitive columns in context",
+                )
+            lines = [f"## Security Surface ({len(issues)})\n"]
+            lines.append("| Severity | Finding | Location | Evidence | Recommended Fix |")
+            lines.append("|----------|---------|----------|----------|------------------|")
+            for item in issues[:50]:
+                lines.append(
+                    f"| {item['severity']} | {item['kind']} | `{item['location']}` | {item['evidence'][:90]} | {item['fix']} |"
+                )
+            return "\n".join(lines) + _with_confidence(
+                "MEDIUM",
+                "Findings are inferred from route middleware, source-pattern checks, and sensitive column usage.",
+                ["Indirect verification helpers and background sanitization outside indexed write paths may be missed."],
+            ) + _next_steps(
+                "Use laravelgraph_request_flow(route='/...') to inspect a flagged route end to end",
+                "Use laravelgraph_context(symbol, include_source=True) on flagged handlers to validate the evidence",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_security_surface", {}, 0, elapsed)
+            return f"Error analyzing security surface: {e}" + _with_confidence(
+                "LOW",
+                "The heuristic security scan did not complete successfully.",
+                ["Some route, source, or database metadata could not be read."],
+            ) + _next_steps(
+                "Use laravelgraph_routes(filter='webhook') and laravelgraph_db_context(table) to inspect the highest-risk areas manually",
+                "Re-run laravelgraph analyze --full if route or DB metadata appears incomplete",
+            )
 
     # ── Tool: laravelgraph_config_usage ──────────────────────────────────────
 
@@ -2799,7 +4349,7 @@ IMPORTANT WORKFLOW:
                         lines.append(f"**Summary:** {cached}\n")
                     else:
                         trace_method_flow(db, ctrl, action, lines, project_root=project_root)
-                        if cfg.summary.enabled:
+                        if cfg.llm.enabled:
                             try:
                                 method_rows = db.execute(
                                     "MATCH (c:Class_)-[:DEFINES]->(m:Method) "
@@ -2820,7 +4370,7 @@ IMPORTANT WORKFLOW:
                                             node_type="controller action",
                                             source=src,
                                             docblock=row.get("doc", ""),
-                                            summary_cfg=cfg.summary,
+                                            summary_cfg=cfg.llm,
                                         )
                                         if summary and row.get("nid"):
                                             _summary_cache.set(
@@ -3104,7 +4654,7 @@ IMPORTANT WORKFLOW:
                                 _append_source_block(fp, ls, le, project_root, lines)
 
                             # Try to generate summary and cache
-                            if cfg.summary.enabled and fp and ls:
+                            if cfg.llm.enabled and fp and ls:
                                 src = read_source_snippet(fp, ls, le, project_root)
                                 if src:
                                     summary, provider_used = generate_summary(
@@ -3112,7 +4662,7 @@ IMPORTANT WORKFLOW:
                                         node_type="controller action",
                                         source=src,
                                         docblock=row.get("doc", ""),
-                                        summary_cfg=cfg.summary,
+                                        summary_cfg=cfg.llm,
                                     )
                                     if summary and row.get("nid"):
                                         _summary_cache.set(
@@ -3448,20 +4998,57 @@ IMPORTANT WORKFLOW:
     # ── Tool: laravelgraph_cypher ─────────────────────────────────────────────
 
     @mcp.tool()
-    def laravelgraph_cypher(query: str) -> str:
-        """Execute a read-only Cypher query against the knowledge graph.
+    def laravelgraph_cypher(query: str, graph: str = "core") -> str:
+        """Execute a Cypher query against the knowledge graph.
 
-        Only MATCH, RETURN, WITH, WHERE, ORDER BY, LIMIT are allowed. No mutations.
+        By default queries the core graph (read-only).
+        Use graph="plugin" to query the plugin knowledge graph (writable runtime data).
+
+        Only MATCH, RETURN, WITH, WHERE, ORDER BY, LIMIT are allowed for graph="core".
+        The plugin graph (graph="plugin") supports write operations.
 
         Args:
             query: Cypher query string
+            graph: Which graph to query — "core" (default) or "plugin"
         """
-        # Security: reject any mutation keywords
+        if graph == "plugin":
+            start = time.perf_counter()
+            try:
+                results = _plugin_db.execute(query)
+            except Exception as e:
+                return f"Plugin graph query error: {e}"
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_cypher", {"query": query[:100], "graph": "plugin"}, len(results), elapsed)
+            if not results:
+                return "Plugin graph query returned no results."
+            lines = [f"## Plugin Graph Query Results ({len(results)} rows)\n"]
+            if results:
+                headers = list(results[0].keys())
+                lines.append("| " + " | ".join(headers) + " |")
+                lines.append("|" + "|".join(["---"] * len(headers)) + "|")
+                for row in results[:50]:
+                    values = [str(row.get(h, ""))[:60] for h in headers]
+                    lines.append("| " + " | ".join(values) + " |")
+                if len(results) > 50:
+                    lines.append(f"\n_...{len(results) - 50} more rows_")
+            return "\n".join(lines)
+
         forbidden = ["CREATE", "MERGE", "DELETE", "SET", "REMOVE", "DROP", "DETACH"]
         q_upper = query.upper()
         for kw in forbidden:
             if kw in q_upper:
-                return f"❌ Mutation keyword '{kw}' is not allowed. Only read-only queries permitted."
+                return f"Mutation keyword '{kw}' is not allowed. Only read-only queries permitted."
+
+        _LABEL_FIXES = {
+            "Class": "Class_",
+            "Function": "Function_",
+            "Trait": "Trait_",
+            "Interface": "Interface_",
+            "Enum": "Enum_",
+        }
+        import re as _re
+        for wrong, right in _LABEL_FIXES.items():
+            query = _re.sub(rf"\b{wrong}\b(?!_)", right, query)
 
         db = _db()
         start = time.perf_counter()
@@ -3469,7 +5056,15 @@ IMPORTANT WORKFLOW:
         try:
             results = db.execute(query)
         except Exception as e:
-            return f"Query error: {e}\n\nUse laravelgraph://schema to see available node/relationship types."
+            hint = ""
+            err_str = str(e)
+            if "does not exist" in err_str:
+                hint = (
+                    "\n\nNode labels use trailing underscores for Python keywords: "
+                    "Class_, Function_, Trait_, Interface_, Enum_. "
+                    "Use laravelgraph://schema resource to see all available types."
+                )
+            return f"Query error: {e}{hint}"
 
         elapsed = (time.perf_counter() - start) * 1000
         _log_tool("laravelgraph_cypher", {"query": query[:100]}, len(results), elapsed)
@@ -3583,6 +5178,1153 @@ IMPORTANT WORKFLOW:
 
         return "\n".join(lines)
 
+    # ── Tool: laravelgraph_features ──────────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_features(feature: str = "") -> str:
+        """List all auto-detected product features and their constituent symbols. Pass feature name to drill into one.
+
+        Args:
+            feature: Feature name or slug to drill into (leave empty to list all)
+        """
+        db = _db()
+        start = time.perf_counter()
+        try:
+            if not feature:
+                rows = db.execute(
+                    "MATCH (f:Feature) RETURN f.node_id AS node_id, f.name AS name, f.slug AS slug, "
+                    "f.entry_routes AS entry_routes, f.symbol_count AS symbol_count, f.has_changes AS has_changes "
+                    "ORDER BY f.name"
+                )
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_features", {"feature": feature}, len(rows), elapsed)
+                if not rows:
+                    return (
+                        "No Feature nodes found. Run `laravelgraph analyze` to index the project."
+                        + _with_confidence("LOW", "Feature detection requires a fully analyzed project.")
+                        + _next_steps(
+                            "Run laravelgraph analyze <project> to index features",
+                            "Use laravelgraph_routes() to browse routes directly",
+                        )
+                    )
+                lines = ["## Product Features\n"]
+                lines.append("| Name | Slug | Routes | Symbols | Has Changes |")
+                lines.append("|------|------|--------|---------|-------------|")
+                for row in rows:
+                    name = row.get("name") or ""
+                    slug = row.get("slug") or ""
+                    symbol_count = row.get("symbol_count") or 0
+                    has_changes = "Yes" if row.get("has_changes") else "No"
+                    entry_routes_raw = row.get("entry_routes") or "[]"
+                    try:
+                        entry_routes = json.loads(entry_routes_raw) if isinstance(entry_routes_raw, str) else (entry_routes_raw or [])
+                        route_count = len(entry_routes)
+                    except Exception:
+                        route_count = 0
+                    lines.append(f"| {name} | `{slug}` | {route_count} | {symbol_count} | {has_changes} |")
+                return "\n".join(lines) + _with_confidence(
+                    "HIGH",
+                    "Feature nodes are derived from route grouping and static analysis during indexing.",
+                ) + _next_steps(
+                    "Pass feature='<name>' to drill into a specific feature",
+                    "Use laravelgraph_routes() for raw route listing",
+                )
+            else:
+                # Drill into a specific feature
+                slug_lower = feature.lower().replace(" ", "-")
+                # Find matching feature
+                feat_rows = db.execute(
+                    "MATCH (f:Feature) WHERE f.slug = $slug OR toLower(f.name) CONTAINS toLower($feature) "
+                    "RETURN f.node_id AS node_id, f.name AS name, f.slug AS slug, "
+                    "f.entry_routes AS entry_routes, f.symbol_count AS symbol_count, f.has_changes AS has_changes "
+                    "LIMIT 5",
+                    {"slug": slug_lower, "feature": feature},
+                )
+                if not feat_rows:
+                    elapsed = (time.perf_counter() - start) * 1000
+                    _log_tool("laravelgraph_features", {"feature": feature}, 0, elapsed)
+                    return (
+                        f"No feature matching '{feature}' found."
+                        + _next_steps(
+                            "Call laravelgraph_features() with no arguments to list all features",
+                        )
+                    )
+                feat = feat_rows[0]
+                feat_name = feat.get("name") or feature
+                feat_slug = feat.get("slug") or slug_lower
+                entry_routes_raw = feat.get("entry_routes") or "[]"
+                try:
+                    entry_routes = json.loads(entry_routes_raw) if isinstance(entry_routes_raw, str) else (entry_routes_raw or [])
+                except Exception:
+                    entry_routes = []
+                has_changes = "Yes" if feat.get("has_changes") else "No"
+                symbol_count = feat.get("symbol_count") or 0
+
+                lines = [f"## Feature: {feat_name}\n"]
+                lines.append(f"- **Slug:** `{feat_slug}`")
+                lines.append(f"- **Symbol count:** {symbol_count}")
+                lines.append(f"- **Has changes:** {has_changes}")
+                if entry_routes:
+                    lines.append(f"- **Entry routes:** {', '.join(str(r) for r in entry_routes[:10])}")
+                lines.append("")
+
+                # Query all symbols BELONGS_TO_FEATURE this feature
+                symbol_rows: list[dict] = []
+                for label in ("Route", "EloquentModel", "Class_", "Event", "Job"):
+                    try:
+                        label_rows = db.execute(
+                            f"MATCH (x:{label})-[:BELONGS_TO_FEATURE]->(f:Feature) "
+                            "WHERE f.slug = $slug OR toLower(f.name) CONTAINS toLower($feature) "
+                            "RETURN $label AS type, x.name AS name, x.fqn AS fqn "
+                            "LIMIT 30",
+                            {"slug": feat_slug, "feature": feature, "label": label},
+                        )
+                        symbol_rows.extend(label_rows)
+                    except Exception:
+                        pass
+
+                if symbol_rows:
+                    lines.append("### Constituent Symbols\n")
+                    lines.append("| Type | Name | FQN |")
+                    lines.append("|------|------|-----|")
+                    for s in symbol_rows:
+                        stype = s.get("type") or ""
+                        sname = s.get("name") or ""
+                        sfqn = s.get("fqn") or ""
+                        lines.append(f"| {stype} | {sname} | `{sfqn}` |")
+                else:
+                    lines.append("_No BELONGS_TO_FEATURE edges found for this feature._")
+
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_features", {"feature": feature}, len(symbol_rows), elapsed)
+                return "\n".join(lines) + _with_confidence(
+                    "MEDIUM",
+                    "Feature membership is inferred by route grouping and call-graph traversal during indexing.",
+                ) + _next_steps(
+                    f"Use laravelgraph_request_flow(route='...') to trace a specific entry route end to end",
+                    f"Use laravelgraph_impact(symbol='...') to see which symbols in this feature would be affected by a change",
+                )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_features", {"feature": feature}, 0, elapsed)
+            return f"Error listing features: {e}" + _with_confidence(
+                "LOW",
+                "Feature query did not complete. Feature nodes may not be present in this index.",
+            ) + _next_steps(
+                "Run laravelgraph analyze <project> to ensure features are indexed",
+            )
+
+    # ── Tool: laravelgraph_contracts ─────────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_contracts(symbol: str = "", contract_type: str = "") -> str:
+        """Browse behavioral contracts (validation rules, authorization policies, lifecycle hooks, mass-assignment guards) for any model, controller, or route.
+
+        Args:
+            symbol: Class name or partial FQN to filter contracts by source class
+            contract_type: Contract type filter (e.g. 'validation', 'authorization', 'lifecycle', 'fillable')
+        """
+        db = _db()
+        start = time.perf_counter()
+        try:
+            rows = db.execute(
+                "MATCH (c:Contract) "
+                "WHERE ($symbol = '' OR toLower(c.source_class) CONTAINS toLower($symbol)) "
+                "  AND ($type = '' OR c.contract_type = $type) "
+                "RETURN c.name AS name, c.contract_type AS contract_type, c.source_class AS source_class, "
+                "       c.rules AS rules, c.file_path AS file_path, c.line_start AS line_start "
+                "ORDER BY c.contract_type, c.source_class LIMIT 50",
+                {"symbol": symbol, "type": contract_type},
+            )
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_contracts", {"symbol": symbol, "contract_type": contract_type}, len(rows), elapsed)
+            if not rows:
+                hint = f" matching '{symbol}'" if symbol else ""
+                hint += f" of type '{contract_type}'" if contract_type else ""
+                return (
+                    f"No Contract nodes found{hint}."
+                    + _with_confidence(
+                        "LOW",
+                        "Contract nodes are extracted from FormRequests, policies, and model definitions during indexing.",
+                    )
+                    + _next_steps(
+                        "Use laravelgraph_models() to see model fillable/guard definitions",
+                        "Use laravelgraph_routes(filter='...') to find FormRequest-backed routes",
+                    )
+                )
+            lines = ["## Behavioral Contracts\n"]
+            lines.append("| Contract Name | Type | Source Class | Rules (summary) |")
+            lines.append("|---------------|------|--------------|-----------------|")
+            for row in rows:
+                name = row.get("name") or ""
+                ctype = row.get("contract_type") or ""
+                src = row.get("source_class") or ""
+                rules_raw = row.get("rules") or ""
+                try:
+                    rules_obj = json.loads(rules_raw) if isinstance(rules_raw, str) and rules_raw.startswith(("{", "[")) else rules_raw
+                    rules_str = str(rules_obj)[:80]
+                except Exception:
+                    rules_str = str(rules_raw)[:80]
+                lines.append(f"| {name} | `{ctype}` | `{src}` | {rules_str} |")
+
+            # If a specific symbol was given, also show GOVERNS targets for first match
+            if symbol and rows:
+                first_name = rows[0].get("name") or ""
+                governs: list[dict] = []
+                for label in ("Class_", "Method", "Route", "EloquentModel"):
+                    try:
+                        g_rows = db.execute(
+                            f"MATCH (c:Contract)-[:GOVERNS]->(x:{label}) WHERE c.name = $name "
+                            "RETURN $label AS type, x.name AS target_name, x.fqn AS fqn LIMIT 10",
+                            {"name": first_name, "label": label},
+                        )
+                        governs.extend(g_rows)
+                    except Exception:
+                        pass
+                if governs:
+                    lines.append(f"\n### Governed Targets for `{first_name}`\n")
+                    lines.append("| Type | Target | FQN |")
+                    lines.append("|------|--------|-----|")
+                    for g in governs:
+                        lines.append(f"| {g.get('type', '')} | {g.get('target_name', '')} | `{g.get('fqn', '')}` |")
+
+            return "\n".join(lines) + _with_confidence(
+                "HIGH",
+                "Contract nodes are extracted from FormRequests, Policy classes, and Eloquent $fillable/$guarded during indexing.",
+            ) + _next_steps(
+                "Use laravelgraph_context(symbol='<FormRequest class>', include_source=True) to see full validation rules",
+                "Use laravelgraph_request_flow(route='...') to trace the full HTTP request including validation",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_contracts", {"symbol": symbol, "contract_type": contract_type}, 0, elapsed)
+            return f"Error querying contracts: {e}" + _with_confidence(
+                "LOW",
+                "Contract query failed. Contract nodes may not be present in this index version.",
+            ) + _next_steps(
+                "Use laravelgraph_models() to explore model definitions manually",
+            )
+
+    # ── Tool: laravelgraph_intent ─────────────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_intent(symbol: str) -> str:
+        """Get structured intent analysis for any PHP method or class: what it does, what it reads/writes, side effects, and business rules enforced. Generated lazily by LLM and cached.
+
+        Args:
+            symbol: Class name, FQN, or method FQN (e.g. 'UserController', 'App\\Http\\Controllers\\UserController::store')
+        """
+        from laravelgraph.mcp.explain import read_source_snippet
+        from laravelgraph.mcp.intent import generate_intent
+        from laravelgraph.mcp.intent_cache import IntentCache
+
+        db = _db()
+        start = time.perf_counter()
+        try:
+            node = _resolve_symbol(db, symbol)
+            if node is None:
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_intent", {"symbol": symbol}, 0, elapsed)
+                return (
+                    f"Symbol '{symbol}' not found in the graph."
+                    + _with_confidence("LOW", "Symbol resolution failed — the FQN may be incomplete or the project not yet indexed.")
+                    + _next_steps(
+                        "Use laravelgraph_explain(feature='...') to find the correct symbol name",
+                        "Use laravelgraph_query(query='...') to search by partial name",
+                    )
+                )
+
+            node_id = node.get("node_id") or symbol
+            file_path = node.get("file_path") or ""
+            line_start = node.get("line_start") or 0
+            line_end = node.get("line_end") or 0
+            fqn = node.get("fqn") or node.get("name") or symbol
+
+            # Read source snippet
+            source = ""
+            if file_path:
+                source = read_source_snippet(file_path, line_start, line_end, project_root) or ""
+
+            # Check intent cache
+            intent_cache = IntentCache(index_dir(project_root))
+            cached = intent_cache.get(node_id, file_path)
+            if cached:
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_intent", {"symbol": symbol}, 1, elapsed)
+                lines = [f"## Intent Analysis: `{fqn}`\n", "_(from cache)_\n"]
+                lines.append(f"**Purpose:** {cached.get('purpose', '_unknown_')}\n")
+                if cached.get("reads"):
+                    lines.append("**Reads:**\n" + "\n".join(f"- {r}" for r in cached["reads"]))
+                if cached.get("writes"):
+                    lines.append("\n**Writes:**\n" + "\n".join(f"- {w}" for w in cached["writes"]))
+                if cached.get("side_effects"):
+                    lines.append("\n**Side Effects:**\n" + "\n".join(f"- {s}" for s in cached["side_effects"]))
+                if cached.get("guards"):
+                    lines.append("\n**Business Rules:**\n" + "\n".join(f"- {g}" for g in cached["guards"]))
+                return "\n".join(lines) + _with_confidence(
+                    "MEDIUM",
+                    "Intent is LLM-generated from static source analysis. Runtime behavior may differ.",
+                ) + _next_steps(
+                    f"Use laravelgraph_context(symbol='{symbol}', include_source=True) to see the raw source",
+                    f"Use laravelgraph_impact(symbol='{symbol}') to see downstream effects of this method",
+                )
+
+            # Cache miss — generate via LLM
+            if not source:
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_intent", {"symbol": symbol}, 0, elapsed)
+                return (
+                    f"Cannot generate intent for `{symbol}`: source code not found at `{file_path}`."
+                    + _with_confidence("LOW", "Source file could not be read.")
+                    + _next_steps(
+                        "Verify the file path is correct and the project root is accessible",
+                    )
+                )
+
+            intent, model_used = generate_intent(fqn, source, cfg.llm)
+            elapsed = (time.perf_counter() - start) * 1000
+
+            if intent is None:
+                _log_tool("laravelgraph_intent", {"symbol": symbol}, 0, elapsed)
+                return (
+                    f"Could not generate intent for `{symbol}`: {model_used}"
+                    + _with_confidence(
+                        "LOW",
+                        "LLM intent generation failed. Check provider configuration.",
+                    )
+                    + _next_steps(
+                        "Run `laravelgraph provider-status` to check LLM provider configuration",
+                        f"Use laravelgraph_context(symbol='{symbol}', include_source=True) to read source manually",
+                    )
+                )
+
+            # Store in cache
+            intent_cache.set(node_id, intent, model_used, file_path)
+            _log_tool("laravelgraph_intent", {"symbol": symbol}, 1, elapsed)
+
+            lines = [f"## Intent Analysis: `{fqn}`\n", f"_(generated by {model_used})_\n"]
+            lines.append(f"**Purpose:** {intent.get('purpose', '_unknown_')}\n")
+            if intent.get("reads"):
+                lines.append("**Reads:**\n" + "\n".join(f"- {r}" for r in intent["reads"]))
+            if intent.get("writes"):
+                lines.append("\n**Writes:**\n" + "\n".join(f"- {w}" for w in intent["writes"]))
+            if intent.get("side_effects"):
+                lines.append("\n**Side Effects:**\n" + "\n".join(f"- {s}" for s in intent["side_effects"]))
+            if intent.get("guards"):
+                lines.append("\n**Business Rules:**\n" + "\n".join(f"- {g}" for g in intent["guards"]))
+            return "\n".join(lines) + _with_confidence(
+                "MEDIUM",
+                "Intent is LLM-generated from static source analysis. Runtime behavior may differ.",
+            ) + _next_steps(
+                f"Use laravelgraph_context(symbol='{symbol}', include_source=True) to see the raw source",
+                f"Use laravelgraph_impact(symbol='{symbol}') to see downstream effects of this method",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_intent", {"symbol": symbol}, 0, elapsed)
+            return f"Error generating intent for '{symbol}': {e}" + _with_confidence(
+                "LOW",
+                "Intent generation encountered an unexpected error.",
+            ) + _next_steps(
+                f"Use laravelgraph_context(symbol='{symbol}', include_source=True) to inspect the source manually",
+            )
+
+    # ── Tool: laravelgraph_test_coverage ─────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_test_coverage(symbol: str = "") -> str:
+        """Show test coverage for a route, class, or feature — which test cases exercise it and what's untested.
+
+        Args:
+            symbol: Route URI, class name, or feature name to check coverage for (leave empty for summary)
+        """
+        db = _db()
+        start = time.perf_counter()
+        try:
+            if not symbol:
+                # Summary view
+                total_tests = 0
+                try:
+                    t_rows = db.execute("MATCH (t:TestCase) RETURN count(t) AS total")
+                    total_tests = t_rows[0].get("total", 0) if t_rows else 0
+                except Exception:
+                    pass
+
+                uncovered_routes = 0
+                total_routes = 0
+                try:
+                    total_rows = db.execute("MATCH (r:Route) RETURN count(r) AS total")
+                    total_routes = total_rows[0].get("total", 0) if total_rows else 0
+                except Exception:
+                    pass
+                try:
+                    uncov_rows = db.execute(
+                        "MATCH (r:Route) WHERE NOT EXISTS { MATCH (tc:TestCase)-[:TESTS]->(r) } RETURN count(r) AS uncovered"
+                    )
+                    uncovered_routes = uncov_rows[0].get("uncovered", 0) if uncov_rows else 0
+                except Exception:
+                    pass
+
+                covered_routes = total_routes - uncovered_routes
+                pct = round((covered_routes / total_routes) * 100, 1) if total_routes > 0 else 0.0
+
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_test_coverage", {"symbol": symbol}, total_tests, elapsed)
+
+                lines = ["## Test Coverage Summary\n"]
+                lines.append(f"- **Total TestCases:** {total_tests}")
+                lines.append(f"- **Total Routes:** {total_routes}")
+                lines.append(f"- **Routes covered:** {covered_routes} ({pct}%)")
+                lines.append(f"- **Routes uncovered:** {uncovered_routes}")
+                return "\n".join(lines) + _with_confidence(
+                    "MEDIUM",
+                    "Coverage is inferred from TESTS edges extracted during static analysis. Dynamic coverage (Xdebug) is not included.",
+                    ["Tests that exercise routes indirectly (e.g. via integration harness) may not be detected."],
+                ) + _next_steps(
+                    "Pass symbol='<route URI or class name>' to see tests for a specific target",
+                    "Use laravelgraph_routes() to list all routes",
+                )
+            else:
+                # Specific symbol coverage
+                test_rows: list[dict] = []
+                for label in ("Route", "Class_", "Feature", "Method"):
+                    try:
+                        rows = db.execute(
+                            f"MATCH (tc:TestCase)-[:TESTS]->(x:{label}) "
+                            "WHERE toLower(x.name) CONTAINS toLower($symbol) "
+                            "   OR (x.uri IS NOT NULL AND toLower(x.uri) CONTAINS toLower($symbol)) "
+                            "RETURN tc.name AS test_name, tc.file_path AS file_path, tc.test_type AS test_type, "
+                            "       x.name AS target_name, $label AS target_type "
+                            "LIMIT 30",
+                            {"symbol": symbol, "label": label},
+                        )
+                        test_rows.extend(rows)
+                    except Exception:
+                        pass
+
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_test_coverage", {"symbol": symbol}, len(test_rows), elapsed)
+
+                if not test_rows:
+                    return (
+                        f"No test coverage found for '{symbol}'."
+                        + _with_confidence(
+                            "LOW",
+                            "Either no TESTS edges exist for this target, or the symbol was not matched.",
+                        )
+                        + _next_steps(
+                            "Use laravelgraph_suggest_tests(symbol='...') for test suggestions",
+                            "Verify the symbol name with laravelgraph_query(query='...')",
+                        )
+                    )
+
+                lines = [f"## Test Coverage: `{symbol}`\n"]
+                lines.append(f"Found **{len(test_rows)}** covering test case(s).\n")
+                lines.append("| Test Name | Type | File | Target |")
+                lines.append("|-----------|------|------|--------|")
+                for row in test_rows:
+                    tname = row.get("test_name") or ""
+                    ttype = row.get("test_type") or ""
+                    tfile = row.get("file_path") or ""
+                    ttarget = row.get("target_name") or ""
+                    lines.append(f"| {tname} | {ttype} | `{tfile}` | {ttarget} |")
+
+                # Also check for uncovered routes in a matching feature
+                try:
+                    uncov_rows = db.execute(
+                        "MATCH (r:Route)-[:BELONGS_TO_FEATURE]->(f:Feature) "
+                        "WHERE toLower(f.name) CONTAINS toLower($symbol) "
+                        "  AND NOT EXISTS { MATCH (tc:TestCase)-[:TESTS]->(r) } "
+                        "RETURN r.http_method AS method, r.uri AS uri LIMIT 20",
+                        {"symbol": symbol},
+                    )
+                    if uncov_rows:
+                        lines.append(f"\n### Uncovered Routes in Feature '{symbol}'\n")
+                        for r in uncov_rows:
+                            lines.append(f"- `{r.get('method', 'GET')} {r.get('uri', '')}`")
+                except Exception:
+                    pass
+
+                return "\n".join(lines) + _with_confidence(
+                    "MEDIUM",
+                    "Coverage is inferred from TESTS edges extracted during static analysis.",
+                    ["Integration or browser tests that exercise routes without explicit annotations may not appear."],
+                ) + _next_steps(
+                    "Use laravelgraph_suggest_tests(symbol='...') for gap analysis and suggestions",
+                    "Use laravelgraph_request_flow(route='...') to understand what a route does before writing tests",
+                )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_test_coverage", {"symbol": symbol}, 0, elapsed)
+            return f"Error querying test coverage: {e}" + _with_confidence(
+                "LOW",
+                "Test coverage query failed. TestCase nodes may not be present in this index.",
+            ) + _next_steps(
+                "Verify the project is indexed with laravelgraph analyze",
+            )
+
+    # ── Tool: laravelgraph_performance_risks ─────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_performance_risks(severity: str = "", symbol: str = "") -> str:
+        """List detected N+1 query risks, missing eager loads, and raw query bypasses across the codebase.
+
+        Args:
+            severity: Filter by severity level ('HIGH', 'MEDIUM', 'LOW')
+            symbol: Filter by method FQN containing this string
+        """
+        db = _db()
+        start = time.perf_counter()
+        try:
+            rows = db.execute(
+                "MATCH (m:Method)-[:HAS_PERFORMANCE_RISK]->(r:PerformanceRisk) "
+                "WHERE ($severity = '' OR r.severity = $severity) "
+                "  AND ($symbol = '' OR toLower(m.fqn) CONTAINS toLower($symbol)) "
+                "RETURN m.fqn AS method_fqn, r.risk_type AS risk_type, r.severity AS severity, "
+                "       r.description AS description, r.evidence AS evidence, "
+                "       r.file_path AS file_path, r.line_number AS line_number "
+                "ORDER BY r.severity DESC, r.risk_type LIMIT 50",
+                {"severity": severity.upper() if severity else "", "symbol": symbol},
+            )
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_performance_risks", {"severity": severity, "symbol": symbol}, len(rows), elapsed)
+
+            if not rows:
+                hint = ""
+                if severity:
+                    hint += f" with severity '{severity}'"
+                if symbol:
+                    hint += f" in '{symbol}'"
+                return (
+                    f"No performance risks detected{hint}."
+                    + _with_confidence(
+                        "MEDIUM",
+                        "PerformanceRisk nodes are populated only when the performance analysis phase runs.",
+                    )
+                    + _next_steps(
+                        "Use laravelgraph_race_conditions() to find concurrency risks",
+                        "Use laravelgraph_context(symbol='...', include_source=True) to manually review hot methods",
+                    )
+                )
+
+            # Group by risk_type
+            by_type: dict[str, list[dict]] = {}
+            for row in rows:
+                rt = row.get("risk_type") or "UNKNOWN"
+                by_type.setdefault(rt, []).append(row)
+
+            lines = [f"## Performance Risks ({len(rows)} total)\n"]
+            for risk_type, items in sorted(by_type.items()):
+                lines.append(f"### {risk_type} ({len(items)})\n")
+                lines.append("| Method | File | Severity | Evidence |")
+                lines.append("|--------|------|----------|----------|")
+                for item in items:
+                    method = item.get("method_fqn") or ""
+                    fp = item.get("file_path") or ""
+                    sev = item.get("severity") or ""
+                    evidence = (item.get("evidence") or item.get("description") or "")[:90]
+                    lineno = item.get("line_number") or ""
+                    loc = f"{fp}:{lineno}" if lineno else fp
+                    lines.append(f"| `{method}` | `{loc}` | {sev} | {evidence} |")
+                lines.append("")
+
+            return "\n".join(lines) + _with_confidence(
+                "MEDIUM",
+                "Risks are detected via static analysis patterns. Runtime profiling may reveal additional hotspots.",
+                ["Lazy-loading risks inside loops may not be detected if the loop is dynamically constructed."],
+            ) + _next_steps(
+                "Use laravelgraph_context(symbol='<method>', include_source=True) to review flagged methods",
+                "Use laravelgraph_models() to check eager-load configuration on affected Eloquent models",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_performance_risks", {"severity": severity, "symbol": symbol}, 0, elapsed)
+            return f"Error querying performance risks: {e}" + _with_confidence(
+                "LOW",
+                "PerformanceRisk query failed. This node type may not be present in the current index.",
+            ) + _next_steps(
+                "Use laravelgraph_race_conditions() as an alternative concurrency/risk check",
+            )
+
+    # ── Tool: laravelgraph_api_surface ────────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_api_surface(route: str = "", method: str = "") -> str:
+        """Full API contract for a route: HTTP method+URI, input validation (FormRequest rules), output shape (Resource fields), auth policy, and side effects (events/jobs dispatched).
+
+        Args:
+            route: Route URI or partial URI to look up (e.g. '/api/users', 'orders')
+            method: HTTP method filter (e.g. 'GET', 'POST', 'PUT', 'DELETE')
+        """
+        db = _db()
+        start = time.perf_counter()
+        try:
+            if not route and not method:
+                # List all routes that have at least one API contract annotation
+                try:
+                    annotated_rows = db.execute(
+                        "MATCH (r:Route)-[:ROUTES_TO]->(m:Method) "
+                        "WHERE EXISTS { MATCH (m)-[:VALIDATES_WITH]->(:FormRequest) } "
+                        "   OR EXISTS { MATCH (m)-[:TRANSFORMS_WITH]->(:Resource) } "
+                        "   OR EXISTS { MATCH (m)-[:AUTHORIZES_WITH]->(:Policy) } "
+                        "RETURN r.http_method AS http_method, r.uri AS uri, r.name AS route_name "
+                        "ORDER BY r.uri LIMIT 50"
+                    )
+                except Exception:
+                    annotated_rows = []
+
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_api_surface", {"route": route, "method": method}, len(annotated_rows), elapsed)
+
+                if not annotated_rows:
+                    return (
+                        "No routes with FormRequest validation, Resource transformation, or Policy authorization found.\n"
+                        "Pass route='<uri>' to inspect any specific route's surface."
+                        + _with_confidence(
+                            "LOW",
+                            "API surface annotation requires VALIDATES_WITH, TRANSFORMS_WITH, or AUTHORIZES_WITH edges.",
+                        )
+                        + _next_steps(
+                            "Use laravelgraph_routes() to list all routes",
+                            "Pass route='<uri>' to laravelgraph_api_surface for a specific route contract",
+                        )
+                    )
+
+                lines = ["## Routes with API Contract Annotations\n"]
+                lines.append("| Method | URI | Route Name |")
+                lines.append("|--------|-----|------------|")
+                for row in annotated_rows:
+                    lines.append(
+                        f"| `{row.get('http_method', '')}` | `{row.get('uri', '')}` | {row.get('route_name', '')} |"
+                    )
+                return "\n".join(lines) + _with_confidence(
+                    "HIGH",
+                    "Only routes with explicit FormRequest/Resource/Policy bindings are shown here.",
+                ) + _next_steps(
+                    "Pass route='<uri>' to get the full API contract card for a specific route",
+                )
+            else:
+                # Full API contract card for a specific route
+                contract_rows = db.execute(
+                    "MATCH (r:Route)-[:ROUTES_TO]->(m:Method) "
+                    "WHERE ($route = '' OR toLower(r.uri) CONTAINS toLower($route)) "
+                    "  AND ($method = '' OR r.http_method = toUpper($method)) "
+                    "OPTIONAL MATCH (m)-[:VALIDATES_WITH]->(fr:FormRequest) "
+                    "OPTIONAL MATCH (m)-[:TRANSFORMS_WITH]->(res:Resource) "
+                    "OPTIONAL MATCH (m)-[:DISPATCHES]->(ev:Event) "
+                    "OPTIONAL MATCH (m)-[:DISPATCHES]->(j:Job) "
+                    "RETURN r.http_method AS http_method, r.uri AS uri, r.middleware_stack AS middleware_stack, "
+                    "       m.fqn AS handler_fqn, fr.name AS form_request, fr.rules_summary AS rules_summary, "
+                    "       res.name AS resource_name, ev.name AS event_name, j.name AS job_name "
+                    "LIMIT 20",
+                    {"route": route, "method": method},
+                )
+
+                if not contract_rows:
+                    elapsed = (time.perf_counter() - start) * 1000
+                    _log_tool("laravelgraph_api_surface", {"route": route, "method": method}, 0, elapsed)
+                    return (
+                        f"No route found matching uri='{route}'" + (f" method='{method}'" if method else "") + "."
+                        + _with_confidence("LOW", "Route not found or not yet indexed.")
+                        + _next_steps(
+                            "Use laravelgraph_routes() to list all available routes",
+                        )
+                    )
+
+                # Group results by route+handler (multiple OPTIONAL matches can produce duplicate rows)
+                seen_routes: dict[str, dict] = {}
+                for row in contract_rows:
+                    key = f"{row.get('http_method', '')} {row.get('uri', '')}"
+                    if key not in seen_routes:
+                        seen_routes[key] = {
+                            "http_method": row.get("http_method") or "",
+                            "uri": row.get("uri") or "",
+                            "middleware_stack": row.get("middleware_stack") or "",
+                            "handler_fqn": row.get("handler_fqn") or "",
+                            "form_request": row.get("form_request") or "",
+                            "rules_summary": row.get("rules_summary") or "",
+                            "resource_name": row.get("resource_name") or "",
+                            "events": [],
+                            "jobs": [],
+                        }
+                    entry = seen_routes[key]
+                    if row.get("event_name") and row["event_name"] not in entry["events"]:
+                        entry["events"].append(row["event_name"])
+                    if row.get("job_name") and row["job_name"] not in entry["jobs"]:
+                        entry["jobs"].append(row["job_name"])
+
+                # Also query middleware and policy separately for each route
+                lines = []
+                for key, entry in seen_routes.items():
+                    uri = entry["uri"]
+                    http_method = entry["http_method"]
+                    handler_fqn = entry["handler_fqn"]
+
+                    # Fetch middleware
+                    middleware: list[str] = []
+                    try:
+                        mw_raw = entry.get("middleware_stack") or ""
+                        if mw_raw:
+                            mw_list = json.loads(mw_raw) if isinstance(mw_raw, str) and mw_raw.startswith("[") else [mw_raw]
+                            middleware = [str(m) for m in mw_list if m]
+                    except Exception:
+                        pass
+
+                    # Fetch policy authorization
+                    policies: list[str] = []
+                    if handler_fqn:
+                        try:
+                            pol_rows = db.execute(
+                                "MATCH (m:Method)-[:AUTHORIZES_WITH]->(p:Policy) WHERE m.fqn = $fqn "
+                                "RETURN p.name AS policy_name, p.ability AS ability LIMIT 5",
+                                {"fqn": handler_fqn},
+                            )
+                            for p in pol_rows:
+                                ability = p.get("ability") or ""
+                                pname = p.get("policy_name") or ""
+                                policies.append(f"{pname}::{ability}" if ability else pname)
+                        except Exception:
+                            pass
+
+                    lines.append(f"## API Contract: `{http_method} {uri}`\n")
+                    lines.append(f"**Handler:** `{handler_fqn}`\n")
+
+                    if middleware:
+                        lines.append(f"**Middleware:** {', '.join(f'`{m}`' for m in middleware)}\n")
+
+                    if entry["form_request"]:
+                        rules = entry["rules_summary"] or "_see source_"
+                        lines.append(f"**Validation (FormRequest):** `{entry['form_request']}`")
+                        lines.append(f"  - Rules: {str(rules)[:200]}\n")
+
+                    if entry["resource_name"]:
+                        lines.append(f"**Output (Resource):** `{entry['resource_name']}`\n")
+
+                    if policies:
+                        lines.append(f"**Authorization (Policy):** {', '.join(f'`{p}`' for p in policies)}\n")
+
+                    if entry["events"]:
+                        lines.append(f"**Dispatched Events:** {', '.join(f'`{e}`' for e in entry['events'])}\n")
+
+                    if entry["jobs"]:
+                        lines.append(f"**Queued Jobs:** {', '.join(f'`{j}`' for j in entry['jobs'])}\n")
+
+                    if not entry["form_request"] and not entry["resource_name"] and not policies and not entry["events"] and not entry["jobs"]:
+                        lines.append("_No FormRequest, Resource, Policy, or dispatched side effects detected for this route._\n")
+
+                    lines.append("---")
+
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_api_surface", {"route": route, "method": method}, len(seen_routes), elapsed)
+                return "\n".join(lines) + _with_confidence(
+                    "HIGH",
+                    "API contract is derived from static graph edges: VALIDATES_WITH, TRANSFORMS_WITH, AUTHORIZES_WITH, DISPATCHES.",
+                    ["Dynamic route bindings and runtime-resolved middleware may not appear."],
+                ) + _next_steps(
+                    f"Use laravelgraph_request_flow(route='{uri}') for the full controller → service → DB chain",
+                    "Use laravelgraph_context(symbol='<FormRequest class>', include_source=True) to see full validation rules",
+                )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_api_surface", {"route": route, "method": method}, 0, elapsed)
+            return f"Error querying API surface for route='{route}': {e}" + _with_confidence(
+                "LOW",
+                "API surface query failed. Route or handler nodes may be missing or the graph may be incomplete.",
+            ) + _next_steps(
+                "Use laravelgraph_routes() to browse routes manually",
+                "Run laravelgraph analyze to re-index the project",
+            )
+
+    # ── Tool: laravelgraph_request_plugin ────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_request_plugin(description: str) -> str:
+        """Request auto-generation of a new MCP tool plugin.
+
+        Call this when you need specialized querying capability that the current
+        tool set cannot provide. Describe what you need in plain English.
+
+        The system will:
+        1. Query the graph for relevant context
+        2. Generate a plugin using the configured LLM
+        3. Validate through 4 layers (AST + schema + execution + LLM judge)
+        4. Retry up to 3 times with auto-critique if validation fails
+        5. Deploy the plugin to .laravelgraph/plugins/ if it passes
+
+        The plugin is available in your NEXT conversation (server restart required).
+        If generation fails, you receive a detailed failure report.
+
+        Example: laravelgraph_request_plugin("I need a tool that traces all refund
+        flows from the route through to the database update, showing which models
+        are involved and what events are dispatched")
+        """
+        import time as _time
+        _t0 = _time.time()
+        try:
+            from laravelgraph.plugins.generator import generate_plugin
+            from laravelgraph.plugins.meta import PluginMeta
+            from datetime import datetime, timezone
+            import re
+
+            db = _db()
+            code, status = generate_plugin(description, project_root, db, cfg)
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_request_plugin", {"description": description[:80]}, 1 if code else 0, elapsed)
+
+            if not code:
+                return (
+                    f"# Plugin Generation Failed\n\n{status}\n\n"
+                    f"**Next steps:**\n"
+                    f"- Run `laravelgraph configure` to set up an LLM provider\n"
+                    f"- Try a more specific description\n"
+                    f"- Check `laravelgraph doctor` for issues"
+                )
+
+            # Extract plugin name from PLUGIN_MANIFEST
+            import ast as _ast
+            plugin_name = "generated-plugin"
+            try:
+                tree = _ast.parse(code)
+                for node in _ast.walk(tree):
+                    if isinstance(node, _ast.Assign):
+                        for target in node.targets:
+                            if isinstance(target, _ast.Name) and target.id == "PLUGIN_MANIFEST":
+                                manifest = _ast.literal_eval(node.value)
+                                plugin_name = manifest.get("name", plugin_name)
+            except Exception:
+                pass
+
+            # Save plugin file
+            plugins_dir = project_root / ".laravelgraph" / "plugins"
+            plugins_dir.mkdir(exist_ok=True)
+            plugin_path = plugins_dir / f"{plugin_name}.py"
+            plugin_path.write_text(code, encoding="utf-8")
+
+            # Register in meta store
+            _meta_store.set(PluginMeta(
+                name=plugin_name,
+                status="active",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ))
+
+            # Collect tool names for the success message
+            _tool_names: list[str] = []
+            try:
+                import ast as _ast2
+                _tree2 = _ast2.parse(code)
+                for _n in _ast2.walk(_tree2):
+                    if isinstance(_n, _ast2.Assign):
+                        for _t in _n.targets:
+                            if isinstance(_t, _ast2.Name) and _t.id == "PLUGIN_MANIFEST":
+                                _m2 = _ast2.literal_eval(_n.value)
+                                _pfx = _m2.get("tool_prefix", "").rstrip("_")
+                                break
+                if _pfx:
+                    import re as _re2
+                    for _match in _re2.finditer(r"^\s{4}def\s+(" + _re2.escape(_pfx) + r"\w+)\s*\(", code, _re2.MULTILINE):
+                        _tool_names.append(_match.group(1))
+            except Exception:
+                pass
+
+            _tool_list = "\n".join(f"  - `laravelgraph_run_plugin_tool(\"{plugin_name}\", \"{t}\")`" for t in _tool_names) or f"  - `laravelgraph_run_plugin_tool(\"{plugin_name}\", \"<tool_name>\")`"
+
+            return (
+                f"# Plugin Generated Successfully\n\n"
+                f"**Name:** `{plugin_name}`\n"
+                f"**File:** `.laravelgraph/plugins/{plugin_name}.py`\n"
+                f"**Status:** {status}\n\n"
+                f"## Use it RIGHT NOW (no restart needed)\n\n"
+                f"Call any tool via hot dispatch:\n"
+                f"{_tool_list}\n\n"
+                f"## Next conversation\n\n"
+                f"After MCP server restarts, native tools are registered automatically\n"
+                f"and shown in the LOADED PLUGINS section of the server instructions.\n\n"
+                f"**Manage it:**\n"
+                f"- `laravelgraph plugin list` — see all plugins\n"
+                f"- `laravelgraph plugin validate .laravelgraph/plugins/{plugin_name}.py` — re-validate\n"
+                f"- `laravelgraph plugin disable {plugin_name}` — disable if not useful"
+            )
+        except Exception as exc:
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_request_plugin", {"description": description[:80]}, 0, elapsed)
+            return _error_response("HIGH", f"Plugin request failed: {exc}")
+
+    # ── Tool: laravelgraph_run_plugin_tool ───────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_run_plugin_tool(plugin_name: str, tool_name: str) -> str:
+        """Run any plugin tool on-demand — no server restart needed.
+
+        This is the hot-dispatch mechanism for plugin tools. Use it to:
+
+        1. Run a plugin tool IMMEDIATELY after generating it this conversation
+           (without waiting for a server restart).
+        2. Run any previously installed plugin tool at any time.
+
+        How to find valid plugin names and tool names:
+        - Check the "LOADED PLUGINS" section at the top of the server instructions.
+        - Call laravelgraph_suggest_plugins() to list all installed plugins.
+        - After laravelgraph_request_plugin(), the success message lists tool names.
+
+        Args:
+            plugin_name: The plugin slug, e.g. "user-explorer", "order-lifecycle".
+                         Must match the name in PLUGIN_MANIFEST (also the filename
+                         without .py in .laravelgraph/plugins/).
+            tool_name:   The exact function name, e.g. "usr_summary", "order_flow".
+                         Must start with the plugin's tool_prefix.
+
+        Returns:
+            The tool's output as a string, or a detailed error message.
+
+        Examples:
+            laravelgraph_run_plugin_tool("user-explorer", "usr_summary")
+            laravelgraph_run_plugin_tool("user-explorer", "usr_routes")
+            laravelgraph_run_plugin_tool("order-lifecycle", "order_flow")
+            laravelgraph_run_plugin_tool("order-lifecycle", "order_store_discoveries")
+        """
+        import time as _time
+        _t0 = _time.time()
+        try:
+            from laravelgraph.plugins.loader import (
+                _import_plugin_module,
+                _ToolCollector,
+                PluginSafeDB,
+            )
+            from laravelgraph.plugins.plugin_graph import DualDB
+
+            plugin_path = project_root / ".laravelgraph" / "plugins" / f"{plugin_name}.py"
+            if not plugin_path.exists():
+                return (
+                    f"# Plugin Not Found\n\n"
+                    f"No plugin file at `.laravelgraph/plugins/{plugin_name}.py`.\n\n"
+                    f"**To see available plugins:** call `laravelgraph_suggest_plugins()`\n"
+                    f"**To generate a new plugin:** call `laravelgraph_request_plugin(description)`"
+                )
+
+            # Load the module fresh from disk
+            module = _import_plugin_module(
+                plugin_path,
+                f"laravelgraph_hotrun_{plugin_name.replace('-', '_')}",
+            )
+
+            if not hasattr(module, "register_tools"):
+                return f"Plugin `{plugin_name}` has no register_tools() function — it may be a pipeline plugin, not an MCP plugin."
+
+            # Build db argument — same as what load_mcp_plugins provides
+            safe_db = PluginSafeDB(_db(), plugin_name)
+            if _plugin_db is not None:
+                db_arg: Any = DualDB(lambda: safe_db, _plugin_db)
+            else:
+                db_arg = lambda: safe_db  # noqa: E731
+
+            # Register tools into the collector
+            collector = _ToolCollector()
+            import inspect as _inspect
+            sig = _inspect.signature(module.register_tools)
+            reg_kwargs: dict = {}
+            if "db" in sig.parameters:
+                reg_kwargs["db"] = db_arg
+            if "sql_db" in sig.parameters:
+                reg_kwargs["sql_db"] = _sql_db
+
+            module.register_tools(collector, **reg_kwargs)
+
+            if tool_name not in collector.tools:
+                available = sorted(collector.tools.keys())
+                return (
+                    f"# Tool Not Found in Plugin\n\n"
+                    f"Plugin `{plugin_name}` has no tool named `{tool_name}`.\n\n"
+                    f"**Available tools in this plugin:**\n"
+                    + "\n".join(f"  - `laravelgraph_run_plugin_tool(\"{plugin_name}\", \"{t}\")`" for t in available)
+                )
+
+            # Call the tool
+            result = collector.tools[tool_name]()
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_run_plugin_tool", {"plugin": plugin_name, "tool": tool_name}, 1, elapsed)
+            return result if isinstance(result, str) else str(result)
+
+        except Exception as exc:
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_run_plugin_tool", {"plugin": plugin_name, "tool": tool_name}, 0, elapsed)
+            return _error_response("MEDIUM", f"Plugin tool execution failed: {exc}")
+
+    # ── Tool: laravelgraph_update_plugin ─────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_update_plugin(name: str, critique: str) -> str:
+        """Request regeneration of an existing plugin with a specific critique.
+
+        Call this when an existing plugin tool isn't meeting your needs.
+        Provide the exact plugin name and a specific description of what's wrong.
+
+        The system regenerates and validates the plugin. If it passes, the plugin
+        file is replaced immediately.
+
+        Args:
+            name: Plugin name (e.g. "payment-risk") — use laravelgraph_suggest_plugins() to list
+            critique: What's wrong and what should be different
+        """
+        import time as _time
+        _t0 = _time.time()
+        try:
+            plugins_dir = project_root / ".laravelgraph" / "plugins"
+            plugin_path = plugins_dir / f"{name}.py"
+
+            if not plugin_path.exists():
+                return (
+                    f"Plugin `{name}` not found. "
+                    f"Use `laravelgraph plugin list` to see installed plugins."
+                )
+
+            # Get original description from manifest
+            import ast as _ast
+            source = plugin_path.read_text(encoding="utf-8")
+            original_desc = name
+            try:
+                tree = _ast.parse(source)
+                for node in _ast.walk(tree):
+                    if isinstance(node, _ast.Assign):
+                        for target in node.targets:
+                            if isinstance(target, _ast.Name) and target.id == "PLUGIN_MANIFEST":
+                                manifest = _ast.literal_eval(node.value)
+                                original_desc = manifest.get("description", name)
+            except Exception:
+                pass
+
+            from laravelgraph.plugins.generator import generate_plugin
+            description = f"{original_desc}. CRITIQUE: {critique}"
+            db = _db()
+            code, status = generate_plugin(description, project_root, db, cfg)
+
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_update_plugin", {"name": name}, 1 if code else 0, elapsed)
+
+            if not code:
+                return f"# Plugin Update Failed\n\n{status}"
+
+            plugin_path.write_text(code, encoding="utf-8")
+
+            # Update meta
+            meta = _meta_store.get(name)
+            if meta:
+                meta.self_improvement_count += 1
+                from datetime import datetime, timezone
+                meta.last_improved_at = datetime.now(timezone.utc).isoformat()
+                _meta_store.set(meta)
+
+            return (
+                f"# Plugin Updated\n\n"
+                f"**Plugin:** `{name}`\n"
+                f"**Status:** {status}\n\n"
+                f"Changes take effect in your **next conversation**."
+            )
+        except Exception as exc:
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_update_plugin", {"name": name}, 0, elapsed)
+            return _error_response("HIGH", f"Plugin update failed: {exc}")
+
+    # ── Tool: laravelgraph_remove_plugin ─────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_remove_plugin(name: str, reason: str) -> str:
+        """Remove a plugin that provides no real benefit.
+
+        Call this when a plugin consistently fails to answer questions or returns
+        irrelevant results. The reason is logged to prevent regenerating the same
+        useless plugin in the future.
+
+        Args:
+            name: Plugin name to remove
+            reason: Why this plugin is being removed (used to prevent future regeneration)
+        """
+        import time as _time
+        _t0 = _time.time()
+        try:
+            plugins_dir = project_root / ".laravelgraph" / "plugins"
+            plugin_path = plugins_dir / f"{name}.py"
+
+            removed_file = False
+            if plugin_path.exists():
+                plugin_path.unlink()
+                removed_file = True
+
+            # Clean plugin graph data
+            try:
+                _plugin_db.delete_plugin_data(name)
+            except Exception:
+                pass
+
+            # Log removal reason in meta (keep meta for history)
+            meta = _meta_store.get(name)
+            if meta:
+                meta.removal_reasons.append(reason)
+                meta.status = "disabled"
+                _meta_store.set(meta)
+
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_remove_plugin", {"name": name}, 1, elapsed)
+
+            if not removed_file:
+                return f"Plugin `{name}` not found. May already be removed."
+
+            return (
+                f"# Plugin Removed\n\n"
+                f"**Plugin:** `{name}`\n"
+                f"**Reason logged:** {reason}\n\n"
+                f"Plugin file, graph data, and future auto-generation of this plugin are prevented.\n"
+                f"Changes take effect in your **next conversation**."
+            )
+        except Exception as exc:
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_remove_plugin", {"name": name}, 0, elapsed)
+            return _error_response("HIGH", f"Plugin removal failed: {exc}")
+
+    # ── Tool: laravelgraph_suggest_plugins ───────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_suggest_plugins() -> str:
+        """Analyse the knowledge graph and suggest which plugins would add value to this project.
+
+        Runs domain-signal detection across 7 built-in recipes (payment lifecycle,
+        tenant isolation, booking state machine, subscription lifecycle, RBAC coverage,
+        audit trail, feature-flags). Each recipe fires Cypher queries against the live
+        graph and is recommended only when enough domain signals are found.
+
+        Returns a ranked list of applicable plugins with evidence and scaffold commands.
+        Use `laravelgraph plugin suggest` (CLI) or `laravelgraph plugin scaffold <name>`
+        to generate the plugin skeleton.
+        """
+        import time as _time
+        _t0 = _time.time()
+        try:
+            from laravelgraph.plugins.suggest import detect_applicable_recipes, format_suggestions
+            db = _db()
+            results = detect_applicable_recipes(db)
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_suggest_plugins", {}, len(results), elapsed)
+            if not results:
+                return (
+                    "# Plugin Suggestions\n\n"
+                    "No domain-specific plugin recipes matched this project's graph.\n\n"
+                    "This is normal for generic CRUD applications. The 7 built-in recipes\n"
+                    "cover: payment lifecycle, tenant isolation, booking state machines,\n"
+                    "subscription lifecycle, RBAC coverage, audit trails, and feature-flags.\n\n"
+                    "You can still create a custom plugin from scratch:\n"
+                    "```\nlaravelgraph plugin scaffold my-plugin\n```"
+                )
+            return format_suggestions(results)
+        except Exception as exc:
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_suggest_plugins", {}, 0, elapsed)
+            return _error_response(
+                "HIGH",
+                f"Plugin suggestion failed: {exc}",
+            ) + _next_steps(
+                "Run `laravelgraph analyze` to ensure the graph is up to date",
+                "Check `laravelgraph doctor` for any index issues",
+            )
+
     # ── Tool: laravelgraph_provider_status ───────────────────────────────────
 
     @mcp.tool()
@@ -3595,7 +6337,7 @@ IMPORTANT WORKFLOW:
         """
         from laravelgraph.mcp.summarize import PROVIDER_REGISTRY, provider_status
 
-        status = provider_status(cfg.summary)
+        status = provider_status(cfg.llm)
         lines = ["# LLM Provider Status\n"]
 
         if not status["enabled"]:
@@ -3708,6 +6450,50 @@ IMPORTANT WORKFLOW:
         except Exception as e:
             return f"Error: {e}"
 
+    # ── Project-specific plugin tools ────────────────────────────────────────
+    from laravelgraph.plugins.loader import load_mcp_plugins
+
+    _plugins_dir = project_root / ".laravelgraph" / "plugins"
+
+    # Append active plugin system prompts to server instructions — log them for agent awareness
+    _active_prompts = _meta_store.get_all_system_prompts()
+    if _active_prompts:
+        logger.info("Plugin system prompts active", count=len(_active_prompts))
+
+    if _plugins_dir.exists():
+        _loaded = load_mcp_plugins(
+            _plugins_dir, mcp, logger,
+            db_factory=_db,
+            plugin_db=_plugin_db,
+            meta_store=_meta_store,
+            sql_db_factory=_sql_db,
+        )
+        if _loaded:
+            logger.info("MCP plugin tools loaded", plugins=_loaded)
+
+        # Run self-improvement check on startup (non-blocking for fast plugins)
+        try:
+            from laravelgraph.plugins.self_improve import run_improvement_check_all, auto_generate_suggested
+            _improved = run_improvement_check_all(_plugins_dir, _meta_store, project_root, cfg)
+            for _pname, _ok, _msg in _improved:
+                if _ok:
+                    logger.info("Plugin self-improved on startup", plugin=_pname, message=_msg)
+                else:
+                    logger.warning("Plugin self-improvement failed on startup", plugin=_pname, message=_msg)
+            # Auto-generate new plugins for unmet domain signals
+            try:
+                _db_for_gen = _db()
+                _generated = auto_generate_suggested(_plugins_dir, _meta_store, project_root, _db_for_gen, cfg)
+                for _pname, _ok, _msg in _generated:
+                    if _ok:
+                        logger.info("Plugin auto-generated on startup", plugin=_pname, message=_msg)
+                    else:
+                        logger.debug("Plugin auto-generation skipped/failed on startup", plugin=_pname, message=_msg)
+            except Exception as _eg:
+                logger.debug("Auto-generation on startup skipped", error=str(_eg))
+        except Exception as _e:
+            logger.debug("Self-improvement check skipped", error=str(_e))
+
     return mcp
 
 
@@ -3754,9 +6540,6 @@ def _resolve_symbol(db: GraphDB, symbol: str) -> dict | None:
         except Exception:
             continue
 
-    # 3. Class name match — with disambiguation when multiple classes share a name.
-    # Prefer canonical app paths over sub-namespaces (e.g. App\Http\Controllers\BookingController
-    # over App\Http\Controllers\Reseller\BookingController).
     try:
         results = db.execute(
             "MATCH (n:Class_) WHERE n.name = $s RETURN n.*, 'Class_' AS _label LIMIT 10",
@@ -3765,20 +6548,60 @@ def _resolve_symbol(db: GraphDB, symbol: str) -> dict | None:
         if results:
             if len(results) == 1:
                 return _normalize_node(results[0])
-            # Multiple matches — rank by FQN depth (fewer segments = more canonical)
-            # and by preferred path prefixes.
+
             def _class_rank(row: dict) -> tuple:
                 fqn = row.get("n.fqn", "") or ""
-                fp  = row.get("n.file_path", "") or ""
-                # Prefer paths in app/Http/Controllers/ directly (not sub-dirs)
-                canonical = (
-                    ("Http\\Controllers\\" in fqn and fqn.count("\\") <= fqn.index("Controllers\\") // 1 + 4)
-                    or "/Http/Controllers/" in fp
-                )
                 depth = fqn.count("\\")
-                return (0 if canonical else 1, depth)
+                in_controllers = 1 if "Http\\Controllers\\" in fqn else 0
+                in_models = 1 if "Models\\" in fqn else 0
+                in_services = 1 if "Services\\" in fqn else 0
+                return (-in_controllers, -in_models, -in_services, depth)
             results.sort(key=_class_rank)
-            return _normalize_node(results[0])
+
+            picked = results[0]
+            node = _normalize_node(picked)
+
+            match_details = []
+            for r in results:
+                r_fqn = r.get("n.fqn", "")
+                r_nid = r.get("n.node_id", "")
+                r_file = r.get("n.file_path", "")
+                methods_cnt = 0
+                routes_cnt = 0
+                try:
+                    mc = db.execute(
+                        "MATCH (c:Class_)-[:DEFINES]->(m:Method) WHERE c.node_id = $nid "
+                        "RETURN count(m) AS cnt",
+                        {"nid": r_nid},
+                    )
+                    methods_cnt = mc[0].get("cnt", 0) if mc else 0
+                except Exception:
+                    pass
+                try:
+                    rc = db.execute(
+                        "MATCH (r:Route)-[:ROUTES_TO]->(m:Method)<-[:DEFINES]-(c:Class_) "
+                        "WHERE c.node_id = $nid RETURN count(r) AS cnt",
+                        {"nid": r_nid},
+                    )
+                    routes_cnt = rc[0].get("cnt", 0) if rc else 0
+                except Exception:
+                    pass
+                match_details.append({
+                    "fqn": r_fqn,
+                    "file": r_file,
+                    "methods_count": methods_cnt,
+                    "routes_count": routes_cnt,
+                })
+
+            alternatives = [m["fqn"] for m in match_details[1:] if m["fqn"]]
+            alt_list = ", ".join(f"`{a}`" for a in alternatives)
+            node["_disambiguation_warning"] = (
+                f"Multiple classes named `{symbol}` exist: "
+                f"`{picked.get('n.fqn', '')}` (shown), {alt_list}. "
+                f"Use the full FQN to target a specific one."
+            )
+            node["_all_matches"] = match_details
+            return node
     except Exception:
         pass
 
