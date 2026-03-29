@@ -519,8 +519,25 @@ def _format_anchors_for_prompt(anchors: dict) -> str:
 
 # ── LLM plugin generation ──────────────────────────────────────────────────────
 
+# System prompt for spec generation — distinct from the prose-summary prompt in summarize.py.
+# Must explicitly forbid markdown because local models (Ollama) often wrap JSON in fences.
+_SPEC_SYSTEM_PROMPT = (
+    "You are a JSON generator. Your only job is to return a single valid JSON object. "
+    "Never wrap it in markdown code fences. Never add explanation before or after. "
+    "Return ONLY the raw JSON object, starting with { and ending with }."
+)
+
+# Token budget for plugin spec generation.
+# A spec with 2 tools needs ~500-700 tokens; 1024 gives enough headroom for any model.
+_SPEC_MAX_TOKENS = 1024
+
+
 def _call_llm(prompt: str, cfg: Any) -> str | None:
-    """Call the configured LLM and return the raw text response."""
+    """Call the configured LLM and return the raw text response.
+
+    Uses a higher token budget and JSON-specific system prompt compared to
+    the prose-summary calls in summarize.py.
+    """
     from laravelgraph.mcp.summarize import (
         PROVIDER_REGISTRY,
         _call_anthropic,
@@ -543,8 +560,16 @@ def _call_llm(prompt: str, cfg: Any) -> str | None:
     base_url = _get_base_url(provider, summary_cfg)
     info = PROVIDER_REGISTRY[provider]
     if info["sdk"] == "anthropic":
-        return _call_anthropic(prompt, api_key, model)
-    return _call_openai_compat(prompt, api_key or "no-key", model, base_url)
+        return _call_anthropic(
+            prompt, api_key, model,
+            max_tokens=_SPEC_MAX_TOKENS,
+            system_prompt=_SPEC_SYSTEM_PROMPT,
+        )
+    return _call_openai_compat(
+        prompt, api_key or "no-key", model, base_url,
+        max_tokens=_SPEC_MAX_TOKENS,
+        system_prompt=_SPEC_SYSTEM_PROMPT,
+    )
 
 
 def _generate_plugin_spec(

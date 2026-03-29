@@ -6597,26 +6597,18 @@ MANDATORY RULES
         if _loaded:
             logger.info("MCP plugin tools loaded", plugins=_loaded)
 
-        # Run self-improvement check on startup (non-blocking for fast plugins)
+        # Run self-improvement check on startup (stats-based only — no LLM calls here)
+        # Auto-generation via LLM is intentionally NOT run at startup: it is slow
+        # (30+ seconds with local Ollama), blocks server readiness, and runs on every
+        # restart without user intent. Use `laravelgraph plugin evolve` in CI/cron instead.
         try:
-            from laravelgraph.plugins.self_improve import run_improvement_check_all, auto_generate_suggested
+            from laravelgraph.plugins.self_improve import run_improvement_check_all
             _improved = run_improvement_check_all(_plugins_dir, _meta_store, project_root, cfg)
             for _pname, _ok, _msg in _improved:
                 if _ok:
                     logger.info("Plugin self-improved on startup", plugin=_pname, message=_msg)
                 else:
                     logger.warning("Plugin self-improvement failed on startup", plugin=_pname, message=_msg)
-            # Auto-generate new plugins for unmet domain signals
-            try:
-                _db_for_gen = _db()
-                _generated = auto_generate_suggested(_plugins_dir, _meta_store, project_root, _db_for_gen, cfg)
-                for _pname, _ok, _msg in _generated:
-                    if _ok:
-                        logger.info("Plugin auto-generated on startup", plugin=_pname, message=_msg)
-                    else:
-                        logger.debug("Plugin auto-generation skipped/failed on startup", plugin=_pname, message=_msg)
-            except Exception as _eg:
-                logger.debug("Auto-generation on startup skipped", error=str(_eg))
         except Exception as _e:
             logger.debug("Self-improvement check skipped", error=str(_e))
 

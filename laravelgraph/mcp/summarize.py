@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from laravelgraph.logging import get_logger
 
 if TYPE_CHECKING:
-    from laravelgraph.config import SummaryConfig
+    from laravelgraph.config import LLMConfig
 
 logger = get_logger(__name__)
 
@@ -302,18 +302,28 @@ PROVIDER_REGISTRY: dict[str, dict] = {
 }
 
 _SYSTEM_PROMPT = (
-    "You are a Laravel codebase intelligence engine. Write concise semantic summaries "
-    "of PHP symbols for developer AI agents. "
-    "Rules: 2-4 sentences maximum. Focus on WHAT it does and WHY it exists — "
-    "not HOW (the code shows how). Mention key business concepts (payment, booking, "
-    "authentication, notification, etc.). Mention side effects (emails sent, events "
-    "fired, jobs queued, database writes, external API calls). Be specific and concrete "
-    "— no generic filler like 'This is a method that handles...'. "
-    "Return plain prose only, no markdown, no bullet points."
+    "You are a Laravel codebase intelligence engine producing summaries for AI developer agents. "
+    "Rules: 2-5 sentences. Lead with the specific business operation (not 'This method handles...'). "
+    "MUST include: (1) What business operation it performs. (2) Side effects: emails, events, "
+    "jobs queued, DB writes, external API calls — name each one. (3) Anything unusual or non-obvious: "
+    "type mismatches (UUID vs int ID), missing error handling, race conditions (read-check-write without "
+    "locks), hardcoded magic numbers, TODO/FIXME comments, dead parameters. "
+    "If you cannot determine something from the source, say 'UNVERIFIABLE' rather than guessing. "
+    "NEVER produce generic descriptions that could apply to any similar system. Be specific to THIS code. "
+    "Return plain prose only, no markdown."
 )
 
 
-def _build_prompt(fqn: str, node_type: str, source: str, docblock: str, max_lines: int) -> str:
+def _build_prompt(
+    fqn: str,
+    node_type: str,
+    source: str,
+    docblock: str,
+    max_lines: int,
+    callers: str = "",
+    tables_accessed: str = "",
+    events_dispatched: str = "",
+) -> str:
     parts: list[str] = [f"PHP {node_type}: `{fqn}`"]
 
     if docblock:
@@ -321,7 +331,7 @@ def _build_prompt(fqn: str, node_type: str, source: str, docblock: str, max_line
             from laravelgraph.mcp.explain import clean_docblock
             prose = clean_docblock(docblock)
             if prose:
-                parts.append(f"PHPDoc description: {prose}")
+                parts.append(f"PHPDoc: {prose}")
         except Exception:
             pass
 
@@ -329,24 +339,37 @@ def _build_prompt(fqn: str, node_type: str, source: str, docblock: str, max_line
         capped = "\n".join(source.splitlines()[:max_lines])
         parts.append(f"Source code:\n```php\n{capped}\n```")
 
+    if callers:
+        parts.append(f"Called by: {callers}")
+    if tables_accessed:
+        parts.append(f"DB tables accessed: {tables_accessed}")
+    if events_dispatched:
+        parts.append(f"Events/jobs dispatched: {events_dispatched}")
+
     if len(parts) == 1:
         return ""
 
     return (
         "\n\n".join(parts)
-        + "\n\nWrite a 2-4 sentence semantic summary of what this symbol does "
-        "and why it exists in this Laravel application."
+        + "\n\nWrite a 2-5 sentence semantic summary. Focus on what makes this code "
+        "specific, unusual, or risky. Name every side effect. Flag anything non-obvious."
     )
 
 
-def _call_anthropic(prompt: str, api_key: str, model: str) -> str | None:
+def _call_anthropic(
+    prompt: str,
+    api_key: str,
+    model: str,
+    max_tokens: int = 256,
+    system_prompt: str = _SYSTEM_PROMPT,
+) -> str | None:
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model=model,
-            max_tokens=256,
-            system=_SYSTEM_PROMPT,
+            max_tokens=max_tokens,
+            system=system_prompt,
             messages=[{"role": "user", "content": prompt}],
         )
         return message.content[0].text.strip()
@@ -358,15 +381,22 @@ def _call_anthropic(prompt: str, api_key: str, model: str) -> str | None:
         return None
 
 
-def _call_openai_compat(prompt: str, api_key: str, model: str, base_url: str) -> str | None:
+def _call_openai_compat(
+    prompt: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    max_tokens: int = 256,
+    system_prompt: str = _SYSTEM_PROMPT,
+) -> str | None:
     try:
         import openai
         client = openai.OpenAI(api_key=api_key, base_url=base_url)
         response = client.chat.completions.create(
             model=model,
-            max_tokens=256,
+            max_tokens=max_tokens,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -379,7 +409,7 @@ def _call_openai_compat(prompt: str, api_key: str, model: str, base_url: str) ->
         return None
 
 
-def _get_api_key(provider: str, cfg: "SummaryConfig") -> str:
+def _get_api_key(provider: str, cfg: "LLMConfig") -> str:
     """Return API key: config override first, then env var."""
     key = cfg.api_keys.get(provider, "")
     if key:
@@ -390,11 +420,11 @@ def _get_api_key(provider: str, cfg: "SummaryConfig") -> str:
     return ""
 
 
-def _get_model(provider: str, cfg: "SummaryConfig") -> str:
+def _get_model(provider: str, cfg: "LLMConfig") -> str:
     return cfg.models.get(provider, "") or PROVIDER_REGISTRY[provider]["default_model"]
 
 
-def _get_base_url(provider: str, cfg: "SummaryConfig") -> str:
+def _get_base_url(provider: str, cfg: "LLMConfig") -> str:
     url = cfg.base_urls.get(provider, "") or PROVIDER_REGISTRY[provider].get("base_url", "")
     # Normalise: ensure /v1 suffix for local providers that omit it
     if url and provider in ("ollama", "lmstudio", "vllm"):
@@ -404,7 +434,7 @@ def _get_base_url(provider: str, cfg: "SummaryConfig") -> str:
     return url
 
 
-def _resolve_provider(cfg: "SummaryConfig") -> str | None:
+def _resolve_provider(cfg: "LLMConfig") -> str | None:
     """Return active provider name, or None.
 
     Explicit provider="<name>": returned as-is (local or cloud).
@@ -422,7 +452,7 @@ def _resolve_provider(cfg: "SummaryConfig") -> str | None:
     return None
 
 
-def provider_status(cfg: "SummaryConfig") -> dict:
+def provider_status(cfg: "LLMConfig") -> dict:
     """Visibility: which providers are configured, which are available."""
     active = _resolve_provider(cfg) if cfg.enabled else None
     providers = {}
@@ -451,7 +481,10 @@ def generate_summary(
     node_type: str,
     source: str = "",
     docblock: str = "",
-    summary_cfg: "SummaryConfig | None" = None,
+    summary_cfg: "LLMConfig | None" = None,
+    callers: str = "",
+    tables_accessed: str = "",
+    events_dispatched: str = "",
 ) -> tuple[str | None, str]:
     """Generate a semantic summary via the configured LLM provider.
 
@@ -459,7 +492,7 @@ def generate_summary(
     Never raises — returns (None, "") on any failure.
     """
     if summary_cfg is None:
-        from laravelgraph.config import SummaryConfig as _SC
+        from laravelgraph.config import LLMConfig as _SC
         summary_cfg = _SC()
 
     if not summary_cfg.enabled:
@@ -480,7 +513,10 @@ def generate_summary(
                        hint="run `laravelgraph configure`")
         return None, ""
 
-    prompt = _build_prompt(fqn, node_type, source, docblock, summary_cfg.max_source_lines)
+    prompt = _build_prompt(
+        fqn, node_type, source, docblock, summary_cfg.max_source_lines,
+        callers=callers, tables_accessed=tables_accessed, events_dispatched=events_dispatched,
+    )
     if not prompt:
         return None, ""
 
