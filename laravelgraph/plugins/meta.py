@@ -31,6 +31,7 @@ class PluginMeta:
     removal_reasons: list = field(default_factory=list)  # past reasons for removal
     contribution_score: float = 0.0         # 0.0 - 100.0, computed
     plugin_node_count: int = 0              # nodes written to plugin graph
+    domain_coverage_snapshot: dict = field(default_factory=dict)  # snapshot at generation time
 
 
 class PluginMetaStore:
@@ -153,6 +154,48 @@ class PluginMetaStore:
         until = datetime.now(timezone.utc) + timedelta(hours=hours)
         meta.improvement_cooldown_until = until.isoformat()
         self._save()
+
+    def set_cooldown(self, name: str, hours: int = 48) -> None:
+        """Alias for set_improvement_cooldown — used by self_improve.py."""
+        self.set_improvement_cooldown(name, hours=hours)
+
+    def increment_self_improvement_count(self, name: str) -> None:
+        """Increment the self_improvement_count counter."""
+        meta = self._data.get(name)
+        if meta is None:
+            return
+        meta.self_improvement_count += 1
+        self._save()
+
+    def set_last_improved_at(self, name: str, ts: float | None = None) -> None:
+        """Record last improvement timestamp. Accepts a Unix float or defaults to now."""
+        meta = self._data.get(name)
+        if meta is None:
+            return
+        if ts is not None:
+            meta.last_improved_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        else:
+            meta.last_improved_at = datetime.now(timezone.utc).isoformat()
+        self._save()
+
+    def set_domain_coverage_snapshot(self, name: str, snapshot: dict) -> None:
+        """Store a domain coverage snapshot for drift detection."""
+        meta = self._data.get(name)
+        if meta is None:
+            return
+        meta.domain_coverage_snapshot = snapshot
+        self._save()
+
+    def is_in_cooldown(self, name: str) -> bool:
+        """Return True if the improvement cooldown is still active."""
+        meta = self._data.get(name)
+        if meta is None or not meta.improvement_cooldown_until:
+            return False
+        try:
+            until = datetime.fromisoformat(meta.improvement_cooldown_until)
+            return datetime.now(timezone.utc) < until
+        except ValueError:
+            return False
 
     # ── Contribution scoring ──────────────────────────────────────────────────
 

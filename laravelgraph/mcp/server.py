@@ -46,9 +46,20 @@ def create_server(project_root: Path, config: Config | None = None) -> Any:
     _plugins_dir_early = project_root / ".laravelgraph" / "plugins"
     _plugin_manifests = _scan_manifests(_plugins_dir_early)
 
-    def _build_loaded_plugins_section(manifests: list) -> str:
+    # Pre-load discovery counts from plugin graph (best-effort, non-blocking)
+    _plugin_discovery_counts: dict[str, int] = {}
+    try:
+        from laravelgraph.plugins.plugin_graph import init_plugin_graph as _init_pg
+        _pg = _init_pg(index_dir(project_root))
+        for _m in _plugin_manifests:
+            _plugin_discovery_counts[_m["name"]] = _pg.get_plugin_node_count(_m["name"])
+    except Exception:
+        pass
+
+    def _build_loaded_plugins_section(manifests: list, discovery_counts: dict | None = None) -> str:
         if not manifests:
             return ""
+        _counts = discovery_counts or {}
         lines = [
             "\n═══════════════════════════════════════════════════════════",
             "LOADED PLUGINS (active this conversation)",
@@ -65,18 +76,22 @@ def create_server(project_root: Path, config: Config | None = None) -> Any:
             "",
         ]
         for m in manifests:
-            lines.append(f"▸ {m['name']}  (prefix: {m['tool_prefix']})")
+            disc_count = _counts.get(m["name"], 0)
+            disc_tag = f"  [{disc_count} discoveries]" if disc_count > 0 else ""
+            lines.append(f"▸ {m['name']}  (prefix: {m['tool_prefix']}){disc_tag}")
             if m["description"]:
                 lines.append(f"  \"{m['description']}\"")
             if m["tool_names"]:
                 lines.append(f"  Tools: {', '.join(m['tool_names'])}")
                 lines.append(f"  Hot:   laravelgraph_run_plugin_tool(\"{m['name']}\", \"<tool_name>\")")
+            if disc_count > 0:
+                lines.append(f"  Recall: laravelgraph_plugin_knowledge(plugin_name=\"{m['name']}\")")
             lines.append("")
         lines.append("If a plugin was just generated this session, use hot dispatch above.")
         lines.append("Native tools are only visible after the next MCP server restart.")
         return "\n".join(lines)
 
-    _loaded_plugins_section = _build_loaded_plugins_section(_plugin_manifests)
+    _loaded_plugins_section = _build_loaded_plugins_section(_plugin_manifests, _plugin_discovery_counts)
 
     mcp = FastMCP(
         name="LaravelGraph",
@@ -281,6 +296,14 @@ laravelgraph_update_plugin(name, critique)
 laravelgraph_remove_plugin(name, reason)
   Remove a plugin that provides no benefit. Logs the reason to prevent
   auto-regeneration of the same unhelpful plugin in the future.
+
+laravelgraph_plugin_knowledge([plugin_name])
+  Return domain discoveries stored by plugins across ALL past sessions.
+  Plugins accumulate institutional knowledge via store_discoveries() calls —
+  findings, patterns, identified issues — that persist between conversations.
+  Pass plugin_name to filter to a specific plugin, or omit to see everything.
+  Example: laravelgraph_plugin_knowledge(plugin_name="user-explorer")
+  Plugins with discoveries show [N discoveries] in the LOADED PLUGINS section.
 
 PLUGIN WORKFLOW:
   1. laravelgraph_suggest_plugins()             → see what plugins exist + what's recommended
@@ -6324,6 +6347,109 @@ MANDATORY RULES
                 "Run `laravelgraph analyze` to ensure the graph is up to date",
                 "Check `laravelgraph doctor` for any index issues",
             )
+
+    # ── Tool: laravelgraph_plugin_knowledge ──────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_plugin_knowledge(plugin_name: str = "") -> str:
+        """Return domain discoveries accumulated by plugins across sessions.
+
+        Each plugin can store findings via its ``store_discoveries`` tool. This
+        tool surfaces everything that has been stored — domain patterns, team
+        insights, identified issues — making institutional knowledge available
+        to every future agent without needing to re-discover it.
+
+        Args:
+            plugin_name: Optional. Filter to a specific plugin's discoveries.
+                         Leave empty to see all plugins' discoveries.
+
+        Examples:
+            laravelgraph_plugin_knowledge()
+            laravelgraph_plugin_knowledge(plugin_name="user-explorer")
+        """
+        import time as _time
+        _t0 = _time.time()
+        try:
+            from laravelgraph.plugins.plugin_graph import init_plugin_graph
+            _pg = init_plugin_graph(index_dir(project_root))
+
+            if plugin_name:
+                rows = _pg.execute(
+                    "MATCH (n:PluginNode {plugin_source: $src}) "
+                    "RETURN n.node_id AS id, n.label AS label, n.data AS data, "
+                    "n.created_at AS created_at, n.updated_at AS updated_at "
+                    "ORDER BY n.updated_at DESC",
+                    params={"src": plugin_name},
+                )
+            else:
+                rows = _pg.execute(
+                    "MATCH (n:PluginNode) "
+                    "RETURN n.node_id AS id, n.plugin_source AS plugin_source, "
+                    "n.label AS label, n.data AS data, "
+                    "n.created_at AS created_at, n.updated_at AS updated_at "
+                    "ORDER BY n.updated_at DESC LIMIT 200"
+                )
+
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_plugin_knowledge", {"plugin_name": plugin_name or "all"}, len(rows), elapsed)
+
+            if not rows:
+                scope = f" for `{plugin_name}`" if plugin_name else ""
+                return (
+                    f"# Plugin Knowledge Base\n\n"
+                    f"No discoveries stored{scope} yet.\n\n"
+                    "Discoveries are accumulated when agents call the plugin's "
+                    "`store_discoveries` tool during investigations. Run an investigation "
+                    "using the plugin tools and call `store_discoveries` to begin building "
+                    "the knowledge base."
+                )
+
+            import json as _json
+            lines = [f"# Plugin Knowledge Base\n"]
+            if plugin_name:
+                lines.append(f"**Plugin:** `{plugin_name}`  |  **Discoveries:** {len(rows)}\n")
+            else:
+                # Group by plugin_source
+                by_plugin: dict[str, list[dict]] = {}
+                for row in rows:
+                    src = row.get("plugin_source") or "unknown"
+                    by_plugin.setdefault(src, []).append(row)
+                lines.append(f"**Total discoveries:** {len(rows)} across {len(by_plugin)} plugin(s)\n")
+                lines.append("")
+                for src, src_rows in by_plugin.items():
+                    lines.append(f"## {src}  ({len(src_rows)} discoveries)")
+                    for row in src_rows[:20]:  # cap per plugin
+                        label = row.get("label") or "Discovery"
+                        updated = str(row.get("updated_at", ""))[:19]
+                        try:
+                            data_obj = _json.loads(row.get("data") or "{}")
+                            data_str = _json.dumps(data_obj, indent=2)[:500]
+                        except Exception:
+                            data_str = str(row.get("data", ""))[:500]
+                        lines.append(f"\n**[{label}]** _{updated}_")
+                        lines.append(f"```json\n{data_str}\n```")
+                    if len(src_rows) > 20:
+                        lines.append(f"\n_...and {len(src_rows) - 20} more_")
+                    lines.append("")
+                return "\n".join(lines)
+
+            for row in rows:
+                label = row.get("label") or "Discovery"
+                updated = str(row.get("updated_at", ""))[:19]
+                try:
+                    data_obj = _json.loads(row.get("data") or "{}")
+                    data_str = _json.dumps(data_obj, indent=2)[:500]
+                except Exception:
+                    data_str = str(row.get("data", ""))[:500]
+                lines.append(f"\n**[{label}]** _{updated}_")
+                lines.append(f"```json\n{data_str}\n```")
+
+            return "\n".join(lines)
+
+        except Exception as exc:
+            elapsed = (_time.time() - _t0) * 1000
+            _log_tool("laravelgraph_plugin_knowledge", {"plugin_name": plugin_name or "all"}, 0, elapsed)
+            return _error_response("MEDIUM", f"Plugin knowledge retrieval failed: {exc}")
 
     # ── Tool: laravelgraph_provider_status ───────────────────────────────────
 

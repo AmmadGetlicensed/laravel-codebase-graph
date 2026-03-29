@@ -23,10 +23,96 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# How long to wait before re-generating a plugin that was already auto-generated (seconds)
+# How long to wait before re-generating a plugin that was already auto-generated
 _AUTO_GEN_COOLDOWN_DAYS = 7
+# Cooldown for drift-triggered regeneration (longer to avoid thrashing)
+_DRIFT_REGEN_COOLDOWN_DAYS = 14
 # Max plugins to auto-generate in a single run (prevents LLM cost explosion)
 _AUTO_GEN_MAX_PER_RUN = 3
+
+
+def take_domain_snapshot(db: Any, feature_slug: str) -> dict:
+    """Capture current graph counts for a domain slug.
+
+    Queries the count of Routes, EloquentModels, and Events that belong to
+    the Feature cluster for *feature_slug* via ``BELONGS_TO_FEATURE`` edges.
+    Falls back to substring matching if no Feature node exists.
+
+    Returns: {"route_count": int, "model_count": int, "event_count": int, "has_changes": bool}
+    """
+    snapshot = {"route_count": 0, "model_count": 0, "event_count": 0, "has_changes": False}
+    if db is None:
+        return snapshot
+    try:
+        # Primary: use BELONGS_TO_FEATURE edges from phase 27
+        rows = db.execute(
+            "MATCH (f:Feature {slug: $slug}) RETURN f.symbol_count AS sc, f.has_changes AS hc",
+            params={"slug": feature_slug},
+        ) if hasattr(db, "execute") else []
+
+        if rows:
+            snapshot["has_changes"] = bool(rows[0].get("hc", False))
+
+        # Count Routes
+        r_rows = db.execute(
+            "MATCH (r:Route)-[:BELONGS_TO_FEATURE]->(f:Feature {slug: $slug}) RETURN count(r) AS cnt",
+            params={"slug": feature_slug},
+        ) if hasattr(db, "execute") else []
+        if r_rows:
+            snapshot["route_count"] = int(r_rows[0].get("cnt", 0) or 0)
+
+        # Count EloquentModels
+        m_rows = db.execute(
+            "MATCH (m:EloquentModel)-[:BELONGS_TO_FEATURE]->(f:Feature {slug: $slug}) RETURN count(m) AS cnt",
+            params={"slug": feature_slug},
+        ) if hasattr(db, "execute") else []
+        if m_rows:
+            snapshot["model_count"] = int(m_rows[0].get("cnt", 0) or 0)
+
+        # Count Events
+        e_rows = db.execute(
+            "MATCH (e:Event)-[:BELONGS_TO_FEATURE]->(f:Feature {slug: $slug}) RETURN count(e) AS cnt",
+            params={"slug": feature_slug},
+        ) if hasattr(db, "execute") else []
+        if e_rows:
+            snapshot["event_count"] = int(e_rows[0].get("cnt", 0) or 0)
+
+    except Exception:
+        pass
+
+    return snapshot
+
+
+def check_domain_drift(db: Any, meta: Any) -> bool:
+    """Return True if the plugin's embedded domain knowledge has drifted from the graph.
+
+    Compares the current graph state to the snapshot stored in ``meta.domain_coverage_snapshot``.
+    Drift signals:
+      - Route count changed by > 20%
+      - Model count increased (new models added)
+      - Feature's ``has_changes`` flag is set (phase 29 change intel)
+
+    Returns False when there is no snapshot yet (first run).
+    """
+    snap = getattr(meta, "domain_coverage_snapshot", {})
+    if not snap:
+        return False
+
+    current = take_domain_snapshot(db, meta.name)
+
+    prev_routes = snap.get("route_count", 0)
+    if prev_routes > 0:
+        delta = abs(current["route_count"] - prev_routes)
+        if delta / prev_routes > 0.20:
+            return True
+
+    if current["model_count"] > snap.get("model_count", 0):
+        return True
+
+    if current.get("has_changes"):
+        return True
+
+    return False
 
 
 def check_and_improve(
@@ -231,72 +317,116 @@ def auto_generate_suggested(
     log: Any | None = None,
     max_per_run: int = _AUTO_GEN_MAX_PER_RUN,
 ) -> list[tuple[str, bool, str]]:
-    """Detect applicable domain recipes and auto-generate missing plugins.
+    """Detect applicable domains and auto-generate missing plugins.
 
-    Runs after ``laravelgraph analyze`` and on MCP server startup.
-    Each recipe has a 7-day cooldown so it won't be re-generated constantly.
+    Combines three signals to find the highest-value domains to generate:
+
+    1. Built-in domain recipes (payment, tenancy, bookings, etc.) — Cypher-signal detection
+    2. Feature node gaps — phase-27 Feature clusters with ``symbol_count > 10`` and no plugin
+    3. Log mining — frequently-queried domains (laravelgraph_feature_context / explain calls)
+
+    Each domain gets a priority score. Scores combine across all three signals.
+    Domains in cooldown are skipped.  At most *max_per_run* plugins are generated.
 
     Returns list of (plugin_name, generated: bool, message).
     """
+    from datetime import datetime, timezone
+
     _log = log or logger
     results: list[tuple[str, bool, str]] = []
 
-    # Step 1: detect applicable recipes from the graph
-    try:
-        from laravelgraph.plugins.suggest import detect_applicable_recipes
-    except ImportError as exc:
-        _log.debug("auto_generate_suggested skipped — suggest module unavailable", error=str(exc))
-        return results
+    # ── Signal A: built-in domain recipes ─────────────────────────────────────
+    candidates: dict[str, dict] = {}  # slug → {name, description, score, source}
 
     try:
+        from laravelgraph.plugins.suggest import detect_applicable_recipes, detect_feature_gaps
         recipes = detect_applicable_recipes(core_db)
+        for hit in recipes:
+            plugin_recipe = hit.get("recipe")
+            if plugin_recipe is None:
+                continue
+            slug = plugin_recipe.name
+            score = float(hit.get("signals_matched", 1)) * 3.0  # recipes are weighted higher
+            candidates[slug] = {
+                "name": slug,
+                "description": plugin_recipe.description,
+                "score": score,
+                "source": "recipe",
+            }
     except Exception as exc:
-        _log.warning("auto_generate_suggested skipped — recipe detection failed", error=str(exc))
+        _log.debug("auto_generate_suggested: recipe detection skipped", error=str(exc))
+
+    # ── Signal B: Feature node gaps ────────────────────────────────────────────
+    try:
+        from laravelgraph.plugins.suggest import detect_feature_gaps
+        feature_gaps = detect_feature_gaps(core_db, meta_store, plugins_dir)
+        for gap in feature_gaps:
+            slug = gap["slug"]
+            if slug in candidates:
+                candidates[slug]["score"] += gap["score"]
+            else:
+                candidates[slug] = {
+                    "name": slug,
+                    "description": f"Domain intelligence plugin for {gap['name']}",
+                    "score": gap["score"],
+                    "source": "feature_gap",
+                }
+    except Exception as exc:
+        _log.debug("auto_generate_suggested: feature gap detection skipped", error=str(exc))
+
+    # ── Signal C: log mining (scored boost only) ───────────────────────────────
+    try:
+        import os
+        log_dir = Path.home() / ".laravelgraph" / "logs"
+        if log_dir.exists():
+            from laravelgraph.logging_manager import get_domain_query_frequencies
+            freq_list = get_domain_query_frequencies(log_dir, since_hours=168, min_calls=3)
+            for freq in freq_list:
+                slug = freq["slug"]
+                boost = freq["count"] * 0.5
+                if slug in candidates:
+                    candidates[slug]["score"] += boost
+                # Log-only gaps (no Feature node match) are not auto-generated
+                # because we need a Feature node to resolve real anchors
+    except Exception as exc:
+        _log.debug("auto_generate_suggested: log mining skipped", error=str(exc))
+
+    if not candidates:
+        _log.debug("auto_generate_suggested: no candidates found")
         return results
 
-    if not recipes:
-        _log.debug("auto_generate_suggested: no applicable recipes detected")
-        return results
-
-    _log.info("Auto-generation: detected applicable recipes", count=len(recipes))
+    # ── Sort by score descending ───────────────────────────────────────────────
+    sorted_candidates = sorted(candidates.values(), key=lambda c: c["score"], reverse=True)
+    _log.info("Auto-generation: candidates ranked", count=len(sorted_candidates))
 
     generated_count = 0
-    for recipe in recipes:
+    for candidate in sorted_candidates:
         if generated_count >= max_per_run:
             _log.debug("Auto-generation cap reached", cap=max_per_run)
             break
 
-        plugin_name: str = recipe.get("name", "")
-        if not plugin_name:
-            continue
+        plugin_name: str = candidate["name"]
 
-        # Step 2: skip if plugin already exists on disk
+        # Skip if plugin already exists on disk
         plugin_file = plugins_dir / f"{plugin_name}.py"
         if plugin_file.exists():
             _log.debug("Auto-generation skipped — plugin already exists", plugin=plugin_name)
             continue
 
-        # Step 3: check cooldown via meta store (prevents regeneration within 7 days)
+        # Check cooldown (ISO timestamp in improvement_cooldown_until)
         try:
-            meta = meta_store.get(plugin_name)
-            if meta is not None:
-                cooldown_until = getattr(meta, "improvement_cooldown_until", 0.0) or 0.0
-                if cooldown_until > time.time():
-                    remaining_h = (cooldown_until - time.time()) / 3600
-                    _log.debug(
-                        "Auto-generation skipped — cooldown active",
-                        plugin=plugin_name,
-                        remaining_hours=round(remaining_h, 1),
-                    )
-                    continue
+            if meta_store.is_in_cooldown(plugin_name):
+                _log.debug("Auto-generation skipped — cooldown active", plugin=plugin_name)
+                continue
         except Exception:
-            pass  # no meta yet is fine — proceed with generation
+            pass
 
-        # Step 4: generate the plugin
-        description: str = recipe.get("description", plugin_name)
+        # Generate the plugin
+        description: str = candidate["description"]
         _log.info(
-            "Auto-generating plugin from recipe",
+            "Auto-generating plugin",
             plugin=plugin_name,
+            source=candidate.get("source", "unknown"),
             description=description[:80],
         )
 
@@ -316,7 +446,6 @@ def auto_generate_suggested(
 
         if not generated_code:
             _log.warning("Auto-generation produced no code", plugin=plugin_name, detail=message)
-            # Set cooldown so we don't retry immediately
             try:
                 meta_store.set_cooldown(plugin_name, hours=_AUTO_GEN_COOLDOWN_DAYS * 24)
             except Exception:
@@ -324,7 +453,7 @@ def auto_generate_suggested(
             results.append((plugin_name, False, f"No code generated: {message}"))
             continue
 
-        # Step 5: write plugin to disk
+        # Write plugin to disk
         try:
             plugins_dir.mkdir(parents=True, exist_ok=True)
             plugin_file.write_text(generated_code, encoding="utf-8")
@@ -334,12 +463,18 @@ def auto_generate_suggested(
             results.append((plugin_name, False, msg))
             continue
 
-        # Step 6: register in meta store with 7-day cooldown
+        # Register in meta store, capture domain snapshot, set cooldown
         try:
             from laravelgraph.plugins.meta import PluginMeta
             existing = meta_store.get(plugin_name)
             if existing is None:
-                meta_store.set(plugin_name, PluginMeta(name=plugin_name, status="active"))
+                meta_store.set(PluginMeta(
+                    name=plugin_name,
+                    status="active",
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                ))
+            snapshot = take_domain_snapshot(core_db, plugin_name)
+            meta_store.set_domain_coverage_snapshot(plugin_name, snapshot)
             meta_store.set_cooldown(plugin_name, hours=_AUTO_GEN_COOLDOWN_DAYS * 24)
             meta_store.increment_self_improvement_count(plugin_name)
         except Exception as exc:

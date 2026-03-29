@@ -31,6 +31,9 @@ laravelgraph plugin enable <name> .     # enable disabled plugin
 laravelgraph plugin disable <name> .    # disable plugin (keep file)
 laravelgraph plugin delete <name> .     # permanently delete plugin + data
 laravelgraph plugin prompt <name> "..." # attach system prompt to plugin
+laravelgraph plugin evolve .            # detect gaps + drift, generate top-N plugins
+laravelgraph plugin evolve . --dry-run  # show what would be generated without generating
+laravelgraph plugin evolve . -n 2       # limit to 2 plugins per run
 
 # Log management
 laravelgraph logs                        # show recent logs
@@ -116,8 +119,9 @@ Plugin System:
   plugins/meta.py          PluginMetaStore (status, usage, contribution scoring)
   plugins/generator.py     Domain-anchored generation + 4-layer validation
   plugins/loader.py        MCP + pipeline plugin loading; scan_plugin_manifests; _ToolCollector
-  plugins/self_improve.py  Proactive self-improvement on server startup
-  logging_manager.py       Log reading, filtering, tailing utilities
+  plugins/self_improve.py  Proactive self-improvement, drift detection, auto-generation on server startup
+  plugins/suggest.py       Domain recipe detection + Feature node gap detection
+  logging_manager.py       Log reading, filtering, tailing; domain query frequency mining
 ```
 
 **What plugins are:** Product-specific domain lenses over the graph. Built-in MCP tools give generic Laravel intelligence (routes, models, events, dead code). Plugins give intelligence about a specific product's domain — "what is the order lifecycle?", "how does driver assignment work?" These are questions that require knowing the actual routes, models, and events in that particular app.
@@ -145,6 +149,34 @@ Plugin System:
 **Plugin discovery at server startup (`plugins/loader.py`):**
 
 `scan_plugin_manifests(plugins_dir)` reads every `.py` file via AST (no import, no side effects) and extracts `PLUGIN_MANIFEST` + tool function names. Called before `FastMCP()` is created so the results can be injected into the server instructions string. This means Claude sees all installed plugin names, descriptions, and tool names at the very start of every conversation — no `laravelgraph_suggest_plugins()` call needed.
+
+**Plugin Lifecycle Engine — keeping knowledge current:**
+
+Three-stage engine that makes plugin knowledge self-sustaining:
+
+1. **Stage 1 — Discovery (`plugins/suggest.py: detect_feature_gaps`):** Queries Feature nodes (phase 27 clusters) with `symbol_count > 10` that have no plugin yet. Scores by symbol count. Combined with log mining (`logging_manager.py: get_domain_query_frequencies`) — scans `~/.laravelgraph/logs/` for `laravelgraph_feature_context` / `laravelgraph_explain` calls and boosts score for frequently-queried domains.
+
+2. **Stage 2 — Evolution (`plugins/self_improve.py: check_domain_drift`):** Captures a snapshot of graph counts (route/model/event) at generation time via `take_domain_snapshot()`, stored in `PluginMeta.domain_coverage_snapshot`. On startup, compares current counts to snapshot. Triggers regeneration when routes change >20%, any new model appears, or Feature's `has_changes` flag is set. Uses a 14-day drift cooldown to avoid thrashing.
+
+3. **Stage 3 — Consolidation (`mcp/server.py: laravelgraph_plugin_knowledge`):** MCP tool that queries `plugin_graph.kuzu` for all discoveries accumulated by plugins. Agents call `store_discoveries()` during investigations; `laravelgraph_plugin_knowledge()` makes that institutional knowledge available in every future conversation. Plugins with discoveries show `[N discoveries]` in the LOADED PLUGINS section.
+
+**CI/cron integration:**
+
+```bash
+# Run weekly to evolve the plugin library automatically
+laravelgraph plugin evolve . --max-generate 2
+
+# Dry run to see what would be generated
+laravelgraph plugin evolve . --dry-run
+```
+
+```yaml
+# .github/workflows/laravelgraph.yml
+- name: Evolve plugins
+  run: laravelgraph plugin evolve . --max-generate 2
+  schedule:
+    - cron: '0 9 * * 1'  # every Monday morning
+```
 
 **Hot dispatch — using plugins without restart (`laravelgraph_run_plugin_tool`):**
 

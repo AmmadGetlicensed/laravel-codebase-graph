@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -159,6 +161,52 @@ def detect_applicable_recipes(db: object) -> list[dict]:
 
     results.sort(key=lambda r: r["signals_matched"], reverse=True)
     return results
+
+
+def detect_feature_gaps(db: Any, meta_store: Any, plugins_dir: Path) -> list[dict]:
+    """Find Feature nodes with no corresponding plugin.
+
+    Queries phase-27 Feature clusters with ``symbol_count > 10`` that have
+    no matching plugin slug on disk or in the meta store. Each gap is
+    returned with a priority score proportional to its symbol count.
+
+    Returns list of dicts: {slug, name, symbol_count, has_changes, score, source}.
+    """
+    try:
+        existing_slugs = {m.name for m in meta_store.all()}
+    except Exception:
+        existing_slugs = set()
+
+    try:
+        rows = db.execute(
+            "MATCH (f:Feature) WHERE f.symbol_count > 10 "
+            "RETURN f.slug AS slug, f.name AS name, "
+            "f.symbol_count AS symbol_count, f.has_changes AS has_changes "
+            "ORDER BY f.symbol_count DESC"
+        )
+    except Exception:
+        return []
+
+    gaps: list[dict] = []
+    for row in rows:
+        slug = row.get("slug") or ""
+        if not slug:
+            continue
+        if slug in existing_slugs:
+            continue
+        if (plugins_dir / f"{slug}.py").exists():
+            continue
+        symbol_count = row.get("symbol_count") or 0
+        gaps.append({
+            "slug": slug,
+            "name": row.get("name") or slug,
+            "symbol_count": symbol_count,
+            "has_changes": bool(row.get("has_changes")),
+            "score": min(symbol_count / 10.0, 10.0),
+            "source": "feature_gap",
+        })
+
+    return gaps
 
 
 def format_suggestions(results: list[dict]) -> str:

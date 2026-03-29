@@ -11,7 +11,7 @@ import typer
 from rich import print as rprint
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.table import Table
 from rich.tree import Tree
 
@@ -114,31 +114,42 @@ def analyze(
 
     phase_times: list[float] = []
     phase_names: list[str] = []
-    total_phases_ref: list[int] = [23]
+    total_phases_ref: list[int] = [31]
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         MofNCompleteColumn(),
-        TaskProgressColumn(),
         TimeElapsedColumn(),
-        TextColumn("[dim]{task.fields[eta]}[/dim]"),
+        TimeRemainingColumn(),
         console=console,
+        expand=False,
     ) as progress:
-        task = progress.add_task("Initializing...", total=total_phases_ref[0], eta="")
+        # Main task: overall phase progress
+        task = progress.add_task("Initializing...", total=total_phases_ref[0])
+        # Status task: live in-phase status messages (hidden until a phase calls set_status)
+        status_task = progress.add_task("", total=None, visible=False)
 
-        def on_phase_start(idx: int, name: str, total: int) -> None:
+        def on_phase_start(idx: int, name: str, total: int, description: str) -> None:
             total_phases_ref[0] = total
-            progress.update(task, total=total, description=f"[{idx}/{total}] {name}")
+            progress.update(
+                task,
+                total=total,
+                description=f"[{idx}/{total}] [bold]{name}[/bold]  [dim]{description}[/dim]",
+            )
+            # Hide / clear previous status line
+            progress.update(status_task, description="", visible=False)
 
         def on_phase_done(idx: int, name: str, elapsed: float) -> None:
             phase_times.append(elapsed)
             phase_names.append(name)
-            avg = sum(phase_times) / len(phase_times)
-            remaining = avg * (total_phases_ref[0] - idx)
-            eta_str = f"eta {_fmt_sec(remaining)}" if remaining > 0 and len(phase_times) >= 3 else ""
-            progress.update(task, completed=idx, eta=eta_str)
+            progress.update(task, completed=idx)
+            # Hide status line after phase finishes
+            progress.update(status_task, description="", visible=False)
+
+        def on_status(msg: str) -> None:
+            progress.update(status_task, description=f"  [dim]↳ {msg}[/dim]", visible=True)
 
         from laravelgraph.pipeline.orchestrator import Pipeline
         pipeline = Pipeline(root, config=cfg)
@@ -150,6 +161,7 @@ def analyze(
                 phases=selected_phases,
                 on_phase_start=on_phase_start,
                 on_phase_done=on_phase_done,
+                on_phase_status=on_status,
             )
         except Exception as e:
             if "lock" in str(e).lower() or "locked" in str(e).lower():
@@ -160,9 +172,17 @@ def analyze(
                 raise typer.Exit(1)
             raise
 
-        progress.update(task, description="[green]Complete!", completed=total_phases_ref[0], eta="")
+        progress.update(task, description="[green]✓ Complete![/green]", completed=total_phases_ref[0])
 
-    # Show stats
+    # Print per-phase summary lines (outside progress bar — rendered after it closes)
+    for i, (name, elapsed) in enumerate(zip(phase_names, phase_times)):
+        idx = i + 1
+        console.print(
+            f"  [green]✓[/green]  [dim][{idx}/{total_phases_ref[0]}] {name}[/dim]  [dim]{_fmt_sec(elapsed)}[/dim]"
+        )
+
+    # Show stats table
+    console.print()
     table = Table(title="Index Summary", show_header=True, header_style="bold cyan")
     table.add_column("Metric", style="dim")
     table.add_column("Count", justify="right")
@@ -171,15 +191,6 @@ def analyze(
         table.add_row(key.replace("_", " ").title(), str(value))
 
     console.print(table)
-
-    # Show phase timing breakdown
-    if phase_times:
-        timing_table = Table(title="Phase Timings", show_header=True, header_style="bold")
-        timing_table.add_column("Phase", style="dim")
-        timing_table.add_column("Duration", justify="right")
-        for name, elapsed in zip(phase_names, phase_times):
-            timing_table.add_row(name, _fmt_sec(elapsed))
-        console.print(timing_table)
 
     if ctx.errors:
         console.print(f"\n[yellow]⚠️ {len(ctx.errors)} warnings during indexing.[/yellow]")
@@ -204,6 +215,28 @@ def analyze(
             console.print(f"[yellow]Cache warming failed:[/yellow] {e}")
     elif warm_cache and not cfg.databases:
         console.print("[dim]--warm-cache: no DB connections configured, skipping[/dim]")
+
+    # ── Plugin auto-generation (post-analyze) ────────────────────────────────
+    index_dir = root / ".laravelgraph"
+    plugins_dir = index_dir / "plugins"
+    try:
+        from laravelgraph.plugins.meta import PluginMetaStore
+        from laravelgraph.plugins.self_improve import auto_generate_suggested
+        from laravelgraph.core.graph import GraphDB
+        _meta = PluginMetaStore(index_dir)
+        _gdb = GraphDB(index_dir / "graph.kuzu")
+        with console.status("[dim]Scanning for plugin opportunities...[/dim]", spinner="dots"):
+            _gen_results = auto_generate_suggested(plugins_dir, _meta, root, _gdb, cfg)
+        _gdb.close()
+        for _pname, _ok, _msg in _gen_results:
+            if _ok:
+                console.print(f"[green]✓[/green] Plugin auto-generated: [bold]{_pname}[/bold]")
+            else:
+                console.print(f"[dim]  Plugin {_pname}: {_msg}[/dim]")
+        if not _gen_results:
+            console.print("[dim]  Plugins up to date — no new recipes detected[/dim]")
+    except Exception as _pe:
+        console.print(f"[dim]  Plugin scan skipped: {_pe}[/dim]")
 
     console.print(
         f"\n[green]✓[/green] Project indexed successfully. "
@@ -332,6 +365,117 @@ def clean(
 
     Registry().unregister(root)
     console.print(f"[green]✓[/green] Removed from registry.")
+
+
+# ── download ──────────────────────────────────────────────────────────────────
+
+@app.command(rich_help_panel="1. Setup & Indexing")
+def download(
+    check: bool = typer.Option(False, "--check", help="Only check status, do not download anything."),
+    path: Optional[Path] = PathArg,
+) -> None:
+    """Download required model files and check dependency status.
+
+    Shows which dependencies are already downloaded and which are missing.
+    Downloads any missing assets with progress bars.
+
+    Safe to run multiple times — already-downloaded assets are skipped.
+
+    Examples:
+      laravelgraph download           # download any missing dependencies
+      laravelgraph download --check   # show status only, no downloads
+    """
+    from laravelgraph.downloads import DEPENDENCIES, check_all
+
+    console.print(Panel(
+        "[bold green]LaravelGraph[/bold green] — Dependency Manager",
+        border_style="cyan",
+    ))
+
+    statuses = check_all()
+
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("Dependency")
+    table.add_column("Description")
+    table.add_column("Size", justify="right", width=10)
+    table.add_column("Status", width=20)
+
+    for dep in DEPENDENCIES:
+        available = statuses[dep.key]
+        if available:
+            status_text = "[green]✓ Ready[/green]"
+        else:
+            # Distinguish "pip package missing" (tree-sitter-php) from "downloadable"
+            if "parsing" in dep.tags:
+                status_text = "[red]✗ Missing[/red]"
+            else:
+                status_text = "[yellow]⬇ Not downloaded[/yellow]"
+        table.add_row(dep.name, dep.description, dep.size_hint, status_text)
+
+    console.print(table)
+
+    all_ready = all(statuses.values())
+
+    if all_ready:
+        console.print("\n[green]All dependencies are ready.[/green]")
+        return
+
+    if check:
+        # --check: show status only, no downloads
+        missing_count = sum(1 for v in statuses.values() if not v)
+        console.print(
+            f"\n[yellow]{missing_count} dependency/dependencies not ready.[/yellow] "
+            "Run [bold]laravelgraph download[/bold] to fetch them."
+        )
+        return
+
+    # Download missing dependencies
+    from laravelgraph.downloads import DEPENDENCIES as _DEPS
+
+    missing_deps = [dep for dep in _DEPS if not statuses[dep.key]]
+    total = len(missing_deps)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        downloaded = 0
+        failed = 0
+
+        for i, dep in enumerate(missing_deps, start=1):
+            task = progress.add_task(
+                f"[{i}/{total}] Downloading {dep.name}...",
+                total=None,  # indeterminate
+            )
+            try:
+                dep.download(None)
+                downloaded += 1
+                progress.update(
+                    task,
+                    description=f"[{i}/{total}] [green]✓[/green] {dep.name}",
+                    completed=1,
+                    total=1,
+                )
+            except Exception as exc:
+                failed += 1
+                progress.update(
+                    task,
+                    description=f"[{i}/{total}] [red]✗[/red] {dep.name}",
+                    completed=1,
+                    total=1,
+                )
+                console.print(f"  [red]Error:[/red] {exc}")
+
+    ready = downloaded
+    console.print(
+        f"\n[green]✓ {ready} dependenc{'y' if ready == 1 else 'ies'} ready[/green]"
+        + (f", [red]{failed} failed[/red]" if failed else "")
+    )
+    if failed:
+        raise typer.Exit(1)
 
 
 # ── query ─────────────────────────────────────────────────────────────────────
@@ -1213,41 +1357,23 @@ def diff(
         raise typer.Exit(1)
 
 
-# ── providers ─────────────────────────────────────────────────────────────────
+# ── providers (internal helpers) ──────────────────────────────────────────────
 
-@app.command(rich_help_panel="4. Server & Agent Integration")
-def providers(path: Optional[Path] = PathArg) -> None:
-    """Show which of the 18+ supported LLM providers are configured and active.
-
-    Displays two tables: cloud providers (OpenAI, Anthropic, Gemini, etc.)
-    and local providers (Ollama, LM Studio, etc.). For each provider shows
-    whether it is configured (has an API key or base URL), which model is
-    selected, and whether it is the currently active provider.
-
-    Configured = has API key or base URL set (via env var or config file).
-    Active = the provider that will be used for generating semantic summaries
-    on the next query.
-
-    Use `laravelgraph configure` to set up a provider.
-    Use `laravelgraph doctor` to run a live test of the active provider.
-
-    Examples:
-      laravelgraph providers
-      laravelgraph providers /path/to/project
-    """
+def _providers_list(path: Optional[Path]) -> None:
+    """Display the LLM provider status tables (shared by list sub-command and callback)."""
     root = _project_root(path)
 
     from laravelgraph.config import Config
     from laravelgraph.mcp.summarize import PROVIDER_REGISTRY, provider_status
 
     cfg = Config.load(root)
-    status = provider_status(cfg.summary)
+    status = provider_status(cfg.llm)
     active = status["active_provider"]
 
     active_label = f"{PROVIDER_REGISTRY[active]['label']}" if active else ""
     active_str = f"[green]{active}[/green] — {active_label}" if active else "[yellow]none[/yellow] — summaries skipped"
     console.print(Panel(
-        f"[bold]Semantic Summaries:[/bold] {'[green]enabled[/green]' if status['enabled'] else '[red]disabled[/red]'}\n"
+        f"[bold]LLM Summaries:[/bold] {'[green]enabled[/green]' if status['enabled'] else '[red]disabled[/red]'}\n"
         f"[bold]Active provider:[/bold] {active_str}",
         title="LLM Provider Status",
         border_style="cyan",
@@ -1296,247 +1422,480 @@ def providers(path: Optional[Path] = PathArg) -> None:
     if not active and status["enabled"]:
         console.print(
             "\n[yellow]No provider configured.[/yellow] "
-            "Run [bold]laravelgraph configure[/bold] to set one up."
+            "Run [bold]laravelgraph providers add <name>[/bold] to set one up."
         )
 
 
-# ── configure ─────────────────────────────────────────────────────────────────
-
-@app.command(rich_help_panel="4. Server & Agent Integration")
-def configure(
-    path: Optional[Path] = PathArg,
-    global_: bool = typer.Option(False, "--global", "-g", help="Save to global config (~/.laravelgraph/config.json) rather than project-level (.laravelgraph/config.json)"),
-    activate: str = typer.Option("", "--activate", "-a", help="Activate an already-configured provider by name without re-entering credentials (e.g. --activate groq)"),
-) -> None:
-    """Interactive wizard to configure an LLM provider for semantic summaries.
-
-    Walks you through selecting one of 18+ supported LLM providers (cloud or
-    local) and saves the API key and model selection to config. Config is
-    written to either:
-      - Global:  ~/.laravelgraph/config.json  (all projects on this machine)
-      - Project: <project>/.laravelgraph/config.json  (this project only)
-
-    Project-level config overrides global config. Global config is the best
-    default for most setups. Use project-level if you want different providers
-    per project.
-
-    Summaries are generated lazily on first query and cached — no cost until
-    used. If no provider is set, laravelgraph works fine without summaries.
-
-    After configuring, use `laravelgraph providers` to verify and
-    `laravelgraph doctor` to run a live test.
-
-    Examples:
-      laravelgraph configure                  # Interactive — project-level config
-      laravelgraph configure --global         # Save to ~/.laravelgraph/config.json
-      laravelgraph configure --activate groq  # Switch active provider (no re-auth)
-      laravelgraph configure -g --activate openai  # Switch globally
-    """
+def _providers_write_config(cfg_path: "Path", llm_patch: dict) -> None:
+    """Deep-merge *llm_patch* into the 'llm' section of *cfg_path* and save."""
     import json as _json
-    root = _project_root(path)
-
-    from laravelgraph.config import global_dir, index_dir as _index_dir
-    from laravelgraph.mcp.summarize import PROVIDER_REGISTRY, provider_status
-    from laravelgraph.config import Config
-
-    # ── --activate shortcut: just switch the active provider ─────────────────
-    if activate:
-        activate = activate.strip().lower()
-        if activate not in PROVIDER_REGISTRY and activate != "auto":
-            known = ", ".join(PROVIDER_REGISTRY.keys())
-            console.print(f"[red]Unknown provider:[/red] {activate}\nKnown: {known}")
-            raise typer.Exit(1)
-
-        if not global_:
-            console.print("\n[bold]Where to save?[/bold]\n")
-            console.print(f"  [cyan]1[/cyan]  This project only  ({root / '.laravelgraph' / 'config.json'})")
-            console.print(f"  [cyan]2[/cyan]  Global — all projects  (~/.laravelgraph/config.json)\n")
-            global_ = typer.prompt("Save to", default="2") == "2"
-
-        cfg_path = (global_dir() if global_ else _index_dir(root)) / "config.json"
-        existing: dict = {}
-        if cfg_path.exists():
-            try:
-                existing = _json.loads(cfg_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        existing.setdefault("summary", {})["provider"] = activate
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(_json.dumps(existing, indent=2), encoding="utf-8")
-        scope_label = "global" if global_ else "project"
-        console.print(f"[green]✓[/green] Active provider set to [green]{activate}[/green] ({scope_label})")
-        console.print("Run [bold]laravelgraph providers[/bold] to verify.")
-        return
-
-    # ── Load existing config to show current state ────────────────────────────
-    cfg = Config.load(root)
-    status = provider_status(cfg.summary)
-    current_active = status.get("active_provider")
-    configured_names = {n for n, info in status["providers"].items() if info.get("configured")}
-
-    console.print(Panel(
-        "Configure an LLM provider for [bold]semantic summary generation[/bold].\n"
-        "Summaries are generated lazily on first query and cached — no cost until used.\n"
-        "If no provider is set, the tool works fine — just without AI-generated summaries.",
-        title="LaravelGraph — Provider Setup",
-        border_style="cyan",
-    ))
-
-    if current_active:
-        console.print(f"\n[bold]Currently active:[/bold] [green]{current_active}[/green]  "
-                      f"(switch with [dim]--activate <name>[/dim])")
-    if configured_names:
-        others = configured_names - ({current_active} if current_active else set())
-        if others:
-            console.print(f"[dim]Also configured (not active): {', '.join(sorted(others))}[/dim]")
-
-    # ── List all providers ────────────────────────────────────────────────────
-    cloud_providers = [(n, v) for n, v in PROVIDER_REGISTRY.items() if not v.get("local")]
-    local_providers = [(n, v) for n, v in PROVIDER_REGISTRY.items() if v.get("local")]
-
-    console.print("\n[bold]Cloud providers:[/bold]\n")
-    for i, (name, info) in enumerate(cloud_providers, start=1):
-        active_marker = " [green]← active[/green]" if name == current_active else ""
-        configured_marker = " [dim]✓ configured[/dim]" if name in configured_names else ""
-        console.print(f"  [cyan]{i:2}[/cyan]  {info['label']}{configured_marker}{active_marker}")
-
-    console.print("\n[bold]Local providers (no API key required):[/bold]\n")
-    for i, (name, info) in enumerate(local_providers, start=len(cloud_providers) + 1):
-        active_marker = " [green]← active[/green]" if name == current_active else ""
-        configured_marker = " [dim]✓ configured[/dim]" if name in configured_names else ""
-        console.print(f"  [cyan]{i:2}[/cyan]  {info['label']}{configured_marker}{active_marker}")
-
-    console.print(f"\n  [cyan] 0[/cyan]  Disable summaries\n")
-
-    all_providers = cloud_providers + local_providers
-    choice_str = typer.prompt("Select provider number", default="1")
-
-    if choice_str == "0":
-        provider_name = "disabled"
-        provider_info = None
-    else:
-        try:
-            idx = int(choice_str) - 1
-            provider_name, provider_info = all_providers[idx]
-        except (ValueError, IndexError):
-            console.print(f"[red]Invalid choice:[/red] {choice_str}")
-            raise typer.Exit(1)
-
-    # ── Provider-specific prompts ─────────────────────────────────────────────
-    summary_patch: dict = {}
-
-    def _pick_model(info: dict, custom_prompt: str = "") -> str:
-        """Show numbered model list for a provider; let user pick or type custom."""
-        model_list: list[tuple[str, str]] = info.get("models", [])
-        default_model: str = info.get("default_model", "")
-
-        if not model_list:
-            # No curated list — fall back to free-text prompt
-            return typer.prompt(custom_prompt or "Model", default=default_model)
-
-        console.print("\n[bold]Available models:[/bold]\n")
-        for i, (mid, desc) in enumerate(model_list, start=1):
-            default_marker = " [dim](default)[/dim]" if mid == default_model else ""
-            console.print(f"  [cyan]{i:2}[/cyan]  [bold]{mid}[/bold]{default_marker}")
-            console.print(f"       [dim]{desc}[/dim]")
-        console.print(f"\n  [cyan] 0[/cyan]  Enter custom model ID\n")
-
-        # Default choice = index of the default_model in the list, else 1
-        default_idx = next((str(i) for i, (mid, _) in enumerate(model_list, 1) if mid == default_model), "1")
-        raw = typer.prompt("Select model number (or type a model ID directly)", default=default_idx)
-
-        # If the input is a digit, treat as list pick; otherwise use as literal model ID
-        if raw.isdigit():
-            idx = int(raw)
-            if idx == 0:
-                return typer.prompt("Model ID")
-            if 1 <= idx <= len(model_list):
-                chosen_id = model_list[idx - 1][0]
-                console.print(f"  → [green]{chosen_id}[/green]")
-                return chosen_id
-            console.print(f"[yellow]Invalid choice {idx}, using default[/yellow]")
-            return default_model or model_list[0][0]
-        # User typed a model ID directly
-        return raw.strip()
-
-    if provider_name == "disabled":
-        summary_patch = {"enabled": False}
-        console.print("[yellow]Summaries will be disabled.[/yellow]")
-
-    elif provider_info and provider_info.get("local"):
-        # Local provider: ask for base URL + model
-        console.print(f"\n[bold]{provider_info['label']}[/bold]")
-        default_url = provider_info["base_url"].replace("/v1", "")  # show clean URL
-        base_url = typer.prompt("Base URL", default=default_url)
-        model = _pick_model(provider_info, "Model name (must be already pulled/loaded locally)")
-        summary_patch = {
-            "provider": provider_name,
-            "base_urls": {provider_name: base_url},
-            "models": {provider_name: model},
-        }
-
-    else:
-        # Cloud provider: ask for API key + model
-        env_var = provider_info["env_var"]  # type: ignore[index]
-        console.print(f"\n[bold]{provider_info['label']}[/bold]")  # type: ignore[index]
-        if env_var:
-            console.print(f"Environment variable: [cyan]{env_var}[/cyan]")
-        key = typer.prompt("API key", hide_input=True)
-        model = _pick_model(provider_info)
-        # Save explicit provider name (not "auto") so this provider becomes the
-        # active one immediately and does not displace an already-active provider
-        # when the user later adds a second key.
-        summary_patch = {
-            "provider": provider_name,
-            "api_keys": {provider_name: key},
-            "models": {provider_name: model},
-        }
-
-    # ── Choose scope ──────────────────────────────────────────────────────────
-    if not global_:
-        console.print("\n[bold]Where to save?[/bold]\n")
-        console.print(f"  [cyan]1[/cyan]  This project only  ({root / '.laravelgraph' / 'config.json'})")
-        console.print(f"  [cyan]2[/cyan]  Global — all projects  (~/.laravelgraph/config.json)\n")
-        global_ = typer.prompt("Save to", default="2") == "2"
-
-    cfg_path = (global_dir() if global_ else _index_dir(root)) / "config.json"
-
-    # Deep-merge into existing config — api_keys/models/base_urls dicts are merged
-    # (not replaced) so previously configured providers are preserved.
-    existing = {}
+    existing: dict = {}
     if cfg_path.exists():
         try:
             existing = _json.loads(cfg_path.read_text(encoding="utf-8"))
         except Exception:
             pass
-
-    s = existing.setdefault("summary", {})
-    for k, v in summary_patch.items():
+    # Migrate old "summary" key if present
+    if "summary" in existing and "llm" not in existing:
+        existing["llm"] = existing.pop("summary")
+    s = existing.setdefault("llm", {})
+    for k, v in llm_patch.items():
         if isinstance(v, dict) and isinstance(s.get(k), dict):
             s[k].update(v)   # merge dicts (api_keys, models, base_urls)
         else:
             s[k] = v
-
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(_json.dumps(existing, indent=2), encoding="utf-8")
 
-    scope_label = "global" if global_ else "project"
-    console.print(f"\n[green]✓[/green] Config saved to [cyan]{cfg_path}[/cyan] ({scope_label})")
 
-    if provider_name != "disabled":
-        console.print(
-            f"\n[bold]Active provider:[/bold] [green]{provider_name}[/green]\n"
-            "Summaries will be generated on first query and cached automatically.\n"
-            "Run [bold]laravelgraph providers[/bold] to verify — "
-            "[bold]laravelgraph doctor[/bold] to test live.\n"
-            f"To switch provider later without re-entering keys: "
-            f"[dim]laravelgraph configure --activate <name>[/dim]"
+def _pick_model(info: dict, current_model: str = "", custom_prompt: str = "") -> str:
+    """Show numbered model list for a provider; let user pick or type custom.
+
+    *current_model* is pre-selected (press Enter to keep it).
+    """
+    model_list: list[tuple[str, str]] = info.get("models", [])
+    default_model: str = current_model or info.get("default_model", "")
+
+    if not model_list:
+        return typer.prompt(custom_prompt or "Model", default=default_model)
+
+    console.print("\n[bold]Available models:[/bold]\n")
+    for i, (mid, desc) in enumerate(model_list, start=1):
+        current_marker = " [green](current)[/green]" if mid == current_model else (
+            " [dim](default)[/dim]" if mid == info.get("default_model", "") else ""
         )
-        if provider_info and not provider_info.get("local") and provider_info.get("env_var"):
-            console.print(
-                f"\n[yellow]Tip:[/yellow] Use an env var instead of storing the key in config:\n"
-                f"  [dim]export {provider_info['env_var']}=your-key[/dim]"
-            )
+        console.print(f"  [cyan]{i:2}[/cyan]  [bold]{mid}[/bold]{current_marker}")
+        console.print(f"       [dim]{desc}[/dim]")
+    console.print(f"\n  [cyan] 0[/cyan]  Enter custom model ID\n")
+
+    default_idx = next(
+        (str(i) for i, (mid, _) in enumerate(model_list, 1) if mid == default_model),
+        "1",
+    )
+    raw = typer.prompt("Select model number (or type a model ID directly)", default=default_idx)
+
+    if raw.isdigit():
+        idx = int(raw)
+        if idx == 0:
+            return typer.prompt("Model ID")
+        if 1 <= idx <= len(model_list):
+            chosen_id = model_list[idx - 1][0]
+            console.print(f"  → [green]{chosen_id}[/green]")
+            return chosen_id
+        console.print(f"[yellow]Invalid choice {idx}, using default[/yellow]")
+        return default_model or model_list[0][0]
+    return raw.strip()
+
+
+def _prompt_scope(root: "Path", global_flag: bool) -> "Path":
+    """Ask user where to save (project vs global) if --global not specified."""
+    from laravelgraph.config import global_dir, index_dir as _index_dir
+    if not global_flag:
+        console.print("\n[bold]Where to save?[/bold]\n")
+        console.print(f"  [cyan]1[/cyan]  This project only  ({root / '.laravelgraph' / 'config.json'})")
+        console.print(f"  [cyan]2[/cyan]  Global — all projects  (~/.laravelgraph/config.json)\n")
+        global_flag = typer.prompt("Save to", default="2") == "2"
+    return (global_dir() if global_flag else _index_dir(root)) / "config.json"
+
+
+# ── providers sub-command group ───────────────────────────────────────────────
+
+providers_app = typer.Typer(
+    name="providers",
+    help="Manage LLM providers for semantic summary generation.",
+    rich_markup_mode="rich",
+    invoke_without_command=True,
+    no_args_is_help=False,
+)
+app.add_typer(providers_app, name="providers", rich_help_panel="4. Server & Agent Integration")
+
+
+@providers_app.callback()
+def _providers_callback(ctx: typer.Context) -> None:
+    """Show and manage LLM providers for semantic summary generation.
+
+    Run without a sub-command to list all providers and their status.
+    """
+    if ctx.invoked_subcommand is None:
+        _providers_list(None)
+
+
+@providers_app.command("list")
+def providers_list_cmd(path: Optional[Path] = PathArg) -> None:
+    """List all configured LLM providers and their status."""
+    _providers_list(path)
+
+
+@providers_app.command("add")
+def providers_add(
+    name: str = typer.Argument(..., help="Provider name (e.g. groq, openai, ollama, anthropic)"),
+    path: Optional[Path] = PathArg,
+    global_: bool = typer.Option(False, "--global", "-g", help="Save to global ~/.laravelgraph/config.json"),
+) -> None:
+    """Add or reconfigure an LLM provider.
+
+    If the provider is already configured, existing values are pre-filled so
+    you can press Enter to keep them and only change what you need.
+
+    Examples:
+      laravelgraph providers add groq
+      laravelgraph providers add ollama --global
+      laravelgraph providers add openai -g
+    """
+    from laravelgraph.config import Config
+    from laravelgraph.mcp.summarize import PROVIDER_REGISTRY
+
+    name = name.strip().lower()
+    if name not in PROVIDER_REGISTRY:
+        known = ", ".join(PROVIDER_REGISTRY.keys())
+        console.print(f"[red]Unknown provider:[/red] {name}\nKnown providers: {known}")
+        raise typer.Exit(1)
+
+    root = _project_root(path)
+    cfg = Config.load(root)
+    provider_info = PROVIDER_REGISTRY[name]
+
+    # Load existing values for pre-fill
+    existing_key = cfg.llm.api_keys.get(name, "")
+    existing_model = cfg.llm.models.get(name, "")
+    existing_url = cfg.llm.base_urls.get(name, "")
+    is_reconfigure = bool(existing_key or existing_model or existing_url)
+
+    console.print(Panel(
+        f"Configuring [bold]{provider_info['label']}[/bold]"
+        + (" [dim](updating existing)[/dim]" if is_reconfigure else ""),
+        border_style="cyan",
+    ))
+
+    llm_patch: dict = {}
+
+    if provider_info.get("local"):
+        default_url = existing_url or provider_info["base_url"].replace("/v1", "")
+        if existing_url:
+            console.print(f"  [dim]Current base URL: {existing_url}[/dim]")
+        base_url = typer.prompt("Base URL", default=default_url)
+        model = _pick_model(provider_info, current_model=existing_model,
+                            custom_prompt="Model name (must be already pulled/loaded locally)")
+        llm_patch = {
+            "provider": name,
+            "base_urls": {name: base_url},
+            "models": {name: model},
+        }
+    else:
+        env_var = provider_info.get("env_var", "")
+        if env_var:
+            console.print(f"  Environment variable: [cyan]{env_var}[/cyan]")
+        if existing_key:
+            masked = existing_key[:5] + "****"
+            console.print(f"  [dim]Current key: {masked}  (press Enter to keep)[/dim]")
+        new_key = typer.prompt("API key", hide_input=True, default="")
+        final_key = new_key if new_key else existing_key
+        if not final_key:
+            console.print("[red]API key is required.[/red]")
+            raise typer.Exit(1)
+        model = _pick_model(provider_info, current_model=existing_model)
+        llm_patch = {
+            "provider": name,
+            "api_keys": {name: final_key},
+            "models": {name: model},
+        }
+
+    cfg_path = _prompt_scope(root, global_)
+    _providers_write_config(cfg_path, llm_patch)
+
+    scope_label = "global" if cfg_path.parent == cfg_path.parent else "project"
+    from laravelgraph.config import global_dir
+    scope_label = "global" if cfg_path.parent == global_dir() else "project"
+    console.print(f"\n[green]✓[/green] Config saved to [cyan]{cfg_path}[/cyan] ({scope_label})")
+    console.print(
+        f"[bold]Active provider:[/bold] [green]{name}[/green]\n"
+        "Run [bold]laravelgraph providers[/bold] to verify — "
+        "[bold]laravelgraph providers test[/bold] to run a live check."
+    )
+    if not provider_info.get("local") and provider_info.get("env_var"):
+        console.print(
+            f"\n[yellow]Tip:[/yellow] Use an env var instead of storing the key in config:\n"
+            f"  [dim]export {provider_info['env_var']}=your-key[/dim]"
+        )
+
+
+@providers_app.command("edit")
+def providers_edit(
+    name: str = typer.Argument(..., help="Provider name to edit"),
+    path: Optional[Path] = PathArg,
+    global_: bool = typer.Option(False, "--global", "-g", help="Edit global config"),
+    model: str = typer.Option("", "--model", "-m", help="Set model directly (non-interactive)"),
+    api_key: str = typer.Option("", "--api-key", help="Set API key directly (non-interactive)"),
+    base_url: str = typer.Option("", "--base-url", help="Set base URL directly (non-interactive, local providers only)"),
+) -> None:
+    """Edit a configured provider's settings.
+
+    Without flags: interactive wizard with existing values pre-filled.
+    With flags: update specific fields non-interactively.
+
+    Examples:
+      laravelgraph providers edit groq --model llama-3.1-8b-instant
+      laravelgraph providers edit ollama --base-url http://localhost:11434
+      laravelgraph providers edit openai   # interactive, pre-filled
+    """
+    from laravelgraph.mcp.summarize import PROVIDER_REGISTRY
+
+    name = name.strip().lower()
+    if name not in PROVIDER_REGISTRY:
+        known = ", ".join(PROVIDER_REGISTRY.keys())
+        console.print(f"[red]Unknown provider:[/red] {name}\nKnown providers: {known}")
+        raise typer.Exit(1)
+
+    # Non-interactive path: flags provided
+    if model or api_key or base_url:
+        root = _project_root(path)
+        llm_patch: dict = {"models": {}, "api_keys": {}, "base_urls": {}}
+        if model:
+            llm_patch["models"][name] = model
+        if api_key:
+            llm_patch["api_keys"][name] = api_key
+        if base_url:
+            llm_patch["base_urls"][name] = base_url
+        # Remove empty dicts
+        llm_patch = {k: v for k, v in llm_patch.items() if v}
+        cfg_path = _prompt_scope(root, global_)
+        _providers_write_config(cfg_path, llm_patch)
+        console.print(f"[green]✓[/green] {name} updated.")
+        return
+
+    # Interactive path: delegate to add (which pre-fills existing values)
+    providers_add(name=name, path=path, global_=global_)
+
+
+@providers_app.command("remove")
+def providers_remove(
+    name: str = typer.Argument(..., help="Provider name to remove"),
+    path: Optional[Path] = PathArg,
+    global_: bool = typer.Option(False, "--global", "-g", help="Remove from global config"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
+) -> None:
+    """Remove a provider's credentials from config.
+
+    The provider's api_key, model, and base_url are removed. If it was the
+    active provider, the active provider is reset to 'auto'.
+
+    Examples:
+      laravelgraph providers remove groq
+      laravelgraph providers remove groq --force
+      laravelgraph providers remove openai --global
+    """
+    import json as _json
+    from laravelgraph.mcp.summarize import PROVIDER_REGISTRY
+
+    name = name.strip().lower()
+    if name not in PROVIDER_REGISTRY:
+        known = ", ".join(PROVIDER_REGISTRY.keys())
+        console.print(f"[red]Unknown provider:[/red] {name}\nKnown providers: {known}")
+        raise typer.Exit(1)
+
+    root = _project_root(path)
+    from laravelgraph.config import global_dir, index_dir as _index_dir
+    cfg_path = (global_dir() if global_ else _index_dir(root)) / "config.json"
+
+    if not cfg_path.exists():
+        console.print(f"[yellow]No config file found at {cfg_path}[/yellow]")
+        raise typer.Exit(1)
+
+    try:
+        data = _json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        console.print(f"[red]Could not read config:[/red] {exc}")
+        raise typer.Exit(1)
+
+    # Migrate old key if needed
+    if "summary" in data and "llm" not in data:
+        data["llm"] = data.pop("summary")
+
+    llm = data.get("llm", {})
+    has_key = name in llm.get("api_keys", {})
+    has_model = name in llm.get("models", {})
+    has_url = name in llm.get("base_urls", {})
+
+    if not (has_key or has_model or has_url):
+        console.print(f"[yellow]{name}[/yellow] is not configured in {cfg_path}")
+        raise typer.Exit(1)
+
+    if not force:
+        confirmed = typer.confirm(f"Remove {name} from {cfg_path}?")
+        if not confirmed:
+            console.print("[dim]Cancelled.[/dim]")
+            raise typer.Exit(0)
+
+    if has_key:
+        del llm["api_keys"][name]
+    if has_model:
+        del llm["models"][name]
+    if has_url:
+        del llm["base_urls"][name]
+    # Reset active provider if it was this one
+    if llm.get("provider") == name:
+        llm["provider"] = "auto"
+        console.print(f"[dim]Active provider reset to 'auto'[/dim]")
+
+    cfg_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    console.print(f"[green]✓[/green] {name} removed from config.")
+
+
+@providers_app.command("activate")
+def providers_activate(
+    name: str = typer.Argument(..., help="Provider name to activate (use 'auto' to auto-detect)"),
+    path: Optional[Path] = PathArg,
+    global_: bool = typer.Option(False, "--global", "-g", help="Save to global config"),
+) -> None:
+    """Switch the active LLM provider without re-entering credentials.
+
+    The provider must already be configured (have an API key or be a local
+    provider with a base URL set). Use 'auto' to let LaravelGraph pick the
+    first available cloud provider.
+
+    Examples:
+      laravelgraph providers activate groq
+      laravelgraph providers activate openai --global
+      laravelgraph providers activate auto
+    """
+    from laravelgraph.mcp.summarize import PROVIDER_REGISTRY
+
+    name = name.strip().lower()
+    if name not in PROVIDER_REGISTRY and name != "auto":
+        known = ", ".join(PROVIDER_REGISTRY.keys())
+        console.print(f"[red]Unknown provider:[/red] {name}\nKnown providers: {known}")
+        raise typer.Exit(1)
+
+    root = _project_root(path)
+    cfg_path = _prompt_scope(root, global_)
+    _providers_write_config(cfg_path, {"provider": name})
+
+    from laravelgraph.config import global_dir
+    scope_label = "global" if cfg_path.parent == global_dir() else "project"
+    console.print(f"[green]✓[/green] Active provider set to [green]{name}[/green] ({scope_label})")
+    console.print("Run [bold]laravelgraph providers[/bold] to verify.")
+
+
+@providers_app.command("test")
+def providers_test(
+    name: str = typer.Argument("", help="Provider to test (default: currently active provider)"),
+    path: Optional[Path] = PathArg,
+) -> None:
+    """Run a live test prompt against a provider.
+
+    Tests connectivity, authentication, and response quality. If no provider
+    name is given, tests the currently active provider.
+
+    Examples:
+      laravelgraph providers test
+      laravelgraph providers test groq
+      laravelgraph providers test openai
+    """
+    import time as _time
+    from laravelgraph.config import Config
+    from laravelgraph.mcp.summarize import PROVIDER_REGISTRY, provider_status, generate_summary
+
+    root = _project_root(path)
+    cfg = Config.load(root)
+    status = provider_status(cfg.llm)
+
+    target = name.strip().lower() if name.strip() else status.get("active_provider", "")
+    if not target:
+        console.print("[yellow]No provider configured.[/yellow] Run [bold]laravelgraph providers add <name>[/bold] first.")
+        raise typer.Exit(1)
+
+    if target not in PROVIDER_REGISTRY:
+        known = ", ".join(PROVIDER_REGISTRY.keys())
+        console.print(f"[red]Unknown provider:[/red] {target}\nKnown providers: {known}")
+        raise typer.Exit(1)
+
+    # Build an LLMConfig targeting this specific provider
+    from laravelgraph.config import LLMConfig
+    test_cfg = LLMConfig(
+        enabled=True,
+        provider=target,
+        api_keys=cfg.llm.api_keys,
+        models=cfg.llm.models,
+        base_urls=cfg.llm.base_urls,
+    )
+
+    pinfo = PROVIDER_REGISTRY[target]
+    model = cfg.llm.models.get(target, "") or pinfo["default_model"]
+    console.print(f"\nTesting [bold]{pinfo['label']}[/bold] (model: [cyan]{model}[/cyan])...\n")
+
+    t0 = _time.perf_counter()
+    summary, used_provider = generate_summary(
+        fqn="App\\Http\\Controllers\\HealthController::check",
+        node_type="controller method",
+        source="public function check(): JsonResponse { return response()->json(['status' => 'ok']); }",
+        summary_cfg=test_cfg,
+    )
+    elapsed = _time.perf_counter() - t0
+
+    if summary:
+        console.print(f"[green]✓[/green] Live test passed [dim]({elapsed:.2f}s)[/dim]")
+        console.print(f"\n  [dim italic]\"{summary}\"[/dim italic]\n")
+    else:
+        console.print(f"[red]✗[/red] Live test failed — no response from {target}")
+        console.print("[dim]Check your model name, API key, and network connection.[/dim]")
+        console.print(f"[dim]To reconfigure: laravelgraph providers add {target}[/dim]")
+        raise typer.Exit(1)
+
+
+# ── configure (hidden backward-compat alias) ──────────────────────────────────
+
+@app.command(rich_help_panel="4. Server & Agent Integration", hidden=True)
+def configure(
+    path: Optional[Path] = PathArg,
+    global_: bool = typer.Option(False, "--global", "-g", help="Save to global config"),
+    activate: str = typer.Option("", "--activate", "-a", help="Activate a provider by name"),
+) -> None:
+    """[Deprecated] Use `laravelgraph providers` sub-commands instead."""
+    console.print(
+        "[dim][yellow]Note:[/yellow] `configure` is deprecated — "
+        "use [bold]laravelgraph providers add <name>[/bold] instead.[/dim]\n"
+    )
+    if activate:
+        providers_activate(name=activate, path=path, global_=global_)
+    else:
+        # Show provider list and let user pick (interactive — mirrors old wizard entry)
+        from laravelgraph.config import Config
+        from laravelgraph.mcp.summarize import PROVIDER_REGISTRY, provider_status
+        root = _project_root(path)
+        cfg = Config.load(root)
+        status = provider_status(cfg.llm)
+        current_active = status.get("active_provider")
+        configured_names = {n for n, info in status["providers"].items() if info.get("configured")}
+
+        cloud_providers = [(n, v) for n, v in PROVIDER_REGISTRY.items() if not v.get("local")]
+        local_providers = [(n, v) for n, v in PROVIDER_REGISTRY.items() if v.get("local")]
+        all_providers = cloud_providers + local_providers
+
+        console.print("\n[bold]Cloud providers:[/bold]\n")
+        for i, (pname, info) in enumerate(cloud_providers, start=1):
+            active_marker = " [green]← active[/green]" if pname == current_active else ""
+            configured_marker = " [dim]✓ configured[/dim]" if pname in configured_names else ""
+            console.print(f"  [cyan]{i:2}[/cyan]  {info['label']}{configured_marker}{active_marker}")
+        console.print("\n[bold]Local providers:[/bold]\n")
+        for i, (pname, info) in enumerate(local_providers, start=len(cloud_providers) + 1):
+            active_marker = " [green]← active[/green]" if pname == current_active else ""
+            configured_marker = " [dim]✓ configured[/dim]" if pname in configured_names else ""
+            console.print(f"  [cyan]{i:2}[/cyan]  {info['label']}{configured_marker}{active_marker}")
+        console.print(f"\n  [cyan] 0[/cyan]  Disable summaries\n")
+
+        choice_str = typer.prompt("Select provider number", default="1")
+        if choice_str == "0":
+            cfg_path = _prompt_scope(root, global_)
+            _providers_write_config(cfg_path, {"enabled": False})
+            console.print("[yellow]Summaries disabled.[/yellow]")
+            return
+        try:
+            idx = int(choice_str) - 1
+            provider_name, _ = all_providers[idx]
+        except (ValueError, IndexError):
+            console.print(f"[red]Invalid choice:[/red] {choice_str}")
+            raise typer.Exit(1)
+        providers_add(name=provider_name, path=path, global_=global_)
 
 
 # ── setup ─────────────────────────────────────────────────────────────────────
@@ -1778,6 +2137,710 @@ db_app = typer.Typer(
     rich_markup_mode="rich",
 )
 app.add_typer(db_app, name="db-connections", rich_help_panel="1. Setup & Indexing")
+
+
+# ── plugin ─────────────────────────────────────────────────────────────────────
+
+plugin_app = typer.Typer(
+    name="plugin",
+    help="Manage project-specific analysis plugins.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(plugin_app, name="plugin", rich_help_panel="5. Utilities")
+
+
+# ── logs ───────────────────────────────────────────────────────────────────────
+
+logs_app = typer.Typer(
+    help="View and manage LaravelGraph logs.",
+    no_args_is_help=False,
+    rich_markup_mode="rich",
+)
+app.add_typer(logs_app, name="logs", rich_help_panel="5. Utilities")
+
+
+def _parse_since(since: str) -> float:
+    """Parse a 'since' string like '2h', '1d', '30m' into hours as a float."""
+    since = since.strip().lower()
+    if not since:
+        return 0.0
+    if since.endswith("h"):
+        return float(since[:-1])
+    if since.endswith("d"):
+        return float(since[:-1]) * 24.0
+    if since.endswith("m"):
+        return float(since[:-1]) / 60.0
+    return 0.0
+
+
+@logs_app.command(name="show")
+def logs_show(
+    limit: int = typer.Option(50, "--limit", "-n", help="Number of entries to show"),
+    level: str = typer.Option("", "--level", "-l", help="Filter by level: debug|info|warning|error"),
+    tool: str = typer.Option("", "--tool", "-t", help="Filter by MCP tool name (partial match)"),
+    plugin: str = typer.Option("", "--plugin", "-p", help="Filter by plugin name (partial match)"),
+    since: str = typer.Option("", "--since", "-s", help="Show logs from last N hours/days (e.g. '2h', '1d', '30m')"),
+    search: str = typer.Option("", "--search", help="Search text in any field"),
+) -> None:
+    """Show recent log entries with optional filters."""
+    from laravelgraph.logging_manager import LogManager
+
+    log_dir = Path.home() / ".laravelgraph" / "logs"
+    mgr = LogManager(log_dir)
+
+    since_hours = _parse_since(since)
+    entries = mgr.get_recent(
+        limit=limit,
+        level=level,
+        tool=tool,
+        plugin=plugin,
+        since_hours=since_hours,
+        search=search,
+    )
+
+    if not entries:
+        console.print("[yellow]No log entries found.[/yellow]")
+        return
+
+    LEVEL_STYLES = {
+        "error": "red",
+        "warning": "yellow",
+        "info": "cyan",
+        "debug": "dim",
+    }
+
+    table = Table(
+        title=f"Logs ({len(entries)} entries)",
+        show_header=True,
+        header_style="bold cyan",
+        show_lines=False,
+        pad_edge=False,
+    )
+    table.add_column("Time", style="dim", width=8, no_wrap=True)
+    table.add_column("Level", width=8, no_wrap=True)
+    table.add_column("Message", no_wrap=False)
+    table.add_column("Details", style="dim", no_wrap=False)
+
+    for entry in entries:
+        ts = entry.get("timestamp") or entry.get("ts") or entry.get("time") or ""
+        if ts and len(str(ts)) >= 19:
+            ts = str(ts)[11:19]  # Extract HH:MM:SS
+        elif ts:
+            ts = str(ts)[:8]
+
+        lvl = str(entry.get("level", "info")).lower()
+        lvl_style = LEVEL_STYLES.get(lvl, "")
+        lvl_cell = f"[{lvl_style}]{lvl}[/{lvl_style}]" if lvl_style else lvl
+
+        msg = str(entry.get("message") or entry.get("msg") or entry.get("event") or "")
+
+        # Build details from remaining keys
+        skip_keys = {"timestamp", "ts", "time", "level", "message", "msg", "event", "logger"}
+        detail_parts = []
+        for k, v in entry.items():
+            if k not in skip_keys and v is not None and v != "":
+                detail_parts.append(f"{k}={v!r}"[:40])
+        details = "  ".join(detail_parts[:4])
+
+        table.add_row(ts, lvl_cell, msg[:80], details[:80])
+
+    console.print(table)
+
+
+@logs_app.command()
+def tail(
+    level: str = typer.Option("", "--level", "-l", help="Filter by level"),
+    tool: str = typer.Option("", "--tool", "-t", help="Filter by MCP tool name (partial match)"),
+    plugin: str = typer.Option("", "--plugin", "-p", help="Filter by plugin name (partial match)"),
+) -> None:
+    """Live tail log output (Ctrl+C to stop)."""
+    from laravelgraph.logging_manager import LogManager, format_log_entry
+
+    log_dir = Path.home() / ".laravelgraph" / "logs"
+    mgr = LogManager(log_dir)
+
+    console.print(f"[dim]Tailing logs from {log_dir} — Ctrl+C to stop[/dim]")
+
+    def _print_entry(entry: dict) -> None:
+        line = format_log_entry(entry, color=True)
+        console.print(line)
+
+    mgr.tail(callback=_print_entry, level=level, tool=tool, plugin=plugin)
+
+
+@logs_app.command()
+def logs_stats() -> None:
+    """Show log statistics: entry counts by level and tool, disk usage."""
+    from laravelgraph.logging_manager import LogManager
+
+    log_dir = Path.home() / ".laravelgraph" / "logs"
+    mgr = LogManager(log_dir)
+
+    stats = mgr.get_stats()
+
+    # Level counts table
+    level_table = Table(title="Log Entries by Level", show_header=True, header_style="bold cyan")
+    level_table.add_column("Level")
+    level_table.add_column("Count", justify="right")
+    LEVEL_STYLES = {"error": "red", "warning": "yellow", "info": "cyan", "debug": "dim"}
+    for lvl, count in sorted(stats.get("by_level", {}).items(), key=lambda x: -x[1]):
+        style = LEVEL_STYLES.get(lvl, "")
+        lvl_cell = f"[{style}]{lvl}[/{style}]" if style else lvl
+        level_table.add_row(lvl_cell, str(count))
+    console.print(level_table)
+    console.print()
+
+    # Top tools table
+    tool_table = Table(title="Top Tools by Call Count", show_header=True, header_style="bold cyan")
+    tool_table.add_column("Tool")
+    tool_table.add_column("Calls", justify="right")
+    for tool_name, count in list(stats.get("by_tool", {}).items())[:10]:
+        tool_table.add_row(tool_name, str(count))
+    console.print(tool_table)
+    console.print()
+
+    # Summary
+    console.print(
+        f"[bold]Total entries:[/bold] {stats.get('total_entries', 0)}  "
+        f"[bold]Files:[/bold] {stats.get('file_count', 0)}  "
+        f"[bold]Disk:[/bold] {stats.get('disk_size_mb', 0)} MB"
+    )
+    if stats.get("oldest_entry"):
+        console.print(f"[dim]Oldest: {stats['oldest_entry']}  Newest: {stats.get('newest_entry', '')}[/dim]")
+
+
+@logs_app.command()
+def logs_clear(
+    all_logs: bool = typer.Option(False, "--all", help="Clear ALL logs, not just old ones"),
+    days: int = typer.Option(30, "--days", help="Clear logs older than N days (default: 30)"),
+) -> None:
+    """Clear old log files."""
+    from laravelgraph.logging_manager import LogManager
+
+    log_dir = Path.home() / ".laravelgraph" / "logs"
+    mgr = LogManager(log_dir)
+
+    if all_logs:
+        confirmed = typer.confirm("This will delete ALL log files. Are you sure?", default=False)
+        if not confirmed:
+            console.print("[yellow]Cancelled.[/yellow]")
+            raise typer.Exit(0)
+        deleted = mgr.clear_all()
+        console.print(f"[green]Cleared {deleted} log file(s).[/green]")
+    else:
+        deleted = mgr.clear_old(days=days)
+        console.print(f"[green]Cleared {deleted} log file(s) older than {days} days.[/green]")
+
+
+@plugin_app.command(name="list")
+def plugin_list(path: Optional[Path] = PathArg) -> None:
+    """List all plugins in this project, their status, and registered tools."""
+    root = _project_root(path)
+    plugins_dir = root / ".laravelgraph" / "plugins"
+
+    if not plugins_dir.exists() or not list(plugins_dir.glob("*.py")):
+        console.print("[yellow]No plugins installed.[/yellow]")
+        console.print("Run [bold]laravelgraph plugin suggest[/bold] to see recommendations.")
+        return
+
+    from laravelgraph.config import index_dir as _index_dir
+    from laravelgraph.plugins.meta import PluginMetaStore
+    from laravelgraph.plugins.validator import PluginValidationError, PluginValidator
+
+    validator = PluginValidator()
+    meta_store = PluginMetaStore(_index_dir(root))
+    plugin_files = sorted(plugins_dir.glob("*.py"))
+
+    # Compute total calls across all plugins for relative contribution scoring
+    all_meta = meta_store.all()
+    total_calls = max(sum(m.call_count for m in all_meta), 1)
+
+    table = Table(title=f"Plugins — {root}", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Version")
+    table.add_column("Status")
+    table.add_column("Calls")
+    table.add_column("Contribution")
+    table.add_column("Health")
+    table.add_column("Last Used")
+    table.add_column("Notes")
+
+    for pf in plugin_files:
+        try:
+            manifest, warnings = validator.validate(pf)
+            name = manifest.get("name", pf.stem)
+            version = manifest.get("version", "?")
+        except PluginValidationError as exc:
+            name = pf.stem
+            version = "?"
+            warnings = exc.errors
+
+        meta = meta_store.get(name)
+        meta_status = meta.status if meta else "unknown"
+
+        # Status column
+        if meta_status == "disabled":
+            status_cell = "[dim]disabled ✗[/dim]"
+        else:
+            valid_icon = "[green]active ✓[/green]"
+            status_cell = valid_icon
+
+        # Call count
+        call_count = meta.call_count if meta else 0
+        calls_cell = str(call_count)
+
+        # Contribution score — bar
+        score = meta.contribution_score if meta else 0.0
+        rel_pct = min(100.0, (call_count / total_calls) * 100.0)
+        if rel_pct >= 50:
+            bar_color = "green"
+        elif rel_pct >= 20:
+            bar_color = "yellow"
+        else:
+            bar_color = "red"
+        bar_filled = int(rel_pct / 10)
+        bar = f"[{bar_color}]{'█' * bar_filled}{'░' * (10 - bar_filled)}[/{bar_color}] {rel_pct:.0f}%"
+
+        # Health indicator
+        if meta and meta.call_count > 20:
+            error_rate = meta.error_count / meta.call_count if meta.call_count > 0 else 0.0
+            empty_rate = meta.empty_result_count / meta.call_count if meta.call_count > 0 else 0.0
+            if error_rate > 0.15 or empty_rate > 0.25:
+                health = "🔴 needs improvement"
+            elif error_rate > 0.05 or empty_rate > 0.10:
+                health = "🟡 underperforming"
+            else:
+                health = "🟢 healthy"
+        elif meta and meta.call_count > 0:
+            health = "🟢 healthy"
+        else:
+            health = "[dim]no data[/dim]"
+
+        # Last used
+        last_used = ""
+        if meta and meta.last_used:
+            last_used = str(meta.last_used)[:10]
+
+        # Notes: system prompt indicator + warnings
+        notes_parts = []
+        if meta and meta.system_prompt:
+            notes_parts.append("📝 prompt")
+        if warnings:
+            notes_parts.append(f"[yellow]{len(warnings)} warn[/yellow]")
+
+        table.add_row(
+            name,
+            version,
+            status_cell,
+            calls_cell,
+            bar,
+            health,
+            last_used,
+            "  ".join(notes_parts),
+        )
+
+    console.print(table)
+
+
+@plugin_app.command()
+def validate(
+    plugin_file: Path = typer.Argument(..., help="Path to plugin .py file to validate"),
+) -> None:
+    """Validate a plugin file against all governance rules before deploying it."""
+    from laravelgraph.plugins.validator import PluginValidationError, PluginValidator
+
+    if not plugin_file.exists():
+        console.print(f"[red]File not found:[/red] {plugin_file}")
+        raise typer.Exit(1)
+
+    console.print(Panel(
+        f"[bold]Validating:[/bold] {plugin_file}",
+        title="Plugin Validation",
+        border_style="cyan",
+    ))
+
+    validator = PluginValidator()
+    try:
+        manifest, warnings = validator.validate(plugin_file)
+        console.print(f"  [green]✓[/green]  PLUGIN_MANIFEST found")
+        for field in ("name", "version", "tool_prefix"):
+            val = manifest.get(field, "")
+            console.print(f"  [green]✓[/green]  {field}: [bold]{val}[/bold]")
+        console.print(f"  [green]✓[/green]  Forbidden patterns: none")
+        console.print(f"  [green]✓[/green]  Tool prefix compliance: OK")
+        if warnings:
+            console.print()
+            for w in warnings:
+                console.print(f"  [yellow]![/yellow]  {w}")
+        console.print()
+        console.print(Panel(
+            f"[green]Plugin is valid[/green]  ({len(warnings)} warning(s))",
+            border_style="green",
+        ))
+    except PluginValidationError as exc:
+        for err in exc.errors:
+            console.print(f"  [red]✗[/red]  {err}")
+        for w in exc.warnings:
+            console.print(f"  [yellow]![/yellow]  {w}")
+        console.print()
+        console.print(Panel(
+            f"[red]{len(exc.errors)} error(s)[/red] — fix the issues above before deploying.",
+            border_style="red",
+        ))
+        raise typer.Exit(1)
+
+
+@plugin_app.command()
+def scaffold(
+    name: str = typer.Argument(..., help="Plugin name (alphanumeric + hyphens, e.g. 'payment-audit')"),
+    recipe: str = typer.Option("", "--recipe", "-r", help="Base on a detected recipe (use 'plugin suggest' to see options)"),
+    path: Optional[Path] = PathArg,
+) -> None:
+    """Generate a pre-populated plugin file from your project's graph data."""
+    root = _project_root(path)
+
+    from laravelgraph.config import Config, index_dir as _index_dir
+    from laravelgraph.core.graph import GraphDB
+    from laravelgraph.plugins.scaffolder import scaffold_plugin
+
+    db_path = _index_dir(root) / "graph.kuzu"
+    if not db_path.exists():
+        console.print(f"[red]No index found.[/red] Run: laravelgraph analyze {root}")
+        raise typer.Exit(1)
+
+    try:
+        db = GraphDB(db_path)
+    except Exception as e:
+        console.print(f"[red]Could not open graph:[/red] {e}")
+        raise typer.Exit(1)
+
+    recipe_slug = recipe.strip() or None
+
+    try:
+        output_path = scaffold_plugin(name, recipe_slug, root, db)
+    except FileExistsError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Scaffold failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(Panel(
+        f"[green]Plugin scaffolded successfully![/green]\n\n"
+        f"[bold]File:[/bold] {output_path}\n\n"
+        f"[bold]Next steps:[/bold]\n"
+        f"  1. Edit [cyan]{output_path.name}[/cyan] and implement run() + register_tools()\n"
+        f"  2. Run [bold]laravelgraph plugin validate {output_path}[/bold] to check for issues\n"
+        f"  3. Run [bold]laravelgraph analyze[/bold] to execute the plugin in the pipeline\n"
+        f"  4. Restart the MCP server to register the new tools",
+        title="Plugin Created",
+        border_style="green",
+    ))
+
+
+@plugin_app.command()
+def suggest(path: Optional[Path] = PathArg) -> None:
+    """Analyze the graph and recommend which plugins would add the most value for this project."""
+    root = _project_root(path)
+
+    from laravelgraph.config import index_dir as _index_dir
+    from laravelgraph.core.graph import GraphDB
+    from laravelgraph.plugins.suggest import detect_applicable_recipes, format_suggestions
+
+    db_path = _index_dir(root) / "graph.kuzu"
+    if not db_path.exists():
+        console.print(f"[red]No index found.[/red] Run: laravelgraph analyze {root}")
+        raise typer.Exit(1)
+
+    try:
+        db = GraphDB(db_path)
+    except Exception as e:
+        console.print(f"[red]Could not open graph:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(Panel(
+        f"[bold]Project:[/bold] {root}",
+        title="Plugin Suggestions",
+        border_style="cyan",
+    ))
+    console.print("[dim]Scanning graph for domain patterns...[/dim]\n")
+
+    results = detect_applicable_recipes(db)
+
+    if not results:
+        console.print("[yellow]No plugins match this project's domain patterns.[/yellow]")
+        console.print(
+            "\nThe suggestion engine looks for signals like payment models, tenant columns,\n"
+            "booking tables, etc. If your project has these features, ensure the database\n"
+            "columns and tables are indexed:\n"
+            "  [bold]laravelgraph analyze --phases 24,25,26[/bold]"
+        )
+        return
+
+    for i, result in enumerate(results, 1):
+        from laravelgraph.plugins.suggest import PluginRecipe
+        r: PluginRecipe = result["recipe"]
+        matched = result["signals_matched"]
+        total = result["total_signals"]
+        evidence = result["evidence"]
+
+        console.print(f"[bold cyan]{i}. {r.title}[/bold cyan]")
+        console.print(f"   [dim]Signals matched: {matched}/{total}[/dim]")
+        console.print(f"   {r.description}")
+        if evidence:
+            console.print("   [dim]Evidence:[/dim]")
+            for ev in evidence[:3]:
+                console.print(f"     [dim]· {ev}[/dim]")
+        console.print(
+            f"   [bold]Scaffold command:[/bold] "
+            f"laravelgraph plugin scaffold {r.name} --recipe {r.slug}"
+        )
+        console.print()
+
+
+@plugin_app.command()
+def enable(
+    name: str = typer.Argument(..., help="Plugin name"),
+    path: Optional[Path] = PathArg,
+) -> None:
+    """Enable a disabled plugin."""
+    root = _project_root(path)
+    from laravelgraph.config import index_dir as _index_dir
+    from laravelgraph.plugins.meta import PluginMeta, PluginMetaStore
+
+    meta_store = PluginMetaStore(_index_dir(root))
+    meta = meta_store.get(name)
+    if meta is None:
+        # Create entry if missing
+        from datetime import datetime, timezone
+        meta = PluginMeta(name=name, status="active", created_at=datetime.now(timezone.utc).isoformat())
+        meta_store.set(meta)
+    else:
+        meta_store.enable(name)
+    console.print(f"[green]Plugin '{name}' enabled.[/green]")
+
+
+@plugin_app.command()
+def disable(
+    name: str = typer.Argument(..., help="Plugin name"),
+    path: Optional[Path] = PathArg,
+) -> None:
+    """Disable a plugin without deleting it."""
+    root = _project_root(path)
+    from laravelgraph.config import index_dir as _index_dir
+    from laravelgraph.plugins.meta import PluginMeta, PluginMetaStore
+
+    meta_store = PluginMetaStore(_index_dir(root))
+    meta = meta_store.get(name)
+    if meta is None:
+        from datetime import datetime, timezone
+        meta = PluginMeta(name=name, status="disabled", created_at=datetime.now(timezone.utc).isoformat())
+        meta_store.set(meta)
+    else:
+        meta_store.disable(name)
+    console.print(f"[yellow]Plugin '{name}' disabled.[/yellow]")
+    console.print("[dim]Re-enable with: laravelgraph plugin enable {name}[/dim]")
+
+
+@plugin_app.command()
+def delete(
+    name: str = typer.Argument(..., help="Plugin name"),
+    path: Optional[Path] = PathArg,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Permanently delete a plugin and all its graph data."""
+    root = _project_root(path)
+    from laravelgraph.config import index_dir as _index_dir
+    from laravelgraph.plugins.meta import PluginMetaStore
+    from laravelgraph.plugins.plugin_graph import init_plugin_graph
+
+    if not yes:
+        confirmed = typer.confirm(
+            f"Permanently delete plugin '{name}' and all its graph data?",
+            default=False,
+        )
+        if not confirmed:
+            console.print("[yellow]Cancelled.[/yellow]")
+            raise typer.Exit(0)
+
+    plugins_dir = root / ".laravelgraph" / "plugins"
+    plugin_path = plugins_dir / f"{name}.py"
+
+    removed_file = False
+    if plugin_path.exists():
+        plugin_path.unlink()
+        removed_file = True
+
+    # Remove from plugin graph
+    try:
+        plugin_db = init_plugin_graph(_index_dir(root))
+        deleted_nodes = plugin_db.delete_plugin_data(name)
+        plugin_db.close()
+    except Exception as exc:
+        deleted_nodes = 0
+        console.print(f"[yellow]Warning: could not clean plugin graph:[/yellow] {exc}")
+
+    # Remove meta
+    meta_store = PluginMetaStore(_index_dir(root))
+    meta_store.delete(name)
+
+    if removed_file:
+        console.print(f"[green]Plugin '{name}' deleted.[/green]")
+        if deleted_nodes:
+            console.print(f"[dim]Removed {deleted_nodes} plugin graph node(s).[/dim]")
+    else:
+        console.print(f"[yellow]Plugin file '{name}.py' not found — metadata cleared.[/yellow]")
+
+
+@plugin_app.command()
+def prompt(
+    name: str = typer.Argument(..., help="Plugin name"),
+    text: str = typer.Argument(..., help="System prompt text to attach to this plugin"),
+    path: Optional[Path] = PathArg,
+) -> None:
+    """Attach a system prompt to a plugin (shown to agents automatically)."""
+    root = _project_root(path)
+    from laravelgraph.config import index_dir as _index_dir
+    from laravelgraph.plugins.meta import PluginMeta, PluginMetaStore
+
+    meta_store = PluginMetaStore(_index_dir(root))
+    meta = meta_store.get(name)
+    if meta is None:
+        from datetime import datetime, timezone
+        meta = PluginMeta(name=name, status="active", created_at=datetime.now(timezone.utc).isoformat())
+    meta.system_prompt = text
+    meta_store.set(meta)
+    console.print(f"[green]System prompt attached to plugin '{name}'.[/green]")
+    console.print(f"[dim]Prompt:[/dim] {text[:80]}{'...' if len(text) > 80 else ''}")
+    console.print("[dim]The prompt will be loaded by the MCP server on next startup.[/dim]")
+
+
+@plugin_app.command()
+def evolve(
+    path: Optional[Path] = PathArg,
+    max_generate: int = typer.Option(3, "--max-generate", "-n", help="Max plugins to generate per run"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be generated without generating"),
+) -> None:
+    """Evolve the plugin library: detect gaps and regenerate stale plugins.
+
+    Combines three signals to find the highest-value domains to generate:
+
+    \b
+    1. Built-in recipes (payment, tenancy, bookings, etc.)
+    2. Feature node gaps — phase-27 clusters with no plugin yet
+    3. Drift detection — existing plugins whose domain has changed
+
+    Use in CI/cron to keep plugin knowledge up to date automatically:
+
+    \b
+      laravelgraph plugin evolve . --max-generate 2
+    """
+    from datetime import datetime, timezone
+
+    root = _project_root(path)
+    from laravelgraph.config import Config, index_dir as _index_dir
+    from laravelgraph.core.graph import GraphDB
+    from laravelgraph.plugins.meta import PluginMetaStore
+    from laravelgraph.plugins.self_improve import (
+        auto_generate_suggested,
+        check_domain_drift,
+        take_domain_snapshot,
+    )
+
+    _index = _index_dir(root)
+    db_path = _index / "graph.kuzu"
+    if not db_path.exists():
+        console.print("[red]No graph index found. Run `laravelgraph analyze` first.[/red]")
+        raise typer.Exit(1)
+
+    cfg = Config.load(root)
+    db = GraphDB(db_path, force_reinit=False)
+    meta_store = PluginMetaStore(_index)
+    plugins_dir = root / ".laravelgraph" / "plugins"
+
+    console.print(f"[bold]Plugin Evolution[/bold]  ({root.name})")
+    console.print(f"[dim]Plugins dir:[/dim] {plugins_dir}")
+    console.print()
+
+    # ── Stage 1: drift detection ───────────────────────────────────────────────
+    drifted: list[str] = []
+    all_metas = meta_store.all()
+    if all_metas:
+        console.print("[bold]Checking existing plugins for drift...[/bold]")
+        for meta in all_metas:
+            if meta.status != "active":
+                continue
+            try:
+                if check_domain_drift(db, meta):
+                    drifted.append(meta.name)
+                    status_tag = "[yellow]drifted[/yellow]"
+                else:
+                    status_tag = "[green]current[/green]"
+            except Exception:
+                status_tag = "[dim]unknown[/dim]"
+            console.print(f"  {meta.name}: {status_tag}")
+        console.print()
+
+    # ── Stage 2: gap detection ─────────────────────────────────────────────────
+    from laravelgraph.plugins.suggest import detect_feature_gaps
+    gaps = detect_feature_gaps(db, meta_store, plugins_dir)
+
+    if gaps:
+        console.print("[bold]Feature gaps detected (domains with no plugin):[/bold]")
+        for gap in gaps[:10]:
+            console.print(
+                f"  [cyan]{gap['slug']}[/cyan]  "
+                f"score={gap['score']:.1f}  symbols={gap['symbol_count']}"
+            )
+        if len(gaps) > 10:
+            console.print(f"  [dim]...and {len(gaps) - 10} more[/dim]")
+        console.print()
+
+    if drifted:
+        console.print(f"[yellow]Drifted plugins:[/yellow] {', '.join(drifted)}")
+        console.print()
+
+    if not gaps and not drifted:
+        console.print("[green]All plugins are current and no gaps detected.[/green]")
+        return
+
+    if dry_run:
+        console.print("[dim]--dry-run: no plugins will be generated.[/dim]")
+        console.print(f"Would generate up to [bold]{max_generate}[/bold] plugin(s) "
+                      f"({len(gaps)} gaps, {len(drifted)} drifted).")
+        return
+
+    # ── Stage 3: generate ──────────────────────────────────────────────────────
+    console.print(f"[bold]Generating up to {max_generate} plugin(s)...[/bold]")
+    results = auto_generate_suggested(
+        plugins_dir=plugins_dir,
+        meta_store=meta_store,
+        project_root=root,
+        core_db=db,
+        cfg=cfg,
+        max_per_run=max_generate,
+    )
+
+    generated = [r for r in results if r[1]]
+    failed = [r for r in results if not r[1]]
+
+    console.print()
+    if generated:
+        console.print(f"[green]Generated {len(generated)} plugin(s):[/green]")
+        for name, _, msg in generated:
+            console.print(f"  [green]✓[/green] {name}  ({msg})")
+    if failed:
+        console.print(f"[yellow]Failed {len(failed)} plugin(s):[/yellow]")
+        for name, _, msg in failed:
+            console.print(f"  [yellow]✗[/yellow] {name}  ({msg})")
+    if not results:
+        console.print("[dim]No plugins generated (all in cooldown or no LLM configured).[/dim]")
+
+    if generated:
+        console.print()
+        console.print("[dim]Run `laravelgraph plugin list .` to see the updated plugin library.[/dim]")
+        console.print("[dim]Run `pipx reinstall laravelgraph` to activate new plugins in the MCP server.[/dim]")
 
 
 def _load_db_config(root: Path) -> tuple[dict, Path]:
@@ -2434,6 +3497,7 @@ def doctor(path: Optional[Path] = PathArg) -> None:
       9. Optional Features   — watchfiles (watch mode), fastembed (vector search)
      10. Database Connections — PyMySQL, configured connections, connectivity tests,
                                phases 19/24/25/26 health, query cache stats
+     11. Plugins             — validate installed plugins, check manifests and tool prefixes
 
     Common failure patterns:
       Events: 0    → run: laravelgraph analyze --full  (events missing = stale index)
@@ -2844,10 +3908,10 @@ def doctor(path: Optional[Path] = PathArg) -> None:
     # ── 8. LLM Provider ───────────────────────────────────────────────────────
     section("LLM Provider")
     from laravelgraph.mcp.summarize import provider_status, generate_summary
-    status = provider_status(cfg.summary)
+    status = provider_status(cfg.llm)
     active = status["active_provider"]
 
-    if not cfg.summary.enabled:
+    if not cfg.llm.enabled:
         warn("Summaries disabled in config")
     elif not active:
         warn("No provider configured — run: laravelgraph configure")
@@ -2885,7 +3949,7 @@ def doctor(path: Optional[Path] = PathArg) -> None:
                 fqn="App\\Http\\Controllers\\HealthController::check",
                 node_type="controller method",
                 source="public function check(): JsonResponse { return response()->json(['status' => 'ok']); }",
-                summary_cfg=cfg.summary,
+                summary_cfg=cfg.llm,
             )
             elapsed = time.perf_counter() - t0
 
@@ -3177,6 +4241,229 @@ def doctor(path: Optional[Path] = PathArg) -> None:
 
     except Exception as _e:
         warn(f"Tool signature check skipped: {_e}")
+
+    # ── 11. Plugins ───────────────────────────────────────────────────────────
+    section("Plugins")
+    _plugins_dir = root / ".laravelgraph" / "plugins"
+    if not _plugins_dir.exists() or not list(_plugins_dir.glob("*.py")):
+        warn("No plugins installed — run: laravelgraph plugin suggest")
+    else:
+        from laravelgraph.plugins.validator import PluginValidationError, validate_plugin
+        _plugin_files = sorted(_plugins_dir.glob("*.py"))
+        for _pf in _plugin_files:
+            try:
+                _manifest, _warnings = validate_plugin(_pf)
+                if _warnings:
+                    warn(f"Plugin '{_manifest['name']}' v{_manifest['version']} — {len(_warnings)} warning(s): {_warnings[0]}")
+                else:
+                    ok(f"Plugin '{_manifest['name']}' v{_manifest['version']} — valid")
+            except PluginValidationError as _pve:
+                fail(f"Plugin '{_pf.name}' — INVALID: {_pve.errors[0] if _pve.errors else str(_pve)}")
+
+    # ── 11b. Plugin System Infrastructure ─────────────────────────────────────
+    section("Plugin System")
+
+    # 1. Core imports
+    try:
+        from laravelgraph.plugins.plugin_graph import init_plugin_graph, DualDB
+        ok("plugin_graph module — importable")
+    except Exception as _e:
+        fail(f"plugin_graph module — import failed: {_e}")
+
+    try:
+        from laravelgraph.plugins.meta import PluginMetaStore, PluginMeta
+        ok("plugin meta module — importable")
+    except Exception as _e:
+        fail(f"plugin meta module — import failed: {_e}")
+
+    try:
+        from laravelgraph.plugins.generator import generate_plugin, _validate_schema, _validate_execution, ValidationResult
+        ok("plugin generator module — importable")
+    except Exception as _e:
+        fail(f"plugin generator module — import failed: {_e}")
+
+    try:
+        from laravelgraph.plugins.self_improve import check_and_improve, run_improvement_check_all
+        ok("plugin self_improve module — importable")
+    except Exception as _e:
+        fail(f"plugin self_improve module — import failed: {_e}")
+
+    try:
+        from laravelgraph.logging_manager import LogManager
+        ok("logging_manager module — importable")
+    except Exception as _e:
+        fail(f"logging_manager module — import failed: {_e}")
+
+    # 2. Plugin graph init (smoke test with temp dir)
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            from pathlib import Path as _Path
+            _pdb = init_plugin_graph(_Path(_tmpdir))
+            _pdb.execute("MATCH (n:PluginNode) RETURN n.node_id LIMIT 1")
+            _pdb.close()
+        ok("plugin_graph init + schema + query — working")
+    except Exception as _e:
+        fail(f"plugin_graph smoke test — {_e}")
+
+    # 3. PluginMetaStore smoke test
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            from pathlib import Path as _Path
+            _ms = PluginMetaStore(_Path(_tmpdir))
+            _ms.set(PluginMeta(name="doctor-test", status="active"))
+            _ms.log_call("doctor-test", empty=False, error=False)
+            _retrieved = _ms.get("doctor-test")
+            assert _retrieved is not None and _retrieved.call_count == 1
+            _ms.delete("doctor-test")
+            assert _ms.get("doctor-test") is None
+        ok("PluginMetaStore — set / log_call / get / delete working")
+    except Exception as _e:
+        fail(f"PluginMetaStore smoke test — {_e}")
+
+    # 4. DualDB backwards-compat smoke test
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            from pathlib import Path as _Path
+            _pdb2 = init_plugin_graph(_Path(_tmpdir))
+            _calls = []
+            def _mock_core(): _calls.append(1); return _pdb2
+            _dual = DualDB(_mock_core, _pdb2)
+            assert _dual() is _dual, "DualDB() should return self"
+            assert _dual.plugin() is _pdb2, "DualDB.plugin() should return plugin db"
+            _pdb2.close()
+        ok("DualDB — callable + .plugin() + backwards-compat working")
+    except Exception as _e:
+        fail(f"DualDB smoke test — {_e}")
+
+    # 5. Validation layer smoke tests
+    try:
+        from laravelgraph.plugins.generator import _validate_schema, _validate_execution
+        _good_code = '''
+PLUGIN_MANIFEST = {"name": "doctor-test", "version": "1.0.0", "description": "test", "tool_prefix": "doctest_"}
+def register_tools(mcp, db=None):
+    @mcp.tool()
+    def doctest_query() -> str:
+        return "result"
+'''
+        _l2 = _validate_schema(_good_code)
+        assert _l2.passed, f"Schema validation failed: {_l2.critique}"
+        _l3 = _validate_execution(_good_code, None)
+        assert _l3.passed, f"Execution validation failed: {_l3.critique}"
+        ok("Validation layers 2 (schema) + 3 (execution) — working")
+    except Exception as _e:
+        fail(f"Validation layer smoke test — {_e}")
+
+    # 6. LogManager smoke test
+    try:
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            from pathlib import Path as _Path
+            _lp = _Path(_tmpdir) / "test.log"
+            _lp.write_text(_json.dumps({"level": "info", "event": "doctor test", "tool": "laravelgraph_routes"}) + "\n")
+            _lm = LogManager(_Path(_tmpdir))
+            _entries = _lm.get_recent(limit=10)
+            assert len(_entries) == 1 and _entries[0]["level"] == "info"
+            _stats = _lm.get_stats()
+            assert _stats["total_entries"] == 1
+        ok("LogManager — read / filter / stats working")
+    except Exception as _e:
+        fail(f"LogManager smoke test — {_e}")
+
+    # 7. Check new MCP tools are registered
+    try:
+        from laravelgraph.mcp.server import create_server
+        import inspect
+        _src = inspect.getsource(create_server)
+        _required_tools = ["laravelgraph_request_plugin", "laravelgraph_update_plugin", "laravelgraph_remove_plugin"]
+        _missing = [t for t in _required_tools if t not in _src]
+        if _missing:
+            fail(f"MCP auto-generation tools missing: {', '.join(_missing)}")
+        else:
+            ok(f"MCP auto-generation tools registered — request_plugin, update_plugin, remove_plugin")
+    except Exception as _e:
+        fail(f"MCP tool check — {_e}")
+
+    # 8. Improvement threshold logic
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            from pathlib import Path as _Path
+            _ms2 = PluginMetaStore(_Path(_tmpdir))
+            _ms2.set(PluginMeta(name="underperformer", call_count=25, empty_result_count=8, status="active"))
+            assert _ms2.check_improvement_needed("underperformer") is True
+            _ms2.set(PluginMeta(name="healthy", call_count=25, empty_result_count=1, status="active"))
+            assert _ms2.check_improvement_needed("healthy") is False
+        ok("Self-improvement threshold detection — working (25 calls / 8 empty → triggers)")
+    except Exception as _e:
+        fail(f"Improvement threshold smoke test — {_e}")
+
+    # ── 11c. Plugin Generator live test ───────────────────────────────────────
+    section("Plugin Generator")
+    try:
+        from laravelgraph.plugins.generator import generate_plugin as _gen_plugin
+        from laravelgraph.mcp.summarize import _resolve_provider  # type: ignore[attr-defined]
+
+        _llm_available = False
+        try:
+            _llm_available = bool(_resolve_provider(cfg.llm))
+        except Exception:
+            pass
+
+        if not _llm_available:
+            warn("Plugin Generator live test skipped — no LLM provider configured (run: laravelgraph providers add)")
+        else:
+            import time as _time
+            _test_desc = "List all HTTP routes with their methods and controller actions"
+            _t0 = _time.time()
+            try:
+                class _MockPluginDB:
+                    def execute(self, q, p=None):
+                        if "Route" in q:
+                            return [
+                                {"m": "GET", "u": "/api/health", "a": "HealthController@index"},
+                                {"m": "POST", "u": "/api/users", "a": "UserController@store"},
+                            ]
+                        if "EloquentModel" in q or "Event" in q or "Feature" in q or "DatabaseTable" in q:
+                            return []
+                        return []
+                    def plugin(self):
+                        return self
+                    def upsert_plugin_node(self, *a, **kw):
+                        pass
+
+                _code, _msg = _gen_plugin(
+                    description=_test_desc,
+                    project_root=root,
+                    core_db=_MockPluginDB(),
+                    cfg=cfg,
+                    max_iterations=2,
+                )
+                _elapsed = round(_time.time() - _t0, 1)
+                if _code is not None:
+                    ok(f"Plugin Generator — generated in {_elapsed}s: {_msg[:80]}")
+                else:
+                    fail(f"Plugin Generator — generation failed ({_elapsed}s)", _msg[:120])
+            except Exception as _gen_err:
+                _elapsed = round(_time.time() - _t0, 1)
+                fail(f"Plugin Generator — error ({_elapsed}s): {_gen_err}")
+    except ImportError as _ie:
+        warn(f"Plugin Generator test skipped — import error: {_ie}")
+
+    # ── 12. Downloads ─────────────────────────────────────────────────────────
+    section("Downloads")
+    try:
+        from laravelgraph.downloads import check_all as _check_downloads
+        _dl_statuses = _check_downloads()
+        for _dl_key, _dl_ready in _dl_statuses.items():
+            if _dl_ready:
+                ok(f"{_dl_key} — ready")
+            else:
+                warn(f"{_dl_key} — not downloaded (run: laravelgraph download)")
+    except Exception as _dl_err:
+        warn(f"Downloads check skipped: {_dl_err}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     console.print()
