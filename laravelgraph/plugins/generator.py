@@ -1043,12 +1043,19 @@ def _build_template_fallback(description: str) -> str:
     slug_dq = '"' + slug.replace('"', '\\"') + '"'
     desc_safe = repr(description[:120])
     note = repr(f"Skeleton plugin — edit the Cypher query to match: {description[:80]}")
+    # slug only contains [a-zA-Z0-9\-] after the regex cleanup above, so no quoting needed
+    edit_msg = (
+        f'"Skeleton plugin \u2014 Cypher not yet configured.\\n\\n"'
+        f'\n            "Edit .laravelgraph/plugins/{slug}.py or call:\\n"'
+        f'\n            "  laravelgraph_update_plugin(\\"{slug}\\", \\"describe what you want\\")"'
+    )
     return (
         f'PLUGIN_MANIFEST = {{\n'
         f'    "name": "{slug}",\n'
         f'    "version": "1.0.0",\n'
         f'    "description": {desc_safe},\n'
         f'    "tool_prefix": "{prefix}",\n'
+        f'    "status": "skeleton",\n'
         f'}}\n'
         f'\n'
         f'\n'
@@ -1061,14 +1068,9 @@ def _build_template_fallback(description: str) -> str:
         f'    @mcp.tool()\n'
         f'    def {tool_fn}() -> str:\n'
         f'        {desc_safe}\n'
-        f'        # TODO: Replace with a query that matches your request.\n'
-        f'        rows = db().execute(\n'
-        f'            "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u, r.action_method AS a LIMIT 50"\n'
+        f'        return (\n'
+        f'            {edit_msg}\n'
         f'        )\n'
-        f'        if not rows:\n'
-        f'            return "No data found."\n'
-        f'        lines = [f"[{{r.get(\'m\', \'?\')}}] {{r.get(\'u\', \'?\')}} -> {{r.get(\'a\', \'?\')}}" for r in rows]\n'
-        f'        return "\\n".join(lines)\n'
         f'\n'
         + _build_store_tool(prefix, slug)
     )
@@ -1082,6 +1084,7 @@ def generate_plugin(
     core_db: Any,
     cfg: Any,
     max_iterations: int = 3,
+    allow_skeleton: bool = False,
 ) -> tuple[str | None, str]:
     """Generate a domain-aware plugin from a description.
 
@@ -1089,11 +1092,17 @@ def generate_plugin(
       1. Resolve domain anchors from the graph (no LLM).
       2. For up to max_iterations: ask LLM for a multi-tool JSON spec,
          assemble Python deterministically, validate through 4 layers.
-      3. If all iterations fail at layer 1: try the template fallback.
+      3. If all iterations fail: return a detailed failure message.
+         If allow_skeleton=True, fall back to a template skeleton instead.
+
+    Args:
+        allow_skeleton: When True, generate a placeholder skeleton plugin if the
+            LLM fails all iterations. When False (default), return None with a
+            detailed failure message — no file is written to disk.
 
     Returns:
         (plugin_code, status_message)
-        plugin_code is None only if everything — including the fallback — fails.
+        plugin_code is None when generation fails and allow_skeleton=False.
     """
     from laravelgraph.logging import get_logger
     log = get_logger(__name__)
@@ -1184,26 +1193,32 @@ def generate_plugin(
         log.info("Plugin generated", description=description[:80], iterations=iteration, score=l4.score)
         return code, f"Plugin generated successfully (score: {l4.score}/10, iterations: {iteration})"
 
-    # ── Template fallback ─────────────────────────────────────────────────────
-    try:
-        fallback_code = _build_template_fallback(description)
-        from laravelgraph.plugins.validator import validate_plugin_file_content as _vpc
-        _vpc(fallback_code)
-        l3_fb = _validate_execution(fallback_code, core_db)
-        if l3_fb.passed:
+    # ── Template fallback (only when explicitly opted in) ─────────────────────
+    layer_names = {1: "AST/static", 2: "schema", 3: "execution", 4: "quality-judge"}
+    layer_label = layer_names.get(last_failed_layer, "unknown")
+
+    if allow_skeleton:
+        try:
+            fallback_code = _build_template_fallback(description)
+            from laravelgraph.plugins.validator import validate_plugin_file_content as _vpc
+            _vpc(fallback_code)
             log.info("Template fallback generated", description=description[:80])
             return fallback_code, (
                 "LLM could not produce a valid plugin spec. "
-                "A working skeleton was generated instead — "
-                "edit the Cypher query inside to match your request."
+                "A skeleton was generated instead (status: skeleton). "
+                "The query tool returns an 'edit me' message — "
+                "update it via laravelgraph_update_plugin() with a description of what you want."
             )
-    except Exception as _fb_err:
-        log.debug("Template fallback failed", error=str(_fb_err))
+        except Exception as _fb_err:
+            log.debug("Template fallback failed", error=str(_fb_err))
 
-    layer_names = {1: "AST/static", 2: "schema", 3: "execution", 4: "quality-judge"}
-    layer_label = layer_names.get(last_failed_layer, "unknown")
     return None, (
-        f"Plugin generation failed after {max_iterations} attempts. "
+        f"Plugin generation failed after {max_iterations} attempt(s). "
         f"Last failure: Layer {last_failed_layer} ({layer_label}). "
-        f"Details: {last_critique}"
+        f"Reason: {last_critique}\n\n"
+        f"Options:\n"
+        f"  • Try a more specific description\n"
+        f"  • Use laravelgraph_cypher to explore the graph first, then re-request\n"
+        f"  • Switch to a stronger LLM via `laravelgraph configure`\n"
+        f"  • Force a skeleton: set allow_skeleton=True in laravelgraph_request_plugin"
     )

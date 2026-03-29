@@ -585,11 +585,25 @@ class TestGeneratePlugin:
                 core_db=self._make_db(),
                 cfg=_MockCfg(),
                 max_iterations=1,
+                allow_skeleton=True,  # explicit opt-in required since v0.3
             )
-        # Template fallback should kick in
+        # Template fallback should kick in when allow_skeleton=True
         assert code is not None
         result = validate_plugin_file_content(code)
         assert result.passed, result.errors
+
+    def test_invalid_json_no_skeleton_by_default(self, tmp_path):
+        with patch("laravelgraph.plugins.generator._call_llm", return_value="not json at all !!!"):
+            code, msg = generate_plugin(
+                description="Show catalog items and inventory levels",
+                project_root=tmp_path,
+                core_db=self._make_db(),
+                cfg=_MockCfg(),
+                max_iterations=1,
+                # allow_skeleton defaults to False
+            )
+        assert code is None
+        assert "allow_skeleton" in msg
 
     def test_layer4_retry_on_low_score(self, tmp_path):
         call_count = 0

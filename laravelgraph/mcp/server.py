@@ -83,15 +83,22 @@ def create_server(project_root: Path, config: Config | None = None) -> Any:
         ]
         for m in manifests:
             disc_count = _counts.get(m["name"], 0)
-            disc_tag = f"  [{disc_count} discoveries]" if disc_count > 0 else ""
-            lines.append(f"▸ {m['name']}  (prefix: {m['tool_prefix']}){disc_tag}")
-            if m["description"]:
-                lines.append(f"  \"{m['description']}\"")
-            if m["tool_names"]:
-                lines.append(f"  Tools: {', '.join(m['tool_names'])}")
-                lines.append(f"  Hot:   laravelgraph_run_plugin_tool(\"{m['name']}\", \"<tool_name>\")  [tool_args={{...}} for store_discoveries]")
-            if disc_count > 0:
-                lines.append(f"  Recall: laravelgraph_plugin_knowledge(plugin_name=\"{m['name']}\")")
+            is_skeleton = m.get("status") == "skeleton"
+            if is_skeleton:
+                lines.append(f"▸ {m['name']}  (prefix: {m['tool_prefix']})  ⚠ SKELETON — Cypher not configured")
+                lines.append(f"  Fix: laravelgraph_update_plugin(\"{m['name']}\", \"describe what you want\")")
+                if m["description"]:
+                    lines.append(f"  \"{m['description']}\"")
+            else:
+                disc_tag = f"  [{disc_count} discoveries]" if disc_count > 0 else ""
+                lines.append(f"▸ {m['name']}  (prefix: {m['tool_prefix']}){disc_tag}")
+                if m["description"]:
+                    lines.append(f"  \"{m['description']}\"")
+                if m["tool_names"]:
+                    lines.append(f"  Tools: {', '.join(m['tool_names'])}")
+                    lines.append(f"  Hot:   laravelgraph_run_plugin_tool(\"{m['name']}\", \"<tool_name>\")  [tool_args={{...}} for store_discoveries]")
+                if disc_count > 0:
+                    lines.append(f"  Recall: laravelgraph_plugin_knowledge(plugin_name=\"{m['name']}\")")
             lines.append("")
         lines.append("If a plugin was just generated this session, use hot dispatch above.")
         lines.append("Native tools are only visible after the next MCP server restart.")
@@ -6043,7 +6050,7 @@ MANDATORY RULES
     # ── Tool: laravelgraph_request_plugin ────────────────────────────────────
 
     @mcp.tool()
-    def laravelgraph_request_plugin(description: str) -> str:
+    def laravelgraph_request_plugin(description: str, allow_skeleton: bool = False) -> str:
         """Request auto-generation of a new MCP tool plugin.
 
         Call this when you need specialized querying capability that the current
@@ -6057,7 +6064,15 @@ MANDATORY RULES
         5. Deploy the plugin to .laravelgraph/plugins/ if it passes
 
         The plugin is available in your NEXT conversation (server restart required).
-        If generation fails, you receive a detailed failure report.
+        If generation fails, you receive a detailed failure report with next steps.
+
+        Args:
+            description: Plain-English description of what the plugin should do.
+            allow_skeleton: When True, generate a placeholder skeleton plugin if the
+                LLM fails all iterations. The skeleton query tool returns an
+                "edit me" message (not fake data) and is marked status=skeleton
+                in LOADED PLUGINS. Default False — on failure, returns the reason
+                and actionable suggestions instead of writing a useless file.
 
         Example: laravelgraph_request_plugin("I need a tool that traces all refund
         flows from the route through to the database update, showing which models
@@ -6072,18 +6087,12 @@ MANDATORY RULES
             import re
 
             db = _db()
-            code, status = generate_plugin(description, project_root, db, cfg)
+            code, status = generate_plugin(description, project_root, db, cfg, allow_skeleton=allow_skeleton)
             elapsed = (_time.time() - _t0) * 1000
             _log_tool("laravelgraph_request_plugin", {"description": description[:80]}, 1 if code else 0, elapsed)
 
             if not code:
-                return (
-                    f"# Plugin Generation Failed\n\n{status}\n\n"
-                    f"**Next steps:**\n"
-                    f"- Run `laravelgraph configure` to set up an LLM provider\n"
-                    f"- Try a more specific description\n"
-                    f"- Check `laravelgraph doctor` for issues"
-                )
+                return f"# Plugin Generation Failed\n\n{status}"
 
             # Extract plugin name from PLUGIN_MANIFEST
             import ast as _ast

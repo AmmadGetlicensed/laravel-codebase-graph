@@ -44,6 +44,7 @@ def scan_plugin_manifests(plugins_dir: Path) -> list[dict]:
         name = ""
         description = ""
         tool_prefix = ""
+        manifest: dict = {}
         try:
             tree = ast.parse(source, filename=str(path))
             for node in ast.walk(tree):
@@ -80,6 +81,7 @@ def scan_plugin_manifests(plugins_dir: Path) -> list[dict]:
             "tool_prefix": tool_prefix,
             "tool_names": tool_names,
             "path": path,
+            "status": manifest.get("status", "active"),
         })
 
     return results
