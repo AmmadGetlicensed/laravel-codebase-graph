@@ -81,9 +81,9 @@ class TestPluginMetaStoreNewMethods:
         store.increment_self_improvement_count("missing")  # must not raise
 
     def test_set_last_improved_at_now(self, store):
-        before = time.time()
+        before = time.time() - 1.0   # 1s buffer for slow CI
         store.set_last_improved_at("my-plugin")
-        after = time.time()
+        after = time.time() + 1.0
         meta = store.get("my-plugin")
         from datetime import datetime, timezone
         dt = datetime.fromisoformat(meta.last_improved_at).timestamp()

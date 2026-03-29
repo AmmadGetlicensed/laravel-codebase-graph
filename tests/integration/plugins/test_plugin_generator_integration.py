@@ -103,7 +103,7 @@ def _minimal_spec(slug: str, prefix: str) -> dict:
             {
                 "name": f"{prefix}_overview",
                 "description": "List routes and models for this domain.",
-                "cypher_query": "MATCH (r:Route) RETURN r.method AS m, r.uri AS u LIMIT 20",
+                "cypher_query": "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u LIMIT 20",
                 "result_format": "[{m}] {u}",
             }
         ],
@@ -176,7 +176,7 @@ class TestGeneratePluginEndToEnd:
                 {
                     "name": f"{prefix.rstrip('_')}_routes",
                     "description": "List all user-related routes.",
-                    "cypher_query": "MATCH (r:Route) RETURN r.method AS m, r.uri AS u LIMIT 30",
+                    "cypher_query": "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u LIMIT 30",
                     "result_format": "[{m}] {u}",
                 }
             ],

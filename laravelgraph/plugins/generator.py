@@ -355,7 +355,7 @@ def _try_feature_match(core_db: Any, tokens: list[str], anchors: dict) -> None:
     # (KuzuDB rejects s.method when s is EloquentModel, etc.)
     sym_rows: list[dict] = []
     for label, extra in [
-        ("Route",        "s.method AS http_method, s.uri AS uri, s.action AS action, null AS fqn, null AS db_table, null AS queue"),
+        ("Route",        "s.http_method AS http_method, s.uri AS uri, s.action_method AS action, null AS fqn, null AS db_table, null AS queue"),
         ("EloquentModel","null AS http_method, null AS uri, null AS action, s.fqn AS fqn, s.db_table AS db_table, null AS queue"),
         ("Event",        "null AS http_method, null AS uri, null AS action, s.fqn AS fqn, null AS db_table, null AS queue"),
         ("Job",          "null AS http_method, null AS uri, null AS action, s.fqn AS fqn, null AS db_table, s.queue AS queue"),
@@ -384,8 +384,8 @@ def _try_token_scan(core_db: Any, tokens: list[str], anchors: dict) -> None:
     for token in tokens[:5]:
         for r in _safe_execute(
             core_db,
-            "MATCH (r:Route) WHERE toLower(r.uri) CONTAINS $t OR toLower(r.action) CONTAINS $t "
-            "RETURN r.method AS method, r.uri AS uri, r.action AS action LIMIT 15",
+            "MATCH (r:Route) WHERE toLower(r.uri) CONTAINS $t OR toLower(r.action_method) CONTAINS $t "
+            "RETURN r.http_method AS method, r.uri AS uri, r.action_method AS action LIMIT 15",
             {"t": token},
         ):
             entry = {"method": r.get("method", "?"), "uri": r.get("uri", "?"), "action": r.get("action", "?")}
@@ -598,7 +598,7 @@ def _generate_plugin_spec(
         '    {\n'
         '      "name": "domain_what_it_does",\n'
         '      "description": "One sentence.",\n'
-        '      "cypher_query": "MATCH (r:Route) RETURN r.method AS m, r.uri AS u LIMIT 30",\n'
+        '      "cypher_query": "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u LIMIT 30",\n'
         '      "result_format": "[{m}] {u}"\n'
         '    }\n'
         '  ]\n'
@@ -802,13 +802,13 @@ def _build_store_tool(prefix: str, slug: str, anchors: dict) -> str:
         query_line = (
             f'        rows = db().execute(\n'
             f'            "MATCH (r:Route) WHERE r.uri CONTAINS \\"{uri_keyword}\\" '\
-            f'RETURN r.method AS m, r.uri AS u, r.action AS a LIMIT 50"\n'
+            f'RETURN r.http_method AS m, r.uri AS u, r.action_method AS a LIMIT 50"\n'
             f'        )\n'
         )
     else:
         query_line = (
             f'        rows = db().execute(\n'
-            f'            "MATCH (r:Route) RETURN r.method AS m, r.uri AS u, r.action AS a LIMIT 50"\n'
+            f'            "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u, r.action_method AS a LIMIT 50"\n'
             f'        )\n'
         )
 
@@ -945,7 +945,7 @@ def _build_template_fallback(description: str) -> str:
         f'        {desc_safe}\n'
         f'        # TODO: Replace with a query that matches your request.\n'
         f'        rows = db().execute(\n'
-        f'            "MATCH (r:Route) RETURN r.method AS m, r.uri AS u, r.action AS a LIMIT 50"\n'
+        f'            "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u, r.action_method AS a LIMIT 50"\n'
         f'        )\n'
         f'        if not rows:\n'
         f'            return "No data found."\n'

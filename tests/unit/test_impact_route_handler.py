@@ -88,7 +88,7 @@ class TestImpactRouteQuery:
         """The query must filter by node_id, not fqn, to avoid false positives."""
         query = (
             "MATCH (r:Route)-[:ROUTES_TO]->(n) WHERE n.node_id = $nid "
-            "RETURN r.method AS method, r.uri AS uri, r.name AS rname LIMIT 5"
+            "RETURN r.http_method AS method, r.uri AS uri, r.name AS rname LIMIT 5"
         )
         assert "n.node_id = $nid" in query
         assert "ROUTES_TO" in query

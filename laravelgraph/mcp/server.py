@@ -1027,7 +1027,7 @@ MANDATORY RULES
             try:
                 route_rows = db.execute(
                     "MATCH (r:Route)-[:ROUTES_TO]->(n) WHERE n.node_id = $nid "
-                    "RETURN r.method AS method, r.uri AS uri, r.name AS rname LIMIT 5",
+                    "RETURN r.http_method AS method, r.uri AS uri, r.name AS rname LIMIT 5",
                     {"nid": node_id},
                 )
             except Exception:

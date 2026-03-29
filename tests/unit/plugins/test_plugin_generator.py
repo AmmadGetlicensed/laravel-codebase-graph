@@ -367,7 +367,7 @@ class TestAssemblePluginCode:
             tools = [{
                 "name": "item_list",
                 "description": "List all items",
-                "cypher_query": "MATCH (r:Route) RETURN r.method AS m, r.uri AS u LIMIT 30",
+                "cypher_query": "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u LIMIT 30",
                 "result_format": "[{m}] {u}",
             }]
         return {"slug": slug, "prefix": prefix, "tools": tools}
@@ -410,7 +410,7 @@ class TestAssemblePluginCode:
         spec = self._make_spec(tools=[{
             "name": "item_list",
             "description": "desc",
-            "cypher_query": "MATCH (r:Route) RETURN r.method AS method, r.uri AS uri LIMIT 30",
+            "cypher_query": "MATCH (r:Route) RETURN r.http_method AS method, r.uri AS uri LIMIT 30",
             "result_format": "[{method}] {uri}",
         }])
         code = _assemble_plugin_code(spec, _empty_anchors())
@@ -504,7 +504,7 @@ class TestGeneratePlugin:
             "tools": [{
                 "name": "cat_routes",
                 "description": "List catalog routes",
-                "cypher_query": "MATCH (r:Route) RETURN r.method AS m, r.uri AS u LIMIT 30",
+                "cypher_query": "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u LIMIT 30",
                 "result_format": "[{m}] {u}",
             }],
         })
