@@ -2812,13 +2812,16 @@ def plugin_migrate(path: Optional[Path] = PathArg) -> None:
         console.print("[yellow]No plugins found.[/yellow]")
         raise typer.Exit(0)
 
-    from laravelgraph.plugins.generator import migrate_plugin_store_tool
+    from laravelgraph.plugins.generator import (
+        migrate_plugin_store_tool,
+        migrate_plugin_cypher_properties,
+    )
     import re as _re
 
-    table = Table(title="Plugin Migration — store_discoveries", show_lines=True)
+    table = Table(title="Plugin Migration", show_lines=True)
     table.add_column("Plugin", style="bold")
-    table.add_column("Status")
-    table.add_column("Notes")
+    table.add_column("store_discoveries")
+    table.add_column("Cypher properties")
 
     migrated_count = 0
     for plugin_path in plugin_files:
@@ -2827,34 +2830,33 @@ def plugin_migrate(path: Optional[Path] = PathArg) -> None:
         name_m = _re.search(r'"name":\s*"([^"]+)"', source)
         prefix_m = _re.search(r'"tool_prefix":\s*"([^"]+)"', source)
         if not name_m or not prefix_m:
-            table.add_row(plugin_path.stem, "[dim]skipped[/dim]", "No PLUGIN_MANIFEST found")
+            table.add_row(plugin_path.stem, "[dim]skipped[/dim]", "[dim]skipped[/dim]")
             continue
 
         slug = name_m.group(1)
         prefix = prefix_m.group(1)
 
         try:
-            patched = migrate_plugin_store_tool(plugin_path, prefix, slug)
+            store_patched = migrate_plugin_store_tool(plugin_path, prefix, slug)
+            cypher_fixes = migrate_plugin_cypher_properties(plugin_path)
         except Exception as exc:
             table.add_row(slug, "[red]error[/red]", str(exc))
             continue
 
-        if patched:
+        if store_patched or cypher_fixes:
             migrated_count += 1
-            table.add_row(slug, "[green]🔄 migrated[/green]", "store_discoveries(findings: str) upgraded")
-        else:
-            table.add_row(slug, "[dim]✅ up-to-date[/dim]", "")
+
+        store_col = "[green]🔄 migrated[/green]" if store_patched else "[dim]✅ ok[/dim]"
+        cypher_col = f"[green]🔄 {len(cypher_fixes)} fix(es)[/green]" if cypher_fixes else "[dim]✅ ok[/dim]"
+        table.add_row(slug, store_col, cypher_col)
 
     console.print(table)
     console.print()
     if migrated_count:
-        console.print(f"[green]{migrated_count} plugin(s) migrated.[/green]")
+        console.print(f"[green]{migrated_count} plugin(s) had issues fixed automatically.[/green]")
         console.print("[dim]Restart the MCP server to load the updated tools.[/dim]")
     else:
         console.print("[dim]All plugins already up-to-date.[/dim]")
-    console.print()
-    console.print("[yellow]Note:[/yellow] Plugins with Cypher property errors (e.g. r.method) still need LLM regeneration:")
-    console.print('[dim]  laravelgraph_update_plugin("plugin-name", "r.method should be r.http_method")[/dim]')
 
 
 @plugin_app.command()

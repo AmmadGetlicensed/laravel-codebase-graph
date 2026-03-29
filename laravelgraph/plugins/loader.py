@@ -356,16 +356,26 @@ def load_mcp_plugins(
         plugin_name: str = manifest["name"]
         tool_prefix: str = manifest["tool_prefix"]
 
-        # ── Auto-migrate pre-redesign store_discoveries ───────────────────────
+        # ── Auto-migrate pre-redesign plugin issues ───────────────────────────
         try:
-            from laravelgraph.plugins.generator import migrate_plugin_store_tool
+            from laravelgraph.plugins.generator import (
+                migrate_plugin_store_tool,
+                migrate_plugin_cypher_properties,
+            )
             if migrate_plugin_store_tool(plugin_path, tool_prefix, plugin_name):
                 _log.info(
                     "Migrated store_discoveries to new signature (findings: str)",
                     plugin=plugin_name,
                 )
+            cypher_fixes = migrate_plugin_cypher_properties(plugin_path)
+            if cypher_fixes:
+                _log.info(
+                    "Migrated Cypher property names",
+                    plugin=plugin_name,
+                    fixes=cypher_fixes,
+                )
         except Exception as _mig_exc:
-            _log.warning("store_discoveries migration failed", plugin=plugin_name, error=str(_mig_exc))
+            _log.warning("Plugin migration failed", plugin=plugin_name, error=str(_mig_exc))
 
         # ── Import ───────────────────────────────────────────────────────────
         _log.debug("MCP plugin import starting", plugin=plugin_path.name)

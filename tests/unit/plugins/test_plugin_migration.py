@@ -190,6 +190,80 @@ class TestMigrateEdgeCases:
         assert "def web_store_discoveries() -> str:" not in updated
 
 
+# ── migrate_plugin_cypher_properties tests ───────────────────────────────────
+
+class TestMigrateCypherProperties:
+    """Verify deterministic Cypher property name fixes."""
+
+    def _write(self, tmp_path: Path, content: str) -> Path:
+        p = tmp_path / "test-plugin.py"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_r_method_replaced_with_http_method(self, tmp_path):
+        from laravelgraph.plugins.generator import migrate_plugin_cypher_properties
+        p = self._write(tmp_path, 'rows = db().execute("MATCH (r:Route) RETURN r.method AS m")\n')
+        fixes = migrate_plugin_cypher_properties(p)
+        assert fixes
+        assert "r.http_method" in p.read_text()
+        assert "r.method " not in p.read_text()
+
+    def test_r_action_replaced_with_action_method(self, tmp_path):
+        from laravelgraph.plugins.generator import migrate_plugin_cypher_properties
+        p = self._write(tmp_path, 'rows = db().execute("MATCH (r:Route) RETURN r.action AS a")\n')
+        fixes = migrate_plugin_cypher_properties(p)
+        assert fixes
+        assert "r.action_method" in p.read_text()
+
+    def test_both_fixed_in_one_pass(self, tmp_path):
+        from laravelgraph.plugins.generator import migrate_plugin_cypher_properties
+        p = self._write(
+            tmp_path,
+            'db().execute("MATCH (r:Route) RETURN r.method AS m, r.uri AS u, r.action AS a LIMIT 50")\n',
+        )
+        fixes = migrate_plugin_cypher_properties(p)
+        updated = p.read_text()
+        assert "r.http_method" in updated
+        assert "r.action_method" in updated
+        assert "r.method " not in updated  # space after to avoid matching r.method_uri etc.
+
+    def test_no_changes_returns_empty_list(self, tmp_path):
+        from laravelgraph.plugins.generator import migrate_plugin_cypher_properties
+        p = self._write(tmp_path, 'db().execute("MATCH (r:Route) RETURN r.http_method AS m")\n')
+        fixes = migrate_plugin_cypher_properties(p)
+        assert fixes == []
+
+    def test_file_unchanged_when_no_fixes(self, tmp_path):
+        from laravelgraph.plugins.generator import migrate_plugin_cypher_properties
+        content = 'db().execute("MATCH (r:Route) RETURN r.http_method LIMIT 5")\n'
+        p = self._write(tmp_path, content)
+        migrate_plugin_cypher_properties(p)
+        assert p.read_text() == content
+
+    def test_python_method_calls_not_affected(self, tmp_path):
+        """Python method calls like obj.method() must not be replaced."""
+        from laravelgraph.plugins.generator import migrate_plugin_cypher_properties
+        p = self._write(tmp_path, "result = obj.method()\n")
+        fixes = migrate_plugin_cypher_properties(p)
+        assert fixes == []
+        assert "obj.method()" in p.read_text()
+
+    def test_idempotent(self, tmp_path):
+        from laravelgraph.plugins.generator import migrate_plugin_cypher_properties
+        p = self._write(tmp_path, 'db().execute("MATCH (r:Route) RETURN r.method AS m")\n')
+        migrate_plugin_cypher_properties(p)
+        content_after_first = p.read_text()
+        fixes2 = migrate_plugin_cypher_properties(p)
+        assert fixes2 == []
+        assert p.read_text() == content_after_first
+
+    def test_returns_fix_descriptions(self, tmp_path):
+        from laravelgraph.plugins.generator import migrate_plugin_cypher_properties
+        p = self._write(tmp_path, 'db().execute("RETURN r.method AS m, r.action AS a")\n')
+        fixes = migrate_plugin_cypher_properties(p)
+        assert len(fixes) >= 1  # At least one fix description returned
+
+
 # ── _build_query_tool error handling tests ────────────────────────────────────
 
 class TestQueryToolErrorHandling:
