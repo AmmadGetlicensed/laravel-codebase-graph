@@ -2788,6 +2788,75 @@ def prompt(
     console.print("[dim]The prompt will be loaded by the MCP server on next startup.[/dim]")
 
 
+@plugin_app.command(name="migrate")
+def plugin_migrate(path: Optional[Path] = PathArg) -> None:
+    """Migrate existing plugins to the latest store_discoveries signature.
+
+    Plugins generated before v0.3.0 have an old store_discoveries() with no
+    parameters. This command upgrades them in-place to store_discoveries(findings: str)
+    so agents can call them with plain-text findings immediately.
+
+    Safe to run multiple times — already-migrated plugins are reported as up-to-date.
+    """
+    from rich.table import Table
+
+    root = _project_root(path)
+    plugins_dir = root / ".laravelgraph" / "plugins"
+
+    if not plugins_dir.exists():
+        console.print("[yellow]No plugins directory found at .laravelgraph/plugins/[/yellow]")
+        raise typer.Exit(0)
+
+    plugin_files = sorted(plugins_dir.glob("*.py"))
+    if not plugin_files:
+        console.print("[yellow]No plugins found.[/yellow]")
+        raise typer.Exit(0)
+
+    from laravelgraph.plugins.generator import migrate_plugin_store_tool
+    import re as _re
+
+    table = Table(title="Plugin Migration — store_discoveries", show_lines=True)
+    table.add_column("Plugin", style="bold")
+    table.add_column("Status")
+    table.add_column("Notes")
+
+    migrated_count = 0
+    for plugin_path in plugin_files:
+        source = plugin_path.read_text(encoding="utf-8")
+        # Extract manifest fields
+        name_m = _re.search(r'"name":\s*"([^"]+)"', source)
+        prefix_m = _re.search(r'"tool_prefix":\s*"([^"]+)"', source)
+        if not name_m or not prefix_m:
+            table.add_row(plugin_path.stem, "[dim]skipped[/dim]", "No PLUGIN_MANIFEST found")
+            continue
+
+        slug = name_m.group(1)
+        prefix = prefix_m.group(1)
+
+        try:
+            patched = migrate_plugin_store_tool(plugin_path, prefix, slug)
+        except Exception as exc:
+            table.add_row(slug, "[red]error[/red]", str(exc))
+            continue
+
+        if patched:
+            migrated_count += 1
+            table.add_row(slug, "[green]🔄 migrated[/green]", "store_discoveries(findings: str) upgraded")
+        else:
+            table.add_row(slug, "[dim]✅ up-to-date[/dim]", "")
+
+    console.print(table)
+    console.print()
+    if migrated_count:
+        console.print(f"[green]{migrated_count} plugin(s) migrated.[/green]")
+        console.print("[dim]Restart the MCP server to load the updated tools.[/dim]")
+    else:
+        console.print("[dim]All plugins already up-to-date.[/dim]")
+    console.print()
+    console.print("[yellow]Note:[/yellow] Plugins with Cypher property errors (e.g. r.method) still need LLM regeneration:")
+    console.print('[dim]  laravelgraph_update_plugin("plugin-name", "r.method should be r.http_method")[/dim]')
+
+
 @plugin_app.command()
 def evolve(
     path: Optional[Path] = PathArg,

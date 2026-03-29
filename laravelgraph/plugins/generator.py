@@ -767,7 +767,7 @@ def _build_summary_text(anchors: dict, tool_names: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _build_query_tool(prefix: str, tool_spec: dict) -> str:
+def _build_query_tool(prefix: str, tool_spec: dict, slug: str = "") -> str:
     """Assemble a single @mcp.tool() function from a tool spec dict.
 
     All string literals in generated code use double quotes (via json.dumps)
@@ -793,12 +793,24 @@ def _build_query_tool(prefix: str, tool_spec: dict) -> str:
 
     desc_literal = _json.dumps(desc)
     query_literal = _json.dumps(cypher)
+    slug_literal = _json.dumps(slug) if slug else '""'
 
     return (
         f"    @mcp.tool()\n"
         f"    def {name}() -> str:\n"
         f"        {desc_literal}\n"
-        f"        rows = db().execute({query_literal})\n"
+        f"        try:\n"
+        f"            rows = db().execute({query_literal})\n"
+        f"        except Exception as _e:\n"
+        f"            _msg = str(_e)\n"
+        f'            if "Binder exception" in _msg or "Cannot find property" in _msg:\n'
+        f'                return (\n'
+        f'                    "Plugin Cypher error: " + _msg + "\\n\\n"\n'
+        f'                    "This tool was generated with incorrect property names.\\n"\n'
+        f'                    "Fix: call laravelgraph_update_plugin(" + {slug_literal} + ", "\n'
+        f'                    "\\"Cypher property error: " + _msg + "\\")"\n'
+        f'                )\n'
+        f'            return "Query error: " + _msg\n'
         f"        if not rows:\n"
         f'            return "No data found."\n'
         f"        lines = [{result_line} for r in rows]\n"
@@ -863,6 +875,37 @@ def _build_store_tool(prefix: str, slug: str) -> str:
     )
 
 
+def migrate_plugin_store_tool(plugin_path: Path, prefix: str, slug: str) -> bool:
+    """Upgrade the store_discoveries tool in an existing plugin file to the new signature.
+
+    Detects the old-style ``{prefix}store_discoveries() -> str:`` (no ``findings``
+    parameter, generated before the store_discoveries redesign) and replaces the
+    entire function — and everything after it — with the current ``_build_store_tool``
+    output.
+
+    ``store_discoveries`` is always the last tool appended by ``_assemble_plugin_code``,
+    so replacing from its ``@mcp.tool()`` decorator to EOF is safe and unambiguous.
+
+    Returns:
+        True  — migration was applied (file updated on disk)
+        False — already up-to-date or pattern not found (file unchanged)
+    """
+    source = plugin_path.read_text(encoding="utf-8")
+    fn_name = prefix.rstrip("_") + "_store_discoveries"
+
+    # Old signature: no parameters, just "() -> str:"
+    old_marker = f"\n    @mcp.tool()\n    def {fn_name}() -> str:"
+    pos = source.find(old_marker)
+    if pos == -1:
+        return False  # Already new-style or function not present
+
+    # Replace from the \n before @mcp.tool() to EOF with the new tool block.
+    # The +1 keeps the \n that precedes @mcp.tool() so the file ends cleanly.
+    new_source = source[: pos + 1] + _build_store_tool(prefix, slug)
+    plugin_path.write_text(new_source, encoding="utf-8")
+    return True
+
+
 def _assemble_plugin_code(spec: dict, anchors: dict) -> str:
     """Build the complete Python plugin file from a validated spec + domain anchors.
 
@@ -888,7 +931,7 @@ def _assemble_plugin_code(spec: dict, anchors: dict) -> str:
     tool_blocks: list[str] = []
     tool_blocks.append(_build_summary_tool(prefix, summary_text))
     for tool_spec in spec.get("tools", []):
-        tool_blocks.append(_build_query_tool(prefix, tool_spec))
+        tool_blocks.append(_build_query_tool(prefix, tool_spec, slug))
     tool_blocks.append(_build_store_tool(prefix, slug))
 
     import json as _json
