@@ -4355,6 +4355,10 @@ def doctor(path: Optional[Path] = PathArg) -> None:
             ("laravelgraph_db_query",        "sql= param",            ["sql"]),
             # laravelgraph_db_impact
             ("laravelgraph_db_impact",       "table= param",          ["table"]),
+            # laravelgraph_request_plugin (allow_skeleton opt-in)
+            ("laravelgraph_request_plugin",  "description= + allow_skeleton= params", ["description", "allow_skeleton"]),
+            # laravelgraph_run_plugin_tool (hot dispatch)
+            ("laravelgraph_run_plugin_tool", "plugin_name= + tool_name= params",      ["plugin_name", "tool_name"]),
         ]
 
         # Verify that ALL expected tools were actually registered
@@ -4396,7 +4400,13 @@ def doctor(path: Optional[Path] = PathArg) -> None:
         for _pf in _plugin_files:
             try:
                 _manifest, _warnings = validate_plugin(_pf)
-                if _warnings:
+                _pstatus = _manifest.get("status", "active")
+                if _pstatus == "skeleton":
+                    warn(
+                        f"Plugin '{_manifest['name']}' — SKELETON (Cypher not configured). "
+                        f"Fix: laravelgraph_update_plugin(\"{_manifest['name']}\", \"describe what you want\")"
+                    )
+                elif _warnings:
                     warn(f"Plugin '{_manifest['name']}' v{_manifest['version']} — {len(_warnings)} warning(s): {_warnings[0]}")
                 else:
                     ok(f"Plugin '{_manifest['name']}' v{_manifest['version']} — valid")
@@ -4424,6 +4434,15 @@ def doctor(path: Optional[Path] = PathArg) -> None:
         ok("plugin generator module — importable")
     except Exception as _e:
         fail(f"plugin generator module — import failed: {_e}")
+
+    try:
+        from laravelgraph.plugins.generator import (
+            migrate_plugin_store_tool,
+            migrate_plugin_cypher_properties,
+        )
+        ok("plugin migration functions — importable (migrate_plugin_store_tool, migrate_plugin_cypher_properties)")
+    except Exception as _e:
+        fail(f"plugin migration functions — import failed: {_e}")
 
     try:
         from laravelgraph.plugins.self_improve import check_and_improve, run_improvement_check_all
@@ -4515,19 +4534,74 @@ def register_tools(mcp, db=None):
     except Exception as _e:
         fail(f"LogManager smoke test — {_e}")
 
-    # 7. Check new MCP tools are registered
+    # 7. Check key MCP tools are registered
     try:
         from laravelgraph.mcp.server import create_server
         import inspect
         _src = inspect.getsource(create_server)
-        _required_tools = ["laravelgraph_request_plugin", "laravelgraph_update_plugin", "laravelgraph_remove_plugin"]
+        _required_tools = [
+            "laravelgraph_request_plugin",
+            "laravelgraph_update_plugin",
+            "laravelgraph_remove_plugin",
+            "laravelgraph_run_plugin_tool",
+            "laravelgraph_plugin_knowledge",
+        ]
         _missing = [t for t in _required_tools if t not in _src]
         if _missing:
-            fail(f"MCP auto-generation tools missing: {', '.join(_missing)}")
+            fail(f"MCP plugin tools missing: {', '.join(_missing)}")
         else:
-            ok(f"MCP auto-generation tools registered — request_plugin, update_plugin, remove_plugin")
+            ok("MCP plugin tools registered — request/update/remove/run/knowledge")
+        # Verify allow_skeleton param exists in request_plugin
+        if "allow_skeleton" not in _src:
+            fail("laravelgraph_request_plugin missing allow_skeleton parameter")
+        else:
+            ok("laravelgraph_request_plugin — allow_skeleton parameter present")
     except Exception as _e:
         fail(f"MCP tool check — {_e}")
+
+    # 8a. _build_template_fallback produces status=skeleton
+    try:
+        import ast as _ast_fb
+        from laravelgraph.plugins.generator import _build_template_fallback
+        _fb_code = _build_template_fallback("order management flow")
+        _fb_tree = _ast_fb.parse(_fb_code)
+        _fb_status = None
+        for _fb_node in _ast_fb.walk(_fb_tree):
+            if isinstance(_fb_node, _ast_fb.Assign):
+                for _fb_t in _fb_node.targets:
+                    if isinstance(_fb_t, _ast_fb.Name) and _fb_t.id == "PLUGIN_MANIFEST":
+                        _fb_manifest = _ast_fb.literal_eval(_fb_node.value)
+                        _fb_status = _fb_manifest.get("status")
+        assert _fb_status == "skeleton", f"Expected status=skeleton, got {_fb_status!r}"
+        # Also verify no db().execute( call (no fake Cypher)
+        assert "db().execute(" not in _fb_code, "Skeleton code must not execute Cypher"
+        ok("_build_template_fallback — produces status=skeleton, no fake Cypher")
+    except Exception as _e:
+        fail(f"_build_template_fallback smoke test — {_e}")
+
+    # 8b. scan_plugin_manifests extracts status field
+    try:
+        import tempfile as _tf_scan
+        from pathlib import Path as _Path_scan
+        from laravelgraph.plugins.loader import scan_plugin_manifests
+        with _tf_scan.TemporaryDirectory() as _scan_tmp:
+            _scan_dir = _Path_scan(_scan_tmp)
+            (_scan_dir / "skel.py").write_text(
+                'PLUGIN_MANIFEST = {"name": "skel", "version": "1.0.0", "description": "x",'
+                ' "tool_prefix": "sk_", "status": "skeleton"}\n'
+                'def register_tools(mcp, db=None): pass\n'
+            )
+            (_scan_dir / "active.py").write_text(
+                'PLUGIN_MANIFEST = {"name": "active", "version": "1.0.0", "description": "x",'
+                ' "tool_prefix": "ac_"}\n'
+                'def register_tools(mcp, db=None): pass\n'
+            )
+            _scan_results = {m["name"]: m for m in scan_plugin_manifests(_scan_dir)}
+        assert _scan_results["skel"]["status"] == "skeleton", "skeleton status not extracted"
+        assert _scan_results["active"]["status"] == "active", "active status not defaulted correctly"
+        ok("scan_plugin_manifests — extracts status field (skeleton / active default)")
+    except Exception as _e:
+        fail(f"scan_plugin_manifests status check — {_e}")
 
     # 8. Improvement threshold logic
     try:
