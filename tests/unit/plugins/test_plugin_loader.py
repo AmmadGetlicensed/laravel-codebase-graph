@@ -180,3 +180,80 @@ class TestToolCollector:
         assert "tst_store_discoveries" in collector.tools
         assert collector.tools["tst_summary"]() == "summary"
         assert collector.tools["tst_list"]() == "list"
+
+
+# ── _ToolCollector with kwargs (tool_args hot-dispatch path) ──────────────────
+
+class TestToolCollectorWithArgs:
+    """Verify that tools accepting parameters can be called with keyword args."""
+
+    def test_tool_with_string_param_callable_with_kwargs(self):
+        collector = _ToolCollector()
+
+        @collector.tool()
+        def my_store(findings: str) -> str:
+            return f"stored: {findings}"
+
+        result = collector.tools["my_store"](**{"findings": "something notable"})
+        assert result == "stored: something notable"
+
+    def test_tool_called_with_empty_kwargs_dict(self):
+        collector = _ToolCollector()
+
+        @collector.tool()
+        def no_args_tool() -> str:
+            return "ok"
+
+        # Passing an empty dict is equivalent to no args
+        result = collector.tools["no_args_tool"](**({}))
+        assert result == "ok"
+
+    def test_tool_with_multiple_params(self):
+        collector = _ToolCollector()
+
+        @collector.tool()
+        def multi_param(a: str, b: int = 0) -> str:
+            return f"{a}:{b}"
+
+        result = collector.tools["multi_param"](**{"a": "hello", "b": 42})
+        assert result == "hello:42"
+
+    def test_unexpected_kwarg_raises_type_error(self):
+        """Passing unknown kwargs to the tool should raise TypeError (correct behavior)."""
+        collector = _ToolCollector()
+
+        @collector.tool()
+        def simple() -> str:
+            return "x"
+
+        import pytest
+        with pytest.raises(TypeError):
+            collector.tools["simple"](**{"unknown_param": "value"})
+
+    def test_store_discoveries_plugin_template_callable_with_findings(self):
+        """Full round-trip: a plugin with store_discoveries(findings: str) is callable via kwargs."""
+        _STORE_PLUGIN = """\
+PLUGIN_MANIFEST = {
+    "name": "test-store",
+    "version": "1.0.0",
+    "description": "Test store plugin.",
+    "tool_prefix": "ts_",
+}
+
+def register_tools(mcp, db=None, sql_db=None):
+    @mcp.tool()
+    def ts_store_discoveries(findings: str) -> str:
+        return f"stored: {findings}"
+"""
+        import tempfile, pathlib
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "test-store.py"
+            p.write_text(_STORE_PLUGIN, encoding="utf-8")
+
+            from laravelgraph.plugins.loader import _import_plugin_module
+            module = _import_plugin_module(p, "laravelgraph_plugin_test_store")
+            collector = _ToolCollector()
+            module.register_tools(collector)
+
+            result = collector.tools["ts_store_discoveries"](**{"findings": "5 routes have no auth"})
+            assert result == "stored: 5 routes have no auth"

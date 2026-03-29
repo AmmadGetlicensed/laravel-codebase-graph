@@ -75,9 +75,10 @@ def create_server(project_root: Path, config: Config | None = None) -> Any:
             "",
             "TWO ways to use them:",
             "  1. Native tool call  — e.g. usr_summary()  (registered at startup)",
-            "  2. Hot dispatch      — laravelgraph_run_plugin_tool(plugin, tool)",
+            "  2. Hot dispatch      — laravelgraph_run_plugin_tool(plugin, tool, tool_args=None)",
             "     Use hot dispatch when you generated a plugin THIS conversation",
             "     and want to use it immediately without waiting for a restart.",
+            "     Pass tool_args={'findings': '...'} to call store_discoveries hot.",
             "",
         ]
         for m in manifests:
@@ -88,7 +89,7 @@ def create_server(project_root: Path, config: Config | None = None) -> Any:
                 lines.append(f"  \"{m['description']}\"")
             if m["tool_names"]:
                 lines.append(f"  Tools: {', '.join(m['tool_names'])}")
-                lines.append(f"  Hot:   laravelgraph_run_plugin_tool(\"{m['name']}\", \"<tool_name>\")")
+                lines.append(f"  Hot:   laravelgraph_run_plugin_tool(\"{m['name']}\", \"<tool_name>\")  [tool_args={{...}} for store_discoveries]")
             if disc_count > 0:
                 lines.append(f"  Recall: laravelgraph_plugin_knowledge(plugin_name=\"{m['name']}\")")
             lines.append("")
@@ -284,12 +285,15 @@ laravelgraph_request_plugin(description)
   AFTER generation: use laravelgraph_run_plugin_tool() immediately this session.
   Native tool names also registered on the NEXT server start.
 
-laravelgraph_run_plugin_tool(plugin_name, tool_name)
+laravelgraph_run_plugin_tool(plugin_name, tool_name, tool_args=None)
   *** USE THIS IMMEDIATELY AFTER GENERATING A PLUGIN ***
   Dynamically loads any plugin from disk and calls the named tool — NO restart.
   Works for plugins generated this conversation AND plugins from previous sessions.
+  tool_args: dict of kwargs for tools that take parameters (e.g. store_discoveries).
   Example: laravelgraph_run_plugin_tool("user-explorer", "usr_summary")
   Example: laravelgraph_run_plugin_tool("order-lifecycle", "order_flow")
+  Example: laravelgraph_run_plugin_tool("webhook", "web_store_discoveries",
+           {"findings": "POST /v1/payments/paypal-ipn has no auth or HMAC check"})
   To see available tool names: check LOADED PLUGINS section above, or call
   laravelgraph_suggest_plugins() which lists all installed plugins with their tools.
 
@@ -6153,7 +6157,11 @@ MANDATORY RULES
     # ── Tool: laravelgraph_run_plugin_tool ───────────────────────────────────
 
     @mcp.tool()
-    def laravelgraph_run_plugin_tool(plugin_name: str, tool_name: str) -> str:
+    def laravelgraph_run_plugin_tool(
+        plugin_name: str,
+        tool_name: str,
+        tool_args: "dict | None" = None,
+    ) -> str:
         """Run any plugin tool on-demand — no server restart needed.
 
         This is the hot-dispatch mechanism for plugin tools. Use it to:
@@ -6173,6 +6181,9 @@ MANDATORY RULES
                          without .py in .laravelgraph/plugins/).
             tool_name:   The exact function name, e.g. "usr_summary", "order_flow".
                          Must start with the plugin's tool_prefix.
+            tool_args:   Optional dict of keyword arguments to pass to the tool.
+                         Required for tools that take parameters, e.g. store_discoveries.
+                         Example: {"findings": "Users table has soft-deletes."}
 
         Returns:
             The tool's output as a string, or a detailed error message.
@@ -6181,7 +6192,8 @@ MANDATORY RULES
             laravelgraph_run_plugin_tool("user-explorer", "usr_summary")
             laravelgraph_run_plugin_tool("user-explorer", "usr_routes")
             laravelgraph_run_plugin_tool("order-lifecycle", "order_flow")
-            laravelgraph_run_plugin_tool("order-lifecycle", "order_store_discoveries")
+            laravelgraph_run_plugin_tool("webhook", "web_store_discoveries",
+                                         {"findings": "POST /v1/payments/paypal-ipn has no auth"})
         """
         import time as _time
         _t0 = _time.time()
@@ -6239,8 +6251,8 @@ MANDATORY RULES
                     + "\n".join(f"  - `laravelgraph_run_plugin_tool(\"{plugin_name}\", \"{t}\")`" for t in available)
                 )
 
-            # Call the tool
-            result = collector.tools[tool_name]()
+            # Call the tool (with optional kwargs for tools like store_discoveries)
+            result = collector.tools[tool_name](**(tool_args or {}))
             elapsed = (_time.time() - _t0) * 1000
             _log_tool("laravelgraph_run_plugin_tool", {"plugin": plugin_name, "tool": tool_name}, 1, elapsed)
             return result if isinstance(result, str) else str(result)
