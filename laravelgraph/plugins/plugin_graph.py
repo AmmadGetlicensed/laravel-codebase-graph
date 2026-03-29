@@ -210,6 +210,32 @@ class DualDB:
 
 
 def init_plugin_graph(index_dir: Path) -> PluginGraphDB:
-    """Initialize or open the plugin graph at index_dir/plugin_graph.kuzu"""
+    """Initialize or open the plugin graph at index_dir/plugin_graph.kuzu.
+
+    If the file has a stale KuzuDB lock (e.g. from a previous server process
+    that was killed without a clean shutdown), the lock state is baked into the
+    file header and cannot be cleared without deleting the file.  In that case
+    the stale file is removed and a fresh plugin graph is created automatically.
+    Stored discoveries are lost, but the server starts successfully.
+    """
+    import logging as _logging
     db_path = index_dir / "plugin_graph.kuzu"
-    return PluginGraphDB(db_path)
+    try:
+        return PluginGraphDB(db_path)
+    except Exception as exc:
+        msg = str(exc)
+        if "Could not set lock" in msg or "lock" in msg.lower():
+            # Stale lock in file header — delete and recreate
+            _logging.getLogger("laravelgraph").warning(
+                "plugin_graph.kuzu has a stale lock (server was killed without clean shutdown). "
+                "Deleting stale file and creating a fresh plugin graph. "
+                "Previously stored discoveries are lost."
+            )
+            wal = db_path.parent / (db_path.name + ".wal")
+            for f in (db_path, wal):
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    pass
+            return PluginGraphDB(db_path)
+        raise
