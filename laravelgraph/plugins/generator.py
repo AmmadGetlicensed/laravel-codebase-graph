@@ -604,6 +604,17 @@ def _generate_plugin_spec(
         f"{domain_facts}\n\n"
         "=== AVAILABLE NODE TYPES (use only these) ===\n"
         f"  {populated_types}\n\n"
+        "=== NODE PROPERTY REFERENCE (use ONLY these property names in Cypher) ===\n"
+        "  Route:         r.http_method, r.uri, r.name, r.action_method, r.is_api, r.middleware_stack\n"
+        "  EloquentModel: m.name, m.fqn, m.db_table, m.soft_deletes, m.fillable\n"
+        "  Event:         e.name, e.fqn\n"
+        "  Job:           j.name, j.fqn, j.queue, j.connection\n"
+        "  Class_:        c.name, c.fqn, c.laravel_role\n"
+        "  Method:        mt.name, mt.fqn, mt.visibility, mt.is_static\n"
+        "  Feature:       f.name, f.slug, f.symbol_count\n"
+        "  DatabaseTable: t.name, t.connection\n"
+        "  DatabaseColumn: col.name, col.table_name, col.type, col.nullable\n\n"
+        "  CRITICAL: NEVER use .model, .class, .type, .action, .method as property names — they do NOT exist.\n\n"
         "=== AVAILABLE RELATIONSHIP TYPES ===\n"
         "  (Route)-[:ROUTES_TO]->(Method)\n"
         "  (Method)-[:DISPATCHES]->(Event)\n"
@@ -625,6 +636,12 @@ def _generate_plugin_spec(
         '      "description": "One sentence.",\n'
         '      "cypher_query": "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u LIMIT 30",\n'
         '      "result_format": "[{m}] {u}"\n'
+        '    },\n'
+        '    {\n'
+        '      "name": "domain_models",\n'
+        '      "description": "List Eloquent models for this domain.",\n'
+        '      "cypher_query": "MATCH (m:EloquentModel) RETURN m.name AS name, m.db_table AS tbl LIMIT 20",\n'
+        '      "result_format": "{name} (table: {tbl})"\n'
         '    }\n'
         '  ]\n'
         '}\n\n'
@@ -634,6 +651,7 @@ def _generate_plugin_spec(
         "- every tool name must start with the prefix\n"
         "- cypher_query: valid Cypher, LIMIT 30 or 50\n"
         "- result_format: use {alias} placeholders matching AS aliases in the query\n"
+        "- always use the property names from the NODE PROPERTY REFERENCE above\n"
         + (
             "- IMPORTANT: use the exact node names shown in the domain data above\n"
             if has_anchors else

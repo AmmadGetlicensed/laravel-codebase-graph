@@ -46,13 +46,18 @@ def create_server(project_root: Path, config: Config | None = None) -> Any:
     _plugins_dir_early = project_root / ".laravelgraph" / "plugins"
     _plugin_manifests = _scan_manifests(_plugins_dir_early)
 
-    # Pre-load discovery counts from plugin graph (best-effort, non-blocking)
+    # Pre-load discovery counts from plugin graph (best-effort, non-blocking).
+    # NOTE: _plugin_db is created further below; we use a temporary connection
+    # here only to read counts, then close it immediately to avoid holding two
+    # open Database objects to the same path (KuzuDB write-lock conflict).
     _plugin_discovery_counts: dict[str, int] = {}
     try:
         from laravelgraph.plugins.plugin_graph import init_plugin_graph as _init_pg
-        _pg = _init_pg(index_dir(project_root))
+        _pg_tmp = _init_pg(index_dir(project_root))
         for _m in _plugin_manifests:
-            _plugin_discovery_counts[_m["name"]] = _pg.get_plugin_node_count(_m["name"])
+            _plugin_discovery_counts[_m["name"]] = _pg_tmp.get_plugin_node_count(_m["name"])
+        _pg_tmp.close()
+        del _pg_tmp
     except Exception:
         pass
 
@@ -6443,8 +6448,10 @@ MANDATORY RULES
         import time as _time
         _t0 = _time.time()
         try:
-            from laravelgraph.plugins.plugin_graph import init_plugin_graph
-            _pg = init_plugin_graph(index_dir(project_root))
+            # Use the already-open shared plugin graph connection (_plugin_db).
+            # Creating a new Database object to the same .kuzu path would cause
+            # KuzuDB write-lock conflicts and miss writes from the shared instance.
+            _pg = _plugin_db
 
             if plugin_name:
                 rows = _pg.execute(
