@@ -2212,6 +2212,34 @@ MANDATORY RULES
         except Exception:
             pass
 
+        # ── Convention-based FK inference for *_id columns ───────────────────
+        # If the column ends in _id and no INFERRED_REFERENCES or REFERENCES_TABLE
+        # edges were found, derive a candidate table by naming convention.
+        try:
+            if column.endswith("_id") and col_node_id:
+                # Check whether any FK edges already cover this column
+                has_explicit = bool(db.execute(
+                    "MATCH (c:DatabaseColumn)-[:REFERENCES_TABLE|INFERRED_REFERENCES]->(t:DatabaseTable) "
+                    "WHERE c.node_id = $nid RETURN t.name AS n LIMIT 1",
+                    {"nid": col_node_id},
+                ))
+                if not has_explicit:
+                    stem = column[:-3]  # strip _id
+                    candidates = [stem, stem + "s", stem + "es"]
+                    conv_rows = db.execute(
+                        "MATCH (t:DatabaseTable) WHERE t.name IN $names RETURN t.name AS tname",
+                        {"names": candidates},
+                    )
+                    if conv_rows:
+                        lines.append("\n### Convention-Inferred References (naming pattern, no DB constraint)\n")
+                        lines.append("| Candidate Table | Match Basis |")
+                        lines.append("|----------------|-------------|")
+                        for cr in conv_rows:
+                            tname = cr.get("tname", "")
+                            lines.append(f"| `{tname}` | `{column}` → strip `_id` → `{stem}` |")
+        except Exception:
+            pass
+
         # ── Value semantics (discriminator detection + varchar sampling) ─────────
         disc_dist: list[dict] | None = None
         resolve_conn_cfg = _get_conn_cfg_for_table(conn_name)
