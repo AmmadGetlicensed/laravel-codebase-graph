@@ -90,24 +90,41 @@ class ImpactAnalyzer:
         )
 
     def _find_dependents(self, node_id: str) -> list[dict[str, Any]]:
-        """Find all nodes with an edge pointing TO node_id."""
         results = []
 
-        # CALLS: who calls this method?
-        for query in [
-            ("MATCH (caller)-[r:CALLS]->(target) WHERE target.node_id = $id "
-             "RETURN caller.node_id AS node_id, caller.fqn AS fqn, caller.file_path AS file_path, "
-             "labels(caller)[0] AS label, r.confidence AS confidence"),
-            ("MATCH (user)-[r:USES_TYPE]->(target) WHERE target.node_id = $id "
-             "RETURN user.node_id AS node_id, user.fqn AS fqn, user.file_path AS file_path, "
-             "labels(user)[0] AS label, 0.9 AS confidence"),
-            ("MATCH (sub)-[:EXTENDS_CLASS]->(parent) WHERE parent.node_id = $id "
-             "RETURN sub.node_id AS node_id, sub.fqn AS fqn, sub.file_path AS file_path, "
-             "labels(sub)[0] AS label, 1.0 AS confidence"),
-            ("MATCH (impl)-[:IMPLEMENTS_INTERFACE]->(iface) WHERE iface.node_id = $id "
-             "RETURN impl.node_id AS node_id, impl.fqn AS fqn, impl.file_path AS file_path, "
-             "labels(impl)[0] AS label, 1.0 AS confidence"),
-        ]:
+        _incoming = [
+            "MATCH (caller)-[r:CALLS]->(target) WHERE target.node_id = $id "
+            "RETURN caller.node_id AS node_id, caller.fqn AS fqn, caller.file_path AS file_path, "
+            "labels(caller)[0] AS label, r.confidence AS confidence",
+
+            "MATCH (user)-[r:USES_TYPE]->(target) WHERE target.node_id = $id "
+            "RETURN user.node_id AS node_id, user.fqn AS fqn, user.file_path AS file_path, "
+            "labels(user)[0] AS label, 0.9 AS confidence",
+
+            "MATCH (sub)-[:EXTENDS_CLASS]->(parent) WHERE parent.node_id = $id "
+            "RETURN sub.node_id AS node_id, sub.fqn AS fqn, sub.file_path AS file_path, "
+            "labels(sub)[0] AS label, 1.0 AS confidence",
+
+            "MATCH (impl)-[:IMPLEMENTS_INTERFACE]->(iface) WHERE iface.node_id = $id "
+            "RETURN impl.node_id AS node_id, impl.fqn AS fqn, impl.file_path AS file_path, "
+            "labels(impl)[0] AS label, 1.0 AS confidence",
+        ]
+
+        _outgoing = [
+            "MATCH (src)-[r:CALLS]->(target) WHERE src.node_id = $id "
+            "RETURN target.node_id AS node_id, target.fqn AS fqn, target.file_path AS file_path, "
+            "labels(target)[0] AS label, r.confidence AS confidence",
+
+            "MATCH (src)-[d:DISPATCHES]->(target) WHERE src.node_id = $id "
+            "RETURN target.node_id AS node_id, target.fqn AS fqn, '' AS file_path, "
+            "labels(target)[0] AS label, 0.85 AS confidence",
+
+            "MATCH (src:Method)-[q:QUERIES_TABLE]->(t:DatabaseTable) WHERE src.node_id = $id "
+            "RETURN t.node_id AS node_id, t.name AS fqn, '' AS file_path, "
+            "'DatabaseTable' AS label, 0.80 AS confidence",
+        ]
+
+        for query in _incoming + _outgoing:
             try:
                 rows = self._db.execute(query, {"id": node_id})
                 results.extend(rows)

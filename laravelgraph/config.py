@@ -89,10 +89,10 @@ class DatabaseConnectionConfig(BaseModel):
     query_cache_ttl: int = 300          # seconds to cache SELECT results (0 = disable)
 
 
-class SummaryConfig(BaseModel):
-    """Configuration for lazy semantic summary caching.
+class LLMConfig(BaseModel):
+    """Configuration for LLM providers used for semantic summary generation.
 
-    Supports 15+ LLM providers. Keys are read from environment variables
+    Supports 18+ providers. Keys are read from environment variables
     automatically — no config file needed for cloud providers.
     Local providers (Ollama, LM Studio, vLLM) require provider="<name>" to activate.
 
@@ -110,6 +110,10 @@ class SummaryConfig(BaseModel):
     max_source_lines: int = 50
 
 
+# Backward-compat alias — existing code that imports SummaryConfig continues to work
+SummaryConfig = LLMConfig
+
+
 class LogConfig(BaseModel):
     level: str = "INFO"
     dir: Path = Field(default_factory=lambda: _global_dir() / "logs")
@@ -122,7 +126,7 @@ class Config(BaseModel):
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     log: LogConfig = Field(default_factory=LogConfig)
-    summary: SummaryConfig = Field(default_factory=SummaryConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
     databases: list[DatabaseConnectionConfig] = Field(default_factory=list)
 
     @field_validator("log", mode="before")
@@ -143,14 +147,18 @@ class Config(BaseModel):
         global_cfg = _global_dir() / "config.json"
         if global_cfg.exists():
             with open(global_cfg) as f:
-                base.update(json.load(f))
+                global_data = json.load(f)
+                _migrate_llm_key(global_data)
+                base.update(global_data)
 
         # Project-level config
         if project_root:
             project_cfg = _index_dir(project_root) / "config.json"
             if project_cfg.exists():
                 with open(project_cfg) as f:
-                    _deep_merge(base, json.load(f))
+                    project_data = json.load(f)
+                    _migrate_llm_key(project_data)
+                    _deep_merge(base, project_data)
 
         # Environment variable overrides
         if lvl := os.environ.get("LARAVELGRAPH_LOG_LEVEL"):
@@ -161,6 +169,12 @@ class Config(BaseModel):
             base.setdefault("mcp", {})["api_key"] = key
 
         return cls.model_validate(base)
+
+
+def _migrate_llm_key(data: dict) -> None:
+    """In-place: rename old 'summary' key to 'llm' if 'llm' is absent."""
+    if "summary" in data and "llm" not in data:
+        data["llm"] = data.pop("summary")
 
 
 def _deep_merge(base: dict, override: dict) -> None:

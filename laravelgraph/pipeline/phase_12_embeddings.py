@@ -174,10 +174,11 @@ def run(ctx: PipelineContext) -> None:
     except Exception as exc:
         logger.warning("Failed to fetch Function_ nodes for embedding", error=str(exc))
 
-    logger.info("Generating embeddings", total_items=len(items), batch_size=batch_size)
+    total_items = len(items)
+    logger.info("Generating embeddings", total_items=total_items, batch_size=batch_size)
 
     # Process in batches
-    for batch_start in range(0, len(items), batch_size):
+    for batch_start in range(0, total_items, batch_size):
         batch = items[batch_start : batch_start + batch_size]
         labels = [item[0] for item in batch]
         nids = [item[1] for item in batch]
@@ -207,6 +208,16 @@ def run(ctx: PipelineContext) -> None:
             batch_size=len(batch),
             total_so_far=embeddings_generated,
         )
+
+    # Explicitly release the ONNX runtime and node list to free 500MB+ of RAM
+    # before the remaining pipeline phases run.
+    del items
+    del model
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
 
     ctx.stats["embeddings_generated"] = embeddings_generated
     logger.info("Embedding generation complete", embeddings_generated=embeddings_generated)

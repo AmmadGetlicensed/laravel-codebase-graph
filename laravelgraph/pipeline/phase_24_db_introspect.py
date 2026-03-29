@@ -344,7 +344,8 @@ def _introspect_one(ctx: PipelineContext, cfg: Any) -> dict[str, int]:
                 cur.execute(
                     """
                     SELECT ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_DEFINITION,
-                           ROUTINE_COMMENT
+                           ROUTINE_COMMENT, SECURITY_TYPE, DEFINER,
+                           LAST_ALTERED, CREATED
                     FROM information_schema.ROUTINES
                     WHERE ROUTINE_SCHEMA = %s
                       AND ROUTINE_TYPE IN ('PROCEDURE', 'FUNCTION')
@@ -374,7 +375,16 @@ def _introspect_one(ctx: PipelineContext, cfg: Any) -> dict[str, int]:
                         "type": dtype or "",
                     })
 
-                for (proc_name, routine_type, body, comment) in routines:
+                for row in routines:
+                    proc_name = row[0]
+                    routine_type = row[1]
+                    body = row[2]
+                    comment = row[3]
+                    security_type = row[4] if len(row) > 4 else ""
+                    definer = row[5] if len(row) > 5 else ""
+                    last_altered = row[6] if len(row) > 6 else None
+                    created = row[7] if len(row) > 7 else None
+
                     proc_nid = make_node_id("procedure", conn_name, proc_name)
                     params = params_by_proc.get(proc_name, [])
                     body_str = body or ""
@@ -390,6 +400,10 @@ def _introspect_one(ctx: PipelineContext, cfg: Any) -> dict[str, int]:
                         "body_preview": preview,
                         "full_body": body_str,
                         "comment": comment or "",
+                        "security_type": str(security_type or ""),
+                        "definer": str(definer or ""),
+                        "last_altered": str(last_altered.isoformat()) if last_altered else "",
+                        "created_at": str(created.isoformat()) if created else "",
                     })
 
                     db.upsert_rel(

@@ -50,6 +50,8 @@ NODE_TYPES: list[tuple[str, list[tuple[str, str]]]] = [
         ("is_dead_code", "BOOLEAN"),
         ("community_id", "INT32"),
         ("embedding", "FLOAT[]"),
+        ("changed_recently", "BOOLEAN"),
+        ("changed_in_commit", "STRING"),
     ]),
     ("Trait_", [
         ("node_id", "STRING"),
@@ -91,6 +93,9 @@ NODE_TYPES: list[tuple[str, list[tuple[str, str]]]] = [
         ("laravel_role", "STRING"),  # handle|boot|register|accessor|mutator|scope|...
         ("community_id", "INT32"),
         ("embedding", "FLOAT[]"),
+        ("has_dynamic_table_ref", "BOOLEAN"),
+        ("changed_recently", "BOOLEAN"),
+        ("changed_in_commit", "STRING"),
     ]),
     ("Function_", [
         ("node_id", "STRING"),
@@ -359,6 +364,10 @@ NODE_TYPES: list[tuple[str, list[tuple[str, str]]]] = [
         ("body_preview", "STRING"),   # first 1000 chars of body
         ("full_body", "STRING"),      # complete body for SQL parsing
         ("comment", "STRING"),
+        ("security_type", "STRING"),
+        ("definer", "STRING"),
+        ("last_altered", "STRING"),   # ISO timestamp from information_schema
+        ("created_at", "STRING"),     # ISO timestamp from information_schema
     ]),
     ("DatabaseView", [
         ("node_id", "STRING"),
@@ -430,6 +439,72 @@ NODE_TYPES: list[tuple[str, list[tuple[str, str]]]] = [
         ("entry_type", "STRING"),  # route|command|job|listener|schedule
         ("entry_fqn", "STRING"),
         ("depth", "INT32"),
+    ]),
+
+    # ── Feature Clusters (phase 27) ─────────────────────────────────────────
+    ("Feature", [
+        ("node_id", "STRING"),
+        ("name", "STRING"),           # human-readable e.g. "Order Course"
+        ("slug", "STRING"),           # machine key e.g. "order_course"
+        ("route_prefix", "STRING"),   # primary URI segment used for grouping
+        ("symbol_count", "INT32"),    # total symbols linked to this feature
+        ("entry_routes", "STRING"),   # JSON list of route URIs
+        ("has_changes", "BOOLEAN"),   # set by phase 29 if feature has recent git changes
+    ]),
+
+    # ── Behavioral Contracts (phase 28) ─────────────────────────────────────
+    ("Contract", [
+        ("node_id", "STRING"),
+        ("name", "STRING"),           # e.g. "OrderRequest validation"
+        ("contract_type", "STRING"),  # validation|authorization|lifecycle|mass_assignment
+        ("source_class", "STRING"),   # short class name
+        ("source_fqn", "STRING"),     # fully-qualified class name
+        ("rules", "STRING"),          # JSON: {field: rules_string} or {method: bool} etc.
+        ("file_path", "STRING"),
+        ("line_start", "INT32"),
+    ]),
+
+    # ── Test Coverage (phase 30) ─────────────────────────────────────────────
+    ("TestCase", [
+        ("node_id", "STRING"),
+        ("name", "STRING"),           # test file stem, e.g. "UserTest"
+        ("fqn", "STRING"),            # PSR-4 FQN, e.g. "Tests\\Feature\\UserTest"
+        ("file_path", "STRING"),
+        ("test_type", "STRING"),      # feature|unit|integration
+        ("covers_routes", "STRING"),  # JSON list of extracted URIs
+        ("covers_classes", "STRING"), # JSON list of referenced class short names
+    ]),
+
+    # ── Performance Risks (phase 31) ─────────────────────────────────────────
+    ("PerformanceRisk", [
+        ("node_id", "STRING"),
+        ("risk_type", "STRING"),      # n_plus_one|missing_eager_load|repeated_count|raw_query_bypass
+        ("description", "STRING"),
+        ("severity", "STRING"),       # HIGH|MEDIUM|LOW
+        ("file_path", "STRING"),
+        ("line_number", "INT32"),
+        ("method_fqn", "STRING"),
+        ("evidence", "STRING"),       # short human-readable evidence snippet
+    ]),
+
+    # ── External HTTP Client Calls (phase 32) ────────────────────────────────
+    ("HttpClientCall", [
+        ("node_id", "STRING"),
+        ("caller_fqn", "STRING"),     # method/function that makes the call
+        ("http_verb", "STRING"),      # GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS
+        ("url_pattern", "STRING"),    # static URL or best-effort extracted pattern
+        ("client_type", "STRING"),    # laravel_http|guzzle|curl|symfony_http
+        ("file_path", "STRING"),
+        ("line_number", "INT32"),
+    ]),
+
+    # ── Authorization Gates (phase 34) ──────────────────────────────────────
+    ("Gate", [
+        ("node_id", "STRING"),
+        ("name", "STRING"),           # gate ability name, e.g. "update-post"
+        ("callback_class", "STRING"), # class FQN implementing the gate, if any
+        ("file_path", "STRING"),
+        ("line_number", "INT32"),
     ]),
 ]
 
@@ -756,6 +831,66 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
     ("DEFINES_FACTORY", [
         ("Factory", "EloquentModel"),
     ], []),
+
+    # Feature clustering (phase 27)
+    ("BELONGS_TO_FEATURE", [
+        ("Route", "Feature"),
+        ("EloquentModel", "Feature"),
+        ("Class_", "Feature"),
+        ("Event", "Feature"),
+        ("Job", "Feature"),
+        ("Controller", "Feature"),
+        ("FormRequest", "Feature"),
+        ("Policy", "Feature"),
+        ("Observer", "Feature"),
+    ], [
+        ("confidence", "FLOAT"),   # 1.0=route, 0.8=model, 0.7=class, 0.6=event/job
+        ("match_type", "STRING"),  # exact|contains|prefix
+    ]),
+
+    # Behavioral contracts (phase 28)
+    ("GOVERNS", [
+        ("Contract", "Route"),
+        ("Contract", "Class_"),
+        ("Contract", "EloquentModel"),
+        ("Contract", "FormRequest"),
+        ("Contract", "Policy"),
+        ("Contract", "Observer"),
+    ], [
+        ("role", "STRING"),  # validates|authorizes|observes|fillable|guarded
+    ]),
+
+    # Test coverage (phase 30)
+    ("TESTS", [
+        ("TestCase", "Route"),
+        ("TestCase", "Class_"),
+        ("TestCase", "Method"),
+    ], []),
+
+    # Performance risks (phase 31)
+    ("HAS_PERFORMANCE_RISK", [
+        ("Method", "PerformanceRisk"),
+    ], []),
+
+    # External HTTP calls (phase 32)
+    ("CALLS_EXTERNAL", [
+        ("Method", "HttpClientCall"),
+        ("Function_", "HttpClientCall"),
+    ], [
+        ("http_verb", "STRING"),
+        ("line", "INT32"),
+    ]),
+
+    # Authorization gates (phase 34)
+    ("DEFINES_GATE", [
+        ("ServiceProvider", "Gate"),
+        ("Class_", "Gate"),
+        ("File", "Gate"),
+    ], [("line", "INT32")]),
+    ("CHECKS_GATE", [
+        ("Method", "Gate"),
+        ("Function_", "Gate"),
+    ], [("ability", "STRING"), ("line", "INT32")]),
 ]
 
 

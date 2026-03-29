@@ -389,7 +389,8 @@ class TestAssemblePluginCode:
 
     def test_store_tool_always_present(self):
         code = _assemble_plugin_code(self._make_spec(), _empty_anchors())
-        assert "def item_store_discoveries()" in code
+        # Now accepts a free-text findings param
+        assert "def item_store_discoveries(findings: str)" in code
 
     def test_llm_tool_present(self):
         code = _assemble_plugin_code(self._make_spec(), _empty_anchors())
@@ -452,9 +453,14 @@ class TestBuildTemplateFallback:
         code = _build_template_fallback("Show reservation lifecycle")
         assert "reservation" in code or "lifecycle" in code
 
-    def test_prefix_not_laravelgraph(self):
+    def test_tool_prefix_not_laravelgraph(self):
+        # The generated tool function names should not start with laravelgraph_,
+        # but the docstring may reference laravelgraph_plugin_knowledge() — that's OK.
         code = _build_template_fallback("Show all things")
-        assert "laravelgraph_" not in code
+        import re
+        tool_defs = re.findall(r'def\s+(\w+)\s*\(', code)
+        for fn in tool_defs:
+            assert not fn.startswith("laravelgraph_"), f"Tool function name should not start with laravelgraph_: {fn}"
 
     def test_summary_tool_present(self):
         code = _build_template_fallback("Show order status history")

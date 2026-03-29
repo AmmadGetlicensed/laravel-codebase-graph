@@ -43,13 +43,14 @@ _CLASS_REF_PATTERN = re.compile(r"([A-Za-z_\\]+)::class")
 _STRING_ARG_PATTERN = re.compile(r"['\"]([^'\"]+)['\"]")
 
 # Parse $fillable, $guarded, $casts, $with, $table arrays
-_TABLE_PATTERN = re.compile(r"\\\$table\s*=\s*['\"]([^'\"]+)['\"]")
-_TIMESTAMPS_PATTERN = re.compile(r"\\\$timestamps\s*=\s*(false|true)")
+# Note: r"\$foo" in Python regex means literal "$foo" (dollar sign, not anchor)
+_TABLE_PATTERN = re.compile(r"\$table\s*=\s*['\"]([^'\"]+)['\"]")
+_TIMESTAMPS_PATTERN = re.compile(r"\$timestamps\s*=\s*(false|true)")
 _SOFT_DELETES_PATTERN = re.compile(r"use\s+SoftDeletes\s*[;,{]")
-_FILLABLE_PATTERN = re.compile(r"\\\$fillable\s*=\s*\[([^\]]*)\]", re.DOTALL)
-_GUARDED_PATTERN = re.compile(r"\\\$guarded\s*=\s*\[([^\]]*)\]", re.DOTALL)
-_CASTS_PATTERN = re.compile(r"\\\$casts\s*=\s*\[([^\]]*)\]", re.DOTALL)
-_WITH_PATTERN = re.compile(r"\\\$with\s*=\s*\[([^\]]*)\]", re.DOTALL)
+_FILLABLE_PATTERN = re.compile(r"\$fillable\s*=\s*\[([^\]]*)\]", re.DOTALL)
+_GUARDED_PATTERN = re.compile(r"\$guarded\s*=\s*\[([^\]]*)\]", re.DOTALL)
+_CASTS_PATTERN = re.compile(r"\$casts\s*=\s*\[([^\]]*)\]", re.DOTALL)
+_WITH_PATTERN = re.compile(r"\$with\s*=\s*\[([^\]]*)\]", re.DOTALL)
 _STRING_LIST_PATTERN = re.compile(r"['\"]([^'\"]+)['\"]")
 
 
@@ -245,7 +246,7 @@ def run(ctx: PipelineContext) -> None:
         # Create or update EloquentModel node
         model_node_id = make_node_id("model", class_fqn)
         try:
-            db._insert_node("EloquentModel", {
+            db.upsert_node("EloquentModel", {
                 "node_id": model_node_id,
                 "name": class_name,
                 "fqn": class_fqn,
@@ -259,7 +260,7 @@ def run(ctx: PipelineContext) -> None:
                 "timestamps": meta["timestamps"],
             })
         except Exception as exc:
-            logger.debug("EloquentModel insert failed", fqn=class_fqn, error=str(exc))
+            logger.debug("EloquentModel upsert failed", fqn=class_fqn, error=str(exc))
 
         # Parse relationships
         try:

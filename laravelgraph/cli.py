@@ -2139,6 +2139,78 @@ db_app = typer.Typer(
 app.add_typer(db_app, name="db-connections", rich_help_panel="1. Setup & Indexing")
 
 
+# ── agent ─────────────────────────────────────────────────────────────────────
+
+agent_app = typer.Typer(
+    name="agent",
+    help="Install agent instruction files for AI tools (Claude Code, OpenCode, Cursor).",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(agent_app, name="agent", rich_help_panel="4. Server & Agent Integration")
+
+
+@agent_app.command(name="install")
+def agent_install(
+    path: Optional[Path] = PathArg,
+    tool: str = typer.Option(
+        "claude-code",
+        "--tool", "-t",
+        help="Target agent tool: claude-code | opencode | cursor | all",
+    ),
+) -> None:
+    """Install LaravelGraph agent instructions for your AI coding tool.
+
+    Writes a detailed protocol block to the config file that your AI agent
+    reads at session start — tool hierarchy, investigation workflows, plugin
+    workflow, store_discoveries protocol, and common pitfalls.
+
+    The block is idempotent: running the command again after a LaravelGraph
+    upgrade replaces the existing section in-place.
+
+    Supported targets:
+      claude-code  → CLAUDE.md  (project root)
+      opencode     → .opencode/instructions.md
+      cursor       → .cursorrules
+      all          → all three files
+
+    Examples:
+      laravelgraph agent install .                        # Claude Code (default)
+      laravelgraph agent install . --tool opencode
+      laravelgraph agent install . --tool all
+    """
+    from laravelgraph.agent_installer import (
+        install_for_claude_code,
+        install_for_cursor,
+        install_for_opencode,
+        INSTALL_TARGETS,
+    )
+
+    root = _project_root(path)
+
+    valid = set(INSTALL_TARGETS) | {"all"}
+    if tool not in valid:
+        console.print(f"[red]Unknown tool '{tool}'.[/red]  Valid: {', '.join(sorted(valid))}")
+        raise typer.Exit(1)
+
+    targets_to_run = list(INSTALL_TARGETS) if tool == "all" else [tool]
+    installers = {
+        "claude-code": install_for_claude_code,
+        "opencode":    install_for_opencode,
+        "cursor":      install_for_cursor,
+    }
+
+    for t in targets_to_run:
+        fn = installers[t]
+        written = fn(root)
+        console.print(f"[green]✓[/green] [bold]{t}[/bold] → {written.relative_to(root)}")
+
+    console.print()
+    console.print(
+        "[dim]Re-run after upgrading LaravelGraph to refresh the instructions.[/dim]"
+    )
+
+
 # ── plugin ─────────────────────────────────────────────────────────────────────
 
 plugin_app = typer.Typer(

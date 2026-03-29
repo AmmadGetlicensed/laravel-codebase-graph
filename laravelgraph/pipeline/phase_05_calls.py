@@ -37,7 +37,6 @@ _EVENT_FACADE_RE   = re.compile(r'Event::dispatch\s*\(\s*new\s+([\w\\]+)\s*\(')
 
 
 def run(ctx: PipelineContext) -> None:
-    """Trace all call expressions and write CALLS edges into the graph."""
     with phase_timer("Call Graph Tracing"):
         db = ctx.db
         project_root = ctx.project_root
@@ -47,6 +46,8 @@ def run(ctx: PipelineContext) -> None:
         facades_resolved = 0
 
         use_aliases: dict[str, dict[str, str]] = getattr(ctx, "_use_aliases", {})
+
+        _build_short_name_index(ctx)
 
         for path_str, parsed in ctx.parsed_php.items():
             filepath = Path(path_str)
@@ -413,17 +414,40 @@ def _resolve_class_name(
     file_aliases: dict[str, str],
     ctx: PipelineContext,
 ) -> str | None:
-    """Resolve a short class name to a fully-qualified name using use-statement aliases."""
-    # Direct alias match
     if name in file_aliases:
         return file_aliases[name]
-    # Already in fqn_index as-is
     if name in ctx.fqn_index:
         return name
-    # Already a FQN (contains backslash)
     if "\\" in name and name in ctx.fqn_index:
         return name
+    fqn = _resolve_short_name(name, ctx)
+    if fqn:
+        return fqn
     return None
+
+
+_PREFERRED_NAMESPACES = ("App\\Models\\", "App\\Services\\", "App\\Http\\Controllers\\")
+
+
+def _build_short_name_index(ctx: PipelineContext) -> None:
+    index: dict[str, list[str]] = {}
+    for fqn in ctx.fqn_index:
+        short = fqn.split("\\")[-1].split("::")[-1]
+        index.setdefault(short, []).append(fqn)
+    ctx._short_name_index = index  # type: ignore[attr-defined]
+
+
+def _resolve_short_name(short: str, ctx: PipelineContext) -> str | None:
+    index: dict[str, list[str]] = getattr(ctx, "_short_name_index", {})
+    candidates = index.get(short, [])
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    for fqn in candidates:
+        if any(fqn.startswith(p) for p in _PREFERRED_NAMESPACES):
+            return fqn
+    return candidates[0]
 
 
 def _infer_label(node_id: str) -> str:

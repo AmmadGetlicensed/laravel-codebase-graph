@@ -138,14 +138,14 @@ class TestRelTypesAreUnique:
     def test_no_duplicate_rel_type_names(self):
         seen = set()
         duplicates = []
-        for label, _ in REL_TYPES:
+        for label, *_ in REL_TYPES:
             if label in seen:
                 duplicates.append(label)
             seen.add(label)
         assert duplicates == [], f"Duplicate relationship type names: {duplicates}"
 
     def test_no_empty_rel_type_labels(self):
-        for label, _ in REL_TYPES:
+        for label, *_ in REL_TYPES:
             assert label, "Empty rel type label found"
 
     def test_minimum_rel_type_count(self):
@@ -155,12 +155,12 @@ class TestRelTypesAreUnique:
         assert isinstance(REL_TYPES, list)
         for item in REL_TYPES:
             assert isinstance(item, tuple)
-            assert len(item) == 2
+            assert len(item) >= 2
 
 
 class TestRelTypesCoverage:
     def _labels(self) -> set[str]:
-        return {label for label, _ in REL_TYPES}
+        return {label for label, *_ in REL_TYPES}
 
     def test_core_code_relationships(self):
         labels = self._labels()

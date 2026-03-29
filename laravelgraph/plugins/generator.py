@@ -802,57 +802,46 @@ def _build_summary_tool(prefix: str, summary_text: str) -> str:
     )
 
 
-def _build_store_tool(prefix: str, slug: str, anchors: dict) -> str:
+def _build_store_tool(prefix: str, slug: str) -> str:
     """Assemble the {prefix}store_discoveries tool.
 
-    Writes key domain facts from the graph into the plugin knowledge graph so
-    future agent sessions can read accumulated domain knowledge without re-running
-    the full analysis.
+    Accepts a free-text ``findings`` string from the agent and stores it as a
+    "Discovery" node in the plugin knowledge graph.  This is the right API:
+    agents record their own observations rather than auto-dumping route lists.
 
     All string literals in the generated code use double quotes to avoid quote
     conflicts when the tool is assembled inside f-strings.
     """
     fn_name = prefix.rstrip("_") + "_store_discoveries"
-
-    # Use double-quote repr for slug to avoid single-quote collisions in generated code
     slug_dq = '"' + slug.replace('"', '\\"') + '"'
-
-    # Derive a URI keyword to filter routes (if we have route anchors)
-    uri_keyword = ""
-    if anchors.get("routes"):
-        parts = (anchors["routes"][0].get("uri") or "").strip("/").split("/")
-        uri_keyword = parts[0] if parts else ""
-
-    if uri_keyword:
-        query_line = (
-            f'        rows = db().execute(\n'
-            f'            "MATCH (r:Route) WHERE r.uri CONTAINS \\"{uri_keyword}\\" '\
-            f'RETURN r.http_method AS m, r.uri AS u, r.action_method AS a LIMIT 50"\n'
-            f'        )\n'
-        )
-    else:
-        query_line = (
-            f'        rows = db().execute(\n'
-            f'            "MATCH (r:Route) RETURN r.http_method AS m, r.uri AS u, r.action_method AS a LIMIT 50"\n'
-            f'        )\n'
-        )
 
     return (
         f"    @mcp.tool()\n"
-        f"    def {fn_name}() -> str:\n"
-        f'        "Store discovered domain facts into the plugin knowledge graph for future sessions."\n'
-        f"        stored = 0\n"
-        + query_line +
-        f"        for row in rows:\n"
-        f"            db().plugin().upsert_plugin_node(\n"
-        f"                plugin_source={slug_dq},\n"
-        f'                label="DomainRoute",\n'
-        f'                node_id="domain:" + {slug_dq} + ":route:" + (row.get("u") or ""),\n'
-        f'                data={{"uri": row.get("u"), "method": row.get("m"), "action": row.get("a")}},\n'
-        f'                core_ref=row.get("u") or "",\n'
-        f"            )\n"
-        f"            stored += 1\n"
-        f'        return "Stored " + str(stored) + " domain facts for {slug}."\n'
+        f"    def {fn_name}(findings: str) -> str:\n"
+        f'        """Store agent findings about this domain into the plugin knowledge graph.\n'
+        f'\n'
+        f'        Call this after any investigation with a plain-text summary of what you\n'
+        f'        found.  Examples: unusual patterns, business rules encoded in code,\n'
+        f'        cross-domain dependencies, performance risks, open questions, confirmed\n'
+        f'        behaviours, or edge-cases discovered.\n'
+        f'\n'
+        f'        These findings persist across sessions and are surfaced by the built-in\n'
+        f'        laravelgraph_plugin_knowledge() tool in every future conversation.\n'
+        f'        """\n'
+        f"        import datetime as _dt\n"
+        f"        _ts = _dt.datetime.utcnow().isoformat()\n"
+        f"        node_id = {slug_dq} + \":discovery:\" + _ts\n"
+        f"        db().plugin().upsert_plugin_node(\n"
+        f"            plugin_source={slug_dq},\n"
+        f'            label="Discovery",\n'
+        f"            node_id=node_id,\n"
+        f'            data={{"findings": findings, "recorded_at": _ts}},\n'
+        f'            core_ref="",\n'
+        f"        )\n"
+        f'        return (\n'
+        f'            "Discovery stored for " + {slug_dq} + ". "\n'
+        f'            "It will appear in laravelgraph_plugin_knowledge() in future sessions."\n'
+        f'        )\n'
     )
 
 
@@ -874,13 +863,15 @@ def _assemble_plugin_code(spec: dict, anchors: dict) -> str:
     all_tool_names = [summary_fn] + llm_tool_names + [store_fn]
 
     summary_text = _build_summary_text(anchors, all_tool_names)
+    # Append inline nudge so agents see the call-to-action at the end of summary output
+    summary_text += f"\n\n→ Call `{store_fn}(findings)` with anything notable you discover — patterns, rules, risks, anomalies."
 
     # Build all tool blocks
     tool_blocks: list[str] = []
     tool_blocks.append(_build_summary_tool(prefix, summary_text))
     for tool_spec in spec.get("tools", []):
         tool_blocks.append(_build_query_tool(prefix, tool_spec))
-    tool_blocks.append(_build_store_tool(prefix, slug, anchors))
+    tool_blocks.append(_build_store_tool(prefix, slug))
 
     import json as _json
     first_desc = spec.get("tools", [{}])[0].get("description", slug) if spec.get("tools") else slug
@@ -948,6 +939,8 @@ def _build_template_fallback(description: str) -> str:
     if not tool_fn.startswith(prefix.rstrip("_")):
         tool_fn = prefix.rstrip("_") + "_" + tool_fn
     summary_fn = prefix.rstrip("_") + "_summary"
+    store_fn = prefix.rstrip("_") + "_store_discoveries"
+    slug_dq = '"' + slug.replace('"', '\\"') + '"'
     desc_safe = repr(description[:120])
     note = repr(f"Skeleton plugin — edit the Cypher query to match: {description[:80]}")
     return (
@@ -963,7 +956,7 @@ def _build_template_fallback(description: str) -> str:
         f'    @mcp.tool()\n'
         f'    def {summary_fn}() -> str:\n'
         f'        {note}\n'
-        f'        return {note}\n'
+        f'        return {note} + "\\n\\n→ Call `{store_fn}(findings)` with anything notable you discover."\n'
         f'\n'
         f'    @mcp.tool()\n'
         f'    def {tool_fn}() -> str:\n'
@@ -976,6 +969,8 @@ def _build_template_fallback(description: str) -> str:
         f'            return "No data found."\n'
         f'        lines = [f"[{{r.get(\'m\', \'?\')}}] {{r.get(\'u\', \'?\')}} -> {{r.get(\'a\', \'?\')}}" for r in rows]\n'
         f'        return "\\n".join(lines)\n'
+        f'\n'
+        + _build_store_tool(prefix, slug)
     )
 
 

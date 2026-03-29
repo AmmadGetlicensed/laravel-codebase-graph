@@ -86,6 +86,19 @@ _ELOQUENT_STATIC_RE = re.compile(
     re.MULTILINE,
 )
 
+_INSTANCE_WRITE_RE = re.compile(
+    r"\$(\w+)\s*->\s*(save|update|delete|forceDelete|restore|push|increment|decrement"
+    r"|fill|forceFill|saveOrFail|saveQuietly|updateQuietly|deleteQuietly)\s*\(",
+    re.MULTILINE,
+)
+
+_RELATION_WRITE_RE = re.compile(
+    r"\$\w+\s*->\s*(\w+)\s*\(\s*\)\s*->\s*(create|createMany|save|saveMany"
+    r"|update|updateOrCreate|firstOrCreate|firstOrNew|attach|detach|sync"
+    r"|syncWithoutDetaching|toggle|updateExistingPivot)\s*\(",
+    re.MULTILINE,
+)
+
 # Read-only Eloquent/QB operations
 _READ_METHODS = frozenset({
     "where", "whereIn", "whereNotIn", "whereHas", "with", "find", "findOrFail",
@@ -398,7 +411,7 @@ def _scan_file(
     write_evidence: dict[str, list[dict]],   # col_nid → [evidence]
     guard_evidence: dict[str, list[dict]],   # col_nid → [guard]
 ) -> dict[str, int]:
-    stats = {"queries_table": 0, "write_evidence": 0, "guard_hits": 0}
+    stats = {"queries_table": 0, "write_evidence": 0, "guard_hits": 0, "dynamic_table_refs": 0}
     file_str = str(php_path)
     file_methods = method_file_map.get(file_str, [])
 
@@ -449,7 +462,24 @@ def _scan_file(
             _upsert_queries_table(ctx, method_nid, table_nid, operation, connection, "query_builder", 0.95, line)
             stats["queries_table"] += 1
 
-    # ── 2. ->join() / ->leftJoin() etc ───────────────────────────────────────
+    _dynamic_table_re = re.compile(
+        r"\bDB::(?:connection\([^)]*\)\s*->\s*)?table\(\s*\$(\w+)",
+        re.MULTILINE,
+    )
+    for m in _dynamic_table_re.finditer(source):
+        line = _get_line_number(source, m.start())
+        method_ctx = _method_at_line(file_methods, line)
+        if method_ctx:
+            method_nid, method_fqn = method_ctx
+            try:
+                ctx.db.execute(
+                    "MATCH (m:Method {node_id: $nid}) SET m.has_dynamic_table_ref = true",
+                    {"nid": method_nid},
+                )
+            except Exception:
+                pass
+            stats["dynamic_table_refs"] += 1
+
     for m in _JOIN_RE.finditer(source):
         table_name = m.group(1)
         line = _get_line_number(source, m.start())
@@ -517,7 +547,103 @@ def _scan_file(
             _upsert_queries_table(ctx, method_nid, tbl_nid, operation, default_connection, "eloquent", 0.90, line)
             stats["queries_table"] += 1
 
-    # ── 5. Write-path evidence: $model->some_id = $expr ──────────────────────
+    for m in _INSTANCE_WRITE_RE.finditer(source):
+        var_name = m.group(1)
+        method_name = m.group(2)
+        line = _get_line_number(source, m.start())
+
+        var_class = var_name[0].upper() + var_name[1:] if var_name else ""
+        model_info = model_lookup.get(var_class)
+        if not model_info:
+            for candidate in (var_name.capitalize(), var_name.title().replace("_", "")):
+                model_info = model_lookup.get(candidate)
+                if model_info:
+                    break
+        if not model_info or not model_info.get("db_table"):
+            continue
+
+        db_table = model_info["db_table"]
+        tbl_nid = table_lookup.get(db_table)
+        if not tbl_nid:
+            continue
+
+        operation = "write" if method_name in ("save", "update", "delete", "forceDelete",
+                                                 "saveOrFail", "saveQuietly", "updateQuietly",
+                                                 "deleteQuietly", "push", "fill", "forceFill") else "write"
+        operation = "delete" if "delete" in method_name.lower() else "write"
+        method_ctx = _method_at_line(file_methods, line)
+        if method_ctx:
+            method_nid, _ = method_ctx
+            _upsert_queries_table(ctx, method_nid, tbl_nid, operation, default_connection,
+                                  "eloquent_instance", 0.85, line)
+            stats["queries_table"] += 1
+
+    for m in _RELATION_WRITE_RE.finditer(source):
+        relation_name = m.group(1)
+        chain_method = m.group(2)
+        line = _get_line_number(source, m.start())
+
+        method_ctx = _method_at_line(file_methods, line)
+        if not method_ctx:
+            continue
+        method_nid, method_fqn = method_ctx
+
+        class_fqn = "::".join(method_fqn.split("::")[:-1]) if "::" in method_fqn else ""
+        if not class_fqn:
+            continue
+
+        try:
+            rel_rows = ctx.db.execute(
+                "MATCH (c:Class_)-[:DEFINES]->(m:Method {name: $rname}) "
+                "WHERE c.fqn = $cfqn "
+                "RETURN m.node_id AS mnid LIMIT 1",
+                {"cfqn": class_fqn, "rname": relation_name},
+            )
+        except Exception:
+            rel_rows = []
+
+        if not rel_rows:
+            continue
+
+        try:
+            related_rows = ctx.db.execute(
+                "MATCH (m:Method {node_id: $mnid})<-[:DEFINES]-(c)-[:HAS_RELATIONSHIP]->"
+                "(related:EloquentModel) "
+                "WHERE m.name = $rname "
+                "RETURN related.db_table AS tbl LIMIT 1",
+                {"mnid": rel_rows[0].get("mnid", ""), "rname": relation_name},
+            )
+        except Exception:
+            related_rows = []
+
+        if not related_rows:
+            for model_name, info in model_lookup.items():
+                snake = re.sub(r"(?<!^)(?=[A-Z])", "_", model_name).lower()
+                if relation_name == snake or relation_name == snake + "s" or relation_name == model_name[0].lower() + model_name[1:] + "s":
+                    db_table = info.get("db_table", "")
+                    if db_table:
+                        tbl_nid = table_lookup.get(db_table)
+                        if tbl_nid:
+                            operation = "write" if chain_method in ("create", "createMany", "save",
+                                                                     "saveMany", "update", "updateOrCreate",
+                                                                     "firstOrCreate") else "write"
+                            _upsert_queries_table(ctx, method_nid, tbl_nid, operation,
+                                                  default_connection, "eloquent_relation", 0.75, line)
+                            stats["queries_table"] += 1
+                    break
+            continue
+
+        db_table = related_rows[0].get("tbl", "")
+        if db_table:
+            tbl_nid = table_lookup.get(db_table)
+            if tbl_nid:
+                operation = "write" if chain_method in ("create", "createMany", "save",
+                                                         "saveMany", "update", "updateOrCreate",
+                                                         "firstOrCreate") else "write"
+                _upsert_queries_table(ctx, method_nid, tbl_nid, operation,
+                                      default_connection, "eloquent_relation", 0.80, line)
+                stats["queries_table"] += 1
+
     for m in _PROP_WRITE_RE.finditer(source):
         var_name = m.group(1)
         col_name = m.group(2)
@@ -775,6 +901,7 @@ def run(ctx: PipelineContext) -> None:
     total_queries = 0
     total_write_ev = 0
     total_guard = 0
+    total_dynamic = 0
     files_scanned = 0
 
     logger.info("Scanning PHP files for DB access patterns", files=len(ctx.php_files))
@@ -789,6 +916,7 @@ def run(ctx: PipelineContext) -> None:
             total_queries += stats["queries_table"]
             total_write_ev += stats["write_evidence"]
             total_guard += stats["guard_hits"]
+            total_dynamic += stats.get("dynamic_table_refs", 0)
             files_scanned += 1
         except Exception as exc:
             logger.debug("File scan failed", path=str(php_path), error=str(exc))
@@ -821,6 +949,7 @@ def run(ctx: PipelineContext) -> None:
     )
 
     ctx.stats["db_access_queries_table"] = total_queries
+    ctx.stats["db_access_dynamic_table_refs"] = total_dynamic
     ctx.stats["db_access_write_evidence"] = total_write_ev
     ctx.stats["db_access_guard_hits"] = total_guard
     ctx.stats["db_access_polymorphic_pairs"] = pairs_marked

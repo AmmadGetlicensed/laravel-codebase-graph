@@ -5958,6 +5958,79 @@ MANDATORY RULES
                 "Run laravelgraph analyze to re-index the project",
             )
 
+    # ── Tool: laravelgraph_outbound_apis ─────────────────────────────────────
+
+    @mcp.tool()
+    def laravelgraph_outbound_apis(caller: str = "", url_contains: str = "") -> str:
+        """Show all outbound HTTP calls made by this application — external API dependencies.
+
+        Queries HttpClientCall nodes created by phase 32, which detects Laravel
+        Http:: facade calls, Guzzle requests, and curl usage.  Use this to:
+        - Understand what third-party services this app depends on
+        - Find all callers before a planned API migration
+        - Audit PCI/GDPR: which code sends data to external services?
+
+        Args:
+            caller:       Filter by calling class/method FQN (partial match)
+            url_contains: Filter by URL pattern substring (e.g. 'stripe', 'sendgrid')
+        """
+        start = time.perf_counter()
+        db = _db()
+        try:
+            rows = db.execute(
+                "MATCH (h:HttpClientCall) RETURN "
+                "h.caller_fqn AS caller, h.http_verb AS verb, "
+                "h.url_pattern AS url, h.client_type AS client, "
+                "h.file_path AS path, h.line_number AS line "
+                "ORDER BY h.url_pattern LIMIT 200"
+            )
+            if not rows:
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_outbound_apis", {}, 0, elapsed)
+                return (
+                    "No outbound HTTP calls detected in the index.\n\n"
+                    "This means either:\n"
+                    "- The codebase has no Http::, Guzzle, or curl calls\n"
+                    "- The index was built before phase 32 was added — re-run: `laravelgraph analyze`"
+                )
+
+            # Apply filters
+            if caller:
+                rows = [r for r in rows if caller.lower() in (r.get("caller") or "").lower()]
+            if url_contains:
+                rows = [r for r in rows if url_contains.lower() in (r.get("url") or "").lower()]
+
+            if not rows:
+                elapsed = (time.perf_counter() - start) * 1000
+                _log_tool("laravelgraph_outbound_apis", {"caller": caller, "url_contains": url_contains}, 0, elapsed)
+                return f"No outbound HTTP calls matching the filters (caller='{caller}', url_contains='{url_contains}')."
+
+            # Group by URL domain/pattern for readability
+            lines = [f"## Outbound API Calls ({len(rows)} found)\n"]
+            for r in rows:
+                verb    = r.get("verb") or "?"
+                url     = r.get("url") or "?"
+                c       = r.get("caller") or "?"
+                client  = r.get("client") or "?"
+                lineno  = r.get("line") or 0
+                fpath   = r.get("path") or "?"
+                lines.append(
+                    f"- **[{verb}]** `{url}`\n"
+                    f"  Caller: `{c}` ({fpath}:{lineno})  via: {client}"
+                )
+
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_outbound_apis", {"caller": caller, "url_contains": url_contains}, len(rows), elapsed)
+            return "\n".join(lines)
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            _log_tool("laravelgraph_outbound_apis", {}, 0, elapsed)
+            return (
+                f"Error querying outbound APIs: {e}\n\n"
+                "If the error mentions 'HttpClientCall', the index may predate phase 32 — "
+                "run `laravelgraph analyze` to rebuild."
+            )
+
     # ── Tool: laravelgraph_request_plugin ────────────────────────────────────
 
     @mcp.tool()

@@ -35,6 +35,12 @@ laravelgraph plugin evolve .            # detect gaps + drift, generate top-N pl
 laravelgraph plugin evolve . --dry-run  # show what would be generated without generating
 laravelgraph plugin evolve . -n 2       # limit to 2 plugins per run
 
+# Agent instruction installer
+laravelgraph agent install .                         # install for Claude Code (writes to CLAUDE.md)
+laravelgraph agent install . --tool opencode         # install for OpenCode (.opencode/instructions.md)
+laravelgraph agent install . --tool cursor           # install for Cursor (.cursorrules)
+laravelgraph agent install . --tool all              # install for all three tools
+
 # Log management
 laravelgraph logs                        # show recent logs
 laravelgraph logs --level error         # filter by level
@@ -50,7 +56,7 @@ laravelgraph logs clear --all           # clear all logs (with confirmation)
 
 ## Architecture
 
-LaravelGraph is a **26-phase analysis pipeline** that indexes a Laravel/PHP codebase into a local KuzuDB graph database, then exposes it via an MCP server to AI agents.
+LaravelGraph is a **33-phase analysis pipeline** that indexes a Laravel/PHP codebase into a local KuzuDB graph database, then exposes it via an MCP server to AI agents.
 
 ### Data flow
 
@@ -159,6 +165,22 @@ Three-stage engine that makes plugin knowledge self-sustaining:
 2. **Stage 2 — Evolution (`plugins/self_improve.py: check_domain_drift`):** Captures a snapshot of graph counts (route/model/event) at generation time via `take_domain_snapshot()`, stored in `PluginMeta.domain_coverage_snapshot`. On startup, compares current counts to snapshot. Triggers regeneration when routes change >20%, any new model appears, or Feature's `has_changes` flag is set. Uses a 14-day drift cooldown to avoid thrashing.
 
 3. **Stage 3 — Consolidation (`mcp/server.py: laravelgraph_plugin_knowledge`):** MCP tool that queries `plugin_graph.kuzu` for all discoveries accumulated by plugins. Agents call `store_discoveries()` during investigations; `laravelgraph_plugin_knowledge()` makes that institutional knowledge available in every future conversation. Plugins with discoveries show `[N discoveries]` in the LOADED PLUGINS section.
+
+**`store_discoveries` — free-text agent findings:**
+
+Each generated plugin has a `{prefix}store_discoveries(findings: str)` tool. The agent passes a plain-text summary of what it found (e.g. "Users table has soft-deletes. Admin flag is role_id FK not a boolean."). The finding is stored as a `Discovery` node in `plugin_graph.kuzu` with a timestamp. Future agents read it via `laravelgraph_plugin_knowledge()`. The `{prefix}summary` output always ends with a nudge: `→ Call {prefix}store_discoveries(findings)` so agents see the reminder immediately.
+
+**Agent Instruction Installer (`laravelgraph/agent_installer.py`):**
+
+`laravelgraph agent install` writes an optimized agent instruction block to the file your AI tool reads at session start. It teaches the agent the correct tool hierarchy, investigation protocol, plugin workflow, `store_discoveries` protocol, and common pitfalls. Idempotent — run after each LaravelGraph upgrade to refresh. Supported targets: `CLAUDE.md` (Claude Code), `.opencode/instructions.md` (OpenCode), `.cursorrules` (Cursor).
+
+**New pipeline phases:**
+
+- **Phase 32 — External HTTP Client Detection** (`phase_32_http_clients.py`): Detects outbound `Http::`, Guzzle, and `curl_*` calls. Creates `HttpClientCall` nodes linked via `CALLS_EXTERNAL` edges from the calling Method. Exposed by `laravelgraph_outbound_apis()` MCP tool.
+- **Phase 33 — Notification Channel Enrichment** (`phase_33_notifications.py`): Parses `via()` methods on `Notification` subclasses to populate the `channels` field. Also detects `Mailable` classes and adds them as Notification nodes with `channels=["mail"]`.
+
+**New schema nodes:** `HttpClientCall`, `Gate`
+**New schema rels:** `CALLS_EXTERNAL`, `DEFINES_GATE`, `CHECKS_GATE`
 
 **CI/cron integration:**
 

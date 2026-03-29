@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### `store_discoveries` Redesign
+- `{prefix}store_discoveries(findings: str)` — accepts free-text agent findings instead of auto-querying routes; stores as `Discovery` label node in `plugin_graph.kuzu`
+- `{prefix}summary` output now ends with `→ Call {prefix}store_discoveries(findings)` nudge so agents see the call-to-action immediately after reading the domain overview
+
+#### Agent Instruction Installer
+- `laravelgraph agent install [path] [--tool claude-code|opencode|cursor|all]` — writes optimized agent instruction block to the AI tool's config file (CLAUDE.md, .opencode/instructions.md, .cursorrules)
+- Instruction block covers: tool hierarchy, investigation protocol, plugin workflow, `store_discoveries` protocol, common pitfalls, performance/security patterns, CI plugin evolve setup
+- Idempotent — re-running replaces the existing section; safe to run after upgrades
+- `laravelgraph/agent_installer.py` — new module with `build_agent_block()`, `install_for_claude_code()`, `install_for_opencode()`, `install_for_cursor()`, `_upsert_section()`
+
+#### New Pipeline Phases
+- **Phase 32** (`phase_32_http_clients.py`) — External HTTP Client Detection: detects outbound `Http::`, Guzzle, and `curl_*` calls; creates `HttpClientCall` nodes with `CALLS_EXTERNAL` edges
+- **Phase 33** (`phase_33_notifications.py`) — Notification Channel Enrichment: parses `via()` methods to populate `channels` on Notification nodes; detects Mailable classes
+
+#### New MCP Tool
+- `laravelgraph_outbound_apis(caller="", url_contains="")` — shows all outbound HTTP calls grouped by caller; filterable by caller FQN or URL substring; shows client type (laravel_http/guzzle/curl)
+
+#### New Graph Schema
+- `HttpClientCall` node type: `caller_fqn`, `http_verb`, `url_pattern`, `client_type`, `file_path`, `line_number`
+- `Gate` node type: `name`, `callback_class`, `file_path`, `line_number`
+- `CALLS_EXTERNAL` rel: Method/Function_ → HttpClientCall
+- `DEFINES_GATE` rel: ServiceProvider/Class_/File → Gate
+- `CHECKS_GATE` rel: Method/Function_ → Gate
+
+### Tests
+- 37 new tests in `tests/unit/plugins/test_store_discoveries.py` and `tests/unit/test_agent_installer.py`
+
+## [0.3.0] — 2026-03-28
+
+### Added
+
+#### Plugin System — Auto-Generation & Self-Improvement
+- `laravelgraph_request_plugin(description)` MCP tool — agents can request new plugins via natural language; system generates, validates (4 layers), and deploys automatically
+- `laravelgraph_update_plugin(name, critique)` MCP tool — agents can request plugin regeneration with specific critique
+- `laravelgraph_remove_plugin(name, reason)` MCP tool — agents can remove underperforming plugins; reason is logged to prevent future regeneration
+- Plugin graph (`plugin_graph.kuzu`) — separate writable KuzuDB for plugin-stored runtime knowledge; persists across conversations
+- `DualDB` wrapper — plugins now receive `db.core()` (read-only core graph) and `db.plugin()` (writable plugin graph)
+- `PluginMetaStore` — tracks plugin status, usage stats, contribution scores, system prompts
+- Proactive self-improvement — plugins auto-regenerate when performance thresholds crossed (>25% empty results, >15% errors, >40% agent follow-up rate); 48-hour cooldown
+- 4-layer validation pipeline: (1) static AST, (2) schema validation against known node types, (3) execution dry-run, (4) LLM-as-judge with 7/10 threshold
+- Reflection loop — up to 3 generation iterations with critique feedback before failure
+
+#### Plugin CLI Commands
+- `laravelgraph plugin enable/disable` — enable or disable plugins without deleting
+- `laravelgraph plugin delete` — permanently remove plugin + graph data + meta
+- `laravelgraph plugin prompt` — attach system prompt to a plugin (auto-appended to server instructions)
+- `laravelgraph plugin list` — enhanced with contribution score %, health indicators, call counts
+
+#### Log Management
+- `laravelgraph logs` — view recent structured log entries with filtering
+- `laravelgraph logs tail` — live tail with Ctrl+C stop
+- `laravelgraph logs stats` — log statistics by level and tool
+- `laravelgraph logs clear` — remove old log files
+- `LogManager` class in `laravelgraph/logging_manager.py`
+
+#### `laravelgraph_cypher` Enhancement
+- Added `graph` parameter: `graph="plugin"` queries the plugin graph, `graph="core"` (default) queries core graph
+
+### Fixed
+- Database lock error during `laravelgraph analyze` when MCP server is running — MCP server now opens per-request connections (not persistent), releasing the lock between tool calls
+- `has_dynamic_table_ref` property missing from `Method` schema (caused errors in phase 26)
+- `changed_recently` and `changed_in_commit` properties missing from `Method` and `Class_` schema (caused errors in phase 29)
+- PHP Tree-sitter grammar detection in `laravelgraph download --check` (now checks `language_php` attribute)
+
+---
+
 ## [0.2.0] - 2026-03-27
 
 ### Added

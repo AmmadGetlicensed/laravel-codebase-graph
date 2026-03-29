@@ -44,7 +44,7 @@ class TestParseComposer:
 
 class TestLaravelVersion:
     def test_laravel_version_extracted(self, composer_info: ComposerInfo):
-        assert composer_info.laravel_version == "11.x"
+        assert composer_info.laravel_version == "11.0"  # fixture has "^11.0"
 
     def test_laravel_version_major_minor(self, tmp_path: Path):
         """Test version extraction from various constraint formats."""

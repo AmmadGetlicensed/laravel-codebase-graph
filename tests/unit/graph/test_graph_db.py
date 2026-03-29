@@ -135,21 +135,33 @@ class TestUpsertRelationship:
             })
 
     def test_create_calls_relationship(self, tmp_graph: GraphDB):
-        self._create_two_classes(tmp_graph, "Caller", "Callee")
-        caller_id = node_id("class", "App\\Caller")
-        callee_id = node_id("class", "App\\Callee")
+        # CALLS goes Method → Method; create two Method nodes
+        caller_id = node_id("method", "App\\Caller::call")
+        callee_id = node_id("method", "App\\Callee::handle")
+        for nid, name, fqn in [
+            (caller_id, "call", "App\\Caller::call"),
+            (callee_id, "handle", "App\\Callee::handle"),
+        ]:
+            tmp_graph.upsert_node("Method", {
+                "node_id": nid, "name": name, "fqn": fqn,
+                "file_path": f"/{name}.php", "line_start": 1, "line_end": 10,
+                "visibility": "public", "is_static": False, "is_abstract": False,
+                "return_type": "", "param_types": "[]", "docblock": "",
+                "is_dead_code": False, "laravel_role": "", "community_id": 0,
+                "embedding": [],
+            })
 
         tmp_graph.upsert_rel(
             rel_label="CALLS",
-            from_label="Class_",
+            from_label="Method",
             from_id=caller_id,
-            to_label="Class_",
+            to_label="Method",
             to_id=callee_id,
             props={"confidence": 0.9, "call_type": "direct", "line": 42},
         )
 
         rows = tmp_graph.execute(
-            "MATCH (a:Class_ {node_id: $aid})-[r:CALLS]->(b:Class_ {node_id: $bid}) "
+            "MATCH (a:Method {node_id: $aid})-[r:CALLS]->(b:Method {node_id: $bid}) "
             "RETURN r.confidence AS conf",
             {"aid": caller_id, "bid": callee_id},
         )
