@@ -594,6 +594,7 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
     ("ROUTES_TO", [
         ("Route", "Method"),
         ("Route", "Controller"),
+        ("Route", "Class_"),    # closure/invokable controller resolved to class
     ], [
         ("http_method", "STRING"),
         ("uri", "STRING"),
@@ -635,6 +636,8 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
         ("Method", "Notification"),
         ("Function_", "Event"),
         ("Function_", "Job"),
+        ("Listener", "Job"),    # listener handle() dispatches a job
+        ("Listener", "Event"),  # listener handle() re-dispatches an event
     ], [
         ("dispatch_type", "STRING"),  # event|job|notification
         ("is_queued", "BOOLEAN"),
@@ -651,6 +654,7 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
     ("NOTIFIES", [
         ("Method", "Notification"),
         ("Function_", "Notification"),
+        ("Listener", "Notification"),  # listener handle() sends a notification
     ], [("channels", "STRING")]),
 
     # Blade
@@ -786,6 +790,7 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
     # Authorization
     ("AUTHORIZES_WITH", [
         ("Method", "Policy"),
+        ("File", "File"),       # self-referential gate/policy usage noted at file level
     ], [("ability", "STRING"), ("line", "INT32")]),
     ("VALIDATES_WITH", [
         ("Method", "FormRequest"),
@@ -795,10 +800,13 @@ REL_TYPES: list[tuple[str, list[tuple[str, str]], list[tuple[str, str]]]] = [
     ("TRANSFORMS_WITH", [
         ("Method", "Resource"),
         ("Controller", "Resource"),
+        ("Method", "Class_"),   # resource class resolved as generic class (no Resource node yet)
     ], [("line", "INT32")]),
     ("SCHEDULES", [
         ("ServiceProvider", "ScheduledTask"),
         ("Command", "ScheduledTask"),
+        ("ScheduledTask", "Job"),      # scheduled task runs this job class
+        ("ScheduledTask", "Command"),  # scheduled task runs this artisan command
     ], [("frequency", "STRING")]),
 
     # Analysis

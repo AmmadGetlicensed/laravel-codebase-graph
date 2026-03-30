@@ -12,6 +12,7 @@ from laravelgraph.core.graph import GraphDB
 from laravelgraph.core.registry import Registry
 from laravelgraph.logging import get_logger, get_pipeline_logger, phase_timer
 from laravelgraph.parsers.composer import ComposerInfo, parse_composer
+from laravelgraph.pipeline.schema_sync import sync_schema
 
 logger = get_logger(__name__)
 pipeline_logger = get_pipeline_logger()
@@ -98,6 +99,17 @@ class Pipeline:
                         logger.info("Full rebuild: cleared cache", file=cache_file)
                     except Exception as _e:
                         logger.warning("Could not clear cache file", file=cache_file, error=str(_e))
+
+        # Auto-extend REL_TYPES in memory with any (from_label, to_label) pairs that
+        # pipeline phases or project plugins use in upsert_rel() calls but that are
+        # not yet declared in schema.py.  Must run before GraphDB init so the DDL
+        # that creates KuzuDB relationship tables includes every needed pair.
+        plugins_dir = self.project_root / ".laravelgraph" / "plugins"
+        _pairs_added = sync_schema(
+            extra_scan_dirs=[plugins_dir] if plugins_dir.exists() else []
+        )
+        if _pairs_added:
+            logger.info("schema_sync: extended schema before DB init", pairs_added=_pairs_added)
 
         # force_reinit=True drops all tables via Cypher before recreating them.
         # This is the authoritative schema reset — it works even when shutil.rmtree
