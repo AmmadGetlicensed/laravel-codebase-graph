@@ -267,8 +267,8 @@ def load_pipeline_plugins(plugins_dir: Path, ctx: Any, log: Any | None = None) -
         _log.debug("Pipeline plugin import succeeded", plugin=plugin_path.name)
 
         if not hasattr(module, "run"):
-            _log.warning(
-                "Pipeline plugin has no run() function — skipping",
+            _log.debug(
+                "Plugin has no run() function (MCP-only plugin) — skipping pipeline phase",
                 plugin=plugin_name,
             )
             continue
