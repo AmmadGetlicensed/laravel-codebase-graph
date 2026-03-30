@@ -2180,6 +2180,7 @@ def agent_install(
       laravelgraph agent install . --tool all
     """
     from laravelgraph.agent_installer import (
+        collect_dynamic_data,
         install_for_claude_code,
         install_for_cursor,
         install_for_opencode,
@@ -2193,6 +2194,17 @@ def agent_install(
         console.print(f"[red]Unknown tool '{tool}'.[/red]  Valid: {', '.join(sorted(valid))}")
         raise typer.Exit(1)
 
+    # Collect dynamic project data once (with graceful fallback if graph not yet built)
+    with console.status("[dim]Collecting project data from graph...[/dim]", spinner="dots"):
+        data = collect_dynamic_data(root)
+
+    if not data.graph_available:
+        console.print(
+            "[yellow]Note:[/yellow] Graph not yet indexed — agent file will omit dynamic "
+            "project data.  Run [bold]laravelgraph analyze .[/bold] then re-run this "
+            "command to include routes, models, features, and stats."
+        )
+
     targets_to_run = list(INSTALL_TARGETS) if tool == "all" else [tool]
     installers = {
         "claude-code": install_for_claude_code,
@@ -2202,12 +2214,17 @@ def agent_install(
 
     for t in targets_to_run:
         fn = installers[t]
-        written = fn(root)
-        console.print(f"[green]✓[/green] [bold]{t}[/bold] → {written.relative_to(root)}")
+        written_paths = fn(root, data)
+        for p in written_paths:
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
+                rel = p
+            console.print(f"[green]✓[/green] [bold]{t}[/bold] → {rel}")
 
     console.print()
     console.print(
-        "[dim]Re-run after upgrading LaravelGraph to refresh the instructions.[/dim]"
+        "[dim]Re-run after upgrading LaravelGraph or re-indexing to refresh the instructions.[/dim]"
     )
 
 
