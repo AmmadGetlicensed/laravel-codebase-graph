@@ -11,58 +11,65 @@ def _import():
     return agent_installer
 
 
-# ── build_agent_block ─────────────────────────────────────────────────────────
+def _full_block(mod) -> str:
+    """Return the full agent block (minimal CLAUDE.md block + rich body)."""
+    # build_minimal_block has the section markers; build_rich_agent_body has the protocol.
+    # Tests that check protocol content should use build_rich_agent_body (the full content).
+    return mod.build_rich_agent_body(mod.DynamicData())
+
+
+# ── build_minimal_block ───────────────────────────────────────────────────────
 
 class TestBuildAgentBlock:
     def test_contains_start_marker(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = mod.build_minimal_block()
         assert mod._SECTION_START in block
 
     def test_contains_end_marker(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = mod.build_minimal_block()
         assert mod._SECTION_END in block
 
     def test_contains_tool_hierarchy(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = _full_block(mod)
         assert "Tool Hierarchy" in block
 
     def test_mentions_feature_context(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = mod.build_minimal_block()
         assert "laravelgraph_feature_context" in block
 
     def test_mentions_store_discoveries_protocol(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = _full_block(mod)
         assert "store_discoveries" in block
         assert "findings persist across sessions" in block
 
     def test_mentions_plugin_knowledge(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = _full_block(mod)
         assert "laravelgraph_plugin_knowledge" in block
 
     def test_mentions_plugin_evolve(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = _full_block(mod)
         assert "plugin evolve" in block
 
     def test_lists_common_pitfalls(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = _full_block(mod)
         assert "Pitfall" in block or "pitfall" in block.lower() or "Pitfalls" in block
 
     def test_mentions_request_flow(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = mod.build_minimal_block()
         assert "laravelgraph_request_flow" in block
 
     def test_mentions_impact(self):
         mod = _import()
-        block = mod.build_agent_block()
+        block = mod.build_minimal_block()
         assert "laravelgraph_impact" in block
 
 
@@ -130,25 +137,32 @@ class TestInstallTargets:
     def test_install_for_claude_code(self, tmp_path):
         mod = _import()
         written = mod.install_for_claude_code(tmp_path)
-        assert written == tmp_path / "CLAUDE.md"
-        assert written.exists()
-        content = written.read_text()
+        # Returns a list of written paths; CLAUDE.md is always included
+        written_paths = written if isinstance(written, list) else [written]
+        claude_md = tmp_path / "CLAUDE.md"
+        assert claude_md in written_paths
+        assert claude_md.exists()
+        content = claude_md.read_text()
         assert "LaravelGraph" in content
 
     def test_install_for_opencode(self, tmp_path):
         mod = _import()
         written = mod.install_for_opencode(tmp_path)
-        assert written == tmp_path / ".opencode" / "instructions.md"
-        assert written.exists()
-        content = written.read_text()
+        written_paths = written if isinstance(written, list) else [written]
+        target = tmp_path / ".opencode" / "instructions.md"
+        assert target in written_paths
+        assert target.exists()
+        content = target.read_text()
         assert "LaravelGraph" in content
 
     def test_install_for_cursor(self, tmp_path):
         mod = _import()
         written = mod.install_for_cursor(tmp_path)
-        assert written == tmp_path / ".cursorrules"
-        assert written.exists()
-        content = written.read_text()
+        written_paths = written if isinstance(written, list) else [written]
+        target = tmp_path / ".cursorrules"
+        assert target in written_paths
+        assert target.exists()
+        content = target.read_text()
         assert "LaravelGraph" in content
 
     def test_install_creates_opencode_dir(self, tmp_path):

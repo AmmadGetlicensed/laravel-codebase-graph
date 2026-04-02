@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from laravelgraph.config import Config, index_dir
+from laravelgraph.config import Config, index_dir_path
 from laravelgraph.core.graph import GraphDB
 from laravelgraph.logging import configure, get_logger, get_mcp_logger
 from laravelgraph.mcp.cache import SummaryCache
@@ -25,7 +25,7 @@ mcp_logger = get_mcp_logger()
 
 
 def _load_db(project_root: Path) -> GraphDB | None:
-    db_path = index_dir(project_root) / "graph.kuzu"
+    db_path = index_dir_path(project_root) / "graph.kuzu"
     if not db_path.exists():
         return None
     return GraphDB(db_path)
@@ -51,15 +51,17 @@ def create_server(project_root: Path, config: Config | None = None) -> Any:
     # here only to read counts, then close it immediately to avoid holding two
     # open Database objects to the same path (KuzuDB write-lock conflict).
     _plugin_discovery_counts: dict[str, int] = {}
-    try:
-        from laravelgraph.plugins.plugin_graph import init_plugin_graph as _init_pg
-        _pg_tmp = _init_pg(index_dir(project_root))
-        for _m in _plugin_manifests:
-            _plugin_discovery_counts[_m["name"]] = _pg_tmp.get_plugin_node_count(_m["name"])
-        _pg_tmp.close()
-        del _pg_tmp
-    except Exception:
-        pass
+    _early_idx = index_dir_path(project_root)
+    if _early_idx.exists():
+        try:
+            from laravelgraph.plugins.plugin_graph import init_plugin_graph as _init_pg
+            _pg_tmp = _init_pg(_early_idx)
+            for _m in _plugin_manifests:
+                _plugin_discovery_counts[_m["name"]] = _pg_tmp.get_plugin_node_count(_m["name"])
+            _pg_tmp.close()
+            del _pg_tmp
+        except Exception:
+            pass
 
     def _build_loaded_plugins_section(manifests: list, discovery_counts: dict | None = None) -> str:
         if not manifests:
@@ -368,19 +370,23 @@ MANDATORY RULES
     )
 
     # Lazy semantic summary cache — stored in .laravelgraph/summaries.json
-    _summary_cache = SummaryCache(index_dir(project_root))
+    _summary_cache = SummaryCache(index_dir_path(project_root))
 
     # Lazy DB context cache — stored in .laravelgraph/db_context.json
-    _db_cache = DBContextCache(index_dir(project_root))
+    _db_cache = DBContextCache(index_dir_path(project_root))
 
     # TTL-based query result cache — stored in .laravelgraph/query_cache.json
-    _query_cache = QueryResultCache(index_dir(project_root))
+    _query_cache = QueryResultCache(index_dir_path(project_root))
 
-    # Plugin graph and meta store — initialized early so all tools can access them
+    # Plugin graph and meta store — only initialize the plugin graph if the index
+    # dir already exists (created by `laravelgraph analyze`).  We must not create
+    # .laravelgraph/ as a side-effect of starting the server.  PluginMetaStore is
+    # safe to construct without the directory (its _load() is a no-op when missing).
     from laravelgraph.plugins.plugin_graph import init_plugin_graph
     from laravelgraph.plugins.meta import PluginMetaStore
-    _plugin_db = init_plugin_graph(index_dir(project_root))
-    _meta_store = PluginMetaStore(index_dir(project_root))
+    _idx_dir = index_dir_path(project_root)
+    _plugin_db = init_plugin_graph(_idx_dir) if _idx_dir.exists() else None
+    _meta_store = PluginMetaStore(_idx_dir)
 
     # Evict expired query cache entries on startup — cheap disk cleanup so
     # stale results from previous sessions don't accumulate indefinitely.
@@ -388,7 +394,7 @@ MANDATORY RULES
     if _expired_on_startup:
         logger.info("Query cache: evicted expired entries on startup", count=_expired_on_startup)
 
-    _db_path = index_dir(project_root) / "graph.kuzu"
+    _db_path = index_dir_path(project_root) / "graph.kuzu"
 
     def _db() -> GraphDB:
         """Open a fresh DB connection for this request.
@@ -5513,7 +5519,7 @@ MANDATORY RULES
                 source = read_source_snippet(file_path, line_start, line_end, project_root) or ""
 
             # Check intent cache
-            intent_cache = IntentCache(index_dir(project_root))
+            intent_cache = IntentCache(index_dir_path(project_root))
             cached = intent_cache.get(node_id, file_path)
             if cached:
                 elapsed = (time.perf_counter() - start) * 1000
@@ -6704,6 +6710,64 @@ MANDATORY RULES
             return laravelgraph_bindings()
         except Exception as e:
             return f"Error: {e}"
+
+    @mcp.resource("laravelgraph://instructions")
+    def resource_instructions() -> str:
+        """When-to-use guide for LaravelGraph MCP tools — load this at session start.
+
+        Provides a concise trigger map: which tool to call for which type of question.
+        Clients that support resource auto-loading should attach this to every session.
+        """
+        return """\
+# LaravelGraph — Use These Tools First
+
+This project is indexed by LaravelGraph. A complete knowledge graph of every class,
+method, route, model, event, job, and database table is available via these MCP tools.
+
+**RULE: Query the graph BEFORE reading PHP files or running grep.**
+Graph queries answer cross-file questions in milliseconds that file reads cannot.
+
+## Tool Quick-Reference
+
+| Question | Tool |
+|---|---|
+| How does [feature] work? | `laravelgraph_feature_context(feature="...")` |
+| What calls this method/class? | `laravelgraph_impact(symbol="...")` |
+| What breaks if I change X? | `laravelgraph_impact(symbol="...")` |
+| Trace an HTTP request | `laravelgraph_request_flow(route="/api/...")` |
+| 360° view of a class/method | `laravelgraph_context(symbol="...", include_source=True)` |
+| What does a method do? | `laravelgraph_intent(symbol="...")` |
+| All routes | `laravelgraph_routes()` |
+| All Eloquent models | `laravelgraph_models()` |
+| All events and listeners | `laravelgraph_events()` |
+| DB table structure | `laravelgraph_db_context(table="...")` |
+| N+1 queries / perf risks | `laravelgraph_performance_risks()` |
+| Auth / security gaps | `laravelgraph_security_surface()` |
+| What code writes this column? | `laravelgraph_db_impact(table="...", operation="write")` |
+| External API calls | `laravelgraph_outbound_apis()` |
+| PR blast radius | `laravelgraph_detect_changes(base="main")` |
+| All product features | `laravelgraph_features()` |
+| Async job chain | `laravelgraph_job_chain(job="...")` |
+| Behavioral contracts (auth, validation) | `laravelgraph_contracts(symbol="...")` |
+| Run raw SQL | `laravelgraph_db_query(sql="SELECT ...")` |
+
+## Escalation Path (if first tool returns sparse results)
+
+1. `laravelgraph_feature_context(feature="X")` — everything at once
+2. `laravelgraph_explain(feature="X")` — semantic search for anchor class
+3. `laravelgraph_request_flow(route="/api/X")` — HTTP trace
+4. `laravelgraph_context(symbol="X", include_source=True)` — source + relationships
+
+## Always Do Before Changing Code
+
+- `laravelgraph_impact(symbol="...")` — blast radius
+- `laravelgraph_contracts(symbol="...")` — hidden business rules
+- `laravelgraph_suggest_tests(symbol="...")` — tests to run
+
+## Never Stop at Empty Results
+
+Escalate through the path above. Empty ≠ "doesn't exist" — it means try the next tool.
+"""
 
     # ── Project-specific plugin tools ────────────────────────────────────────
     from laravelgraph.plugins.loader import load_mcp_plugins
