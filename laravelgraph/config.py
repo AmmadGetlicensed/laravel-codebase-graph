@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json as _json
 import os
 from pathlib import Path
 from typing import Any
@@ -19,10 +20,35 @@ def _global_dir() -> Path:
 
 
 def _index_dir(project_root: Path) -> Path:
-    """<project>/.laravelgraph/ — per-project graph store."""
+    """<project>/.laravelgraph/ — per-project graph store. Creates it."""
     d = project_root / ".laravelgraph"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _index_dir_path(project_root: Path) -> Path:
+    """Return the index dir path WITHOUT creating it."""
+    return project_root / ".laravelgraph"
+
+
+def is_laravel_project(project_root: Path) -> bool:
+    """Return True if project_root looks like a Laravel project.
+
+    Checks (in order):
+    1. Presence of the ``artisan`` file — the canonical Laravel signature.
+    2. ``laravel/framework`` listed in composer.json require or require-dev.
+    """
+    if (project_root / "artisan").is_file():
+        return True
+    composer = project_root / "composer.json"
+    if composer.is_file():
+        try:
+            data = _json.loads(composer.read_text())
+            deps = {**data.get("require", {}), **data.get("require-dev", {})}
+            return "laravel/framework" in deps
+        except Exception:
+            pass
+    return False
 
 
 # ── Configuration model ───────────────────────────────────────────────────────
@@ -153,7 +179,7 @@ class Config(BaseModel):
 
         # Project-level config
         if project_root:
-            project_cfg = _index_dir(project_root) / "config.json"
+            project_cfg = _index_dir_path(project_root) / "config.json"
             if project_cfg.exists():
                 with open(project_cfg) as f:
                     project_data = json.load(f)
@@ -193,6 +219,11 @@ def global_dir() -> Path:
 
 def index_dir(project_root: Path) -> Path:
     return _index_dir(project_root)
+
+
+def index_dir_path(project_root: Path) -> Path:
+    """Return the index dir path WITHOUT creating it. Use for read-only access."""
+    return _index_dir_path(project_root)
 
 
 def registry_path() -> Path:

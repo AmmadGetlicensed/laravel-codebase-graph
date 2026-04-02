@@ -59,6 +59,18 @@ def _project_root(path: Optional[Path]) -> Path:
     return root
 
 
+def _require_laravel(root: Path) -> None:
+    """Exit with an error if root is not a Laravel project."""
+    from laravelgraph.config import is_laravel_project
+    if not is_laravel_project(root):
+        console.print(
+            f"[red]Error:[/red] {root} does not appear to be a Laravel project.\n"
+            "LaravelGraph requires a Laravel project (expects an [bold]artisan[/bold] file "
+            "or [bold]laravel/framework[/bold] in composer.json)."
+        )
+        raise typer.Exit(code=1)
+
+
 # ── analyze ───────────────────────────────────────────────────────────────────
 
 @app.command(rich_help_panel="1. Setup & Indexing")
@@ -93,6 +105,7 @@ def analyze(
       laravelgraph analyze --phases 24,25,26 --warm-cache
     """
     root = _project_root(path)
+    _require_laravel(root)
 
     selected_phases = None
     if phases:
@@ -1194,6 +1207,7 @@ def serve(
 ) -> None:
     """Start the MCP server for AI agent integration."""
     root = _project_root(path)
+    _require_laravel(root)
 
     from laravelgraph.config import Config
     from laravelgraph.logging import configure
