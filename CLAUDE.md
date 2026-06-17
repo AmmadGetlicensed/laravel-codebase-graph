@@ -22,18 +22,11 @@ mypy laravelgraph/
 pipx install .
 pipx reinstall laravelgraph   # After any source changes — required because MCP uses the pipx binary
 
-# Plugin management
-laravelgraph plugin list .              # list all plugins with health/contribution
-laravelgraph plugin suggest .           # suggest applicable domain plugins
-laravelgraph plugin scaffold <name> .   # scaffold plugin from graph context
-laravelgraph plugin validate <file>     # validate plugin safety
-laravelgraph plugin enable <name> .     # enable disabled plugin
-laravelgraph plugin disable <name> .    # disable plugin (keep file)
-laravelgraph plugin delete <name> .     # permanently delete plugin + data
-laravelgraph plugin prompt <name> "..." # attach system prompt to plugin
-laravelgraph plugin evolve .            # detect gaps + drift, generate top-N plugins
-laravelgraph plugin evolve . --dry-run  # show what would be generated without generating
-laravelgraph plugin evolve . -n 2       # limit to 2 plugins per run
+# Evaluation harness (proves the tools actually answer correctly)
+python -m eval.run_eval --mode structural --app tiny    # deterministic, no API key (CI gate)
+python -m eval.run_eval --mode agent --app tiny          # A/B accuracy WITH vs WITHOUT (needs ANTHROPIC_API_KEY)
+python -m eval.run_eval --mode structural --app real     # needs LARAVELGRAPH_EVAL_REAL_APP (see eval/realapp.md)
+# Dataset: eval/dataset/*.yaml (ground-truth facts). Scorecards: eval/results/.
 
 # Agent instruction installer
 laravelgraph agent install .                         # install for Claude Code (writes to CLAUDE.md)
@@ -79,7 +72,7 @@ MySQL/RDS databases
 
 - **`laravelgraph/parsers/`** — PHP (tree-sitter + regex fallback), Blade templates, and Composer JSON parsing.
 
-- **`laravelgraph/mcp/server.py`** — The FastMCP server (~6700 lines). All 44 MCP tools and 10 resources live here as `@mcp.tool()` / `@mcp.resource()` decorated functions, built inside `create_server()`.
+- **`laravelgraph/mcp/server.py`** — The FastMCP server (~6000 lines). Exposes **12 primary tools** (`search`, `cypher`, `sql`, `context`, `feature_context`, `impact`, `map`, `trace`, `db`, `risks`, `tests`, `status`) plus ~38 legacy single-purpose tools kept as **deprecated aliases** (still callable, undocumented as primary). The 8 new dispatchers (`map`/`db`/`trace`/`risks`/`tests`/`search`/`sql`/`status`) route by `kind`/`mode` into the legacy implementations — FastMCP keeps decorated functions directly callable, so there is no behavior change. Also registers 10 resources and an `on_call_tool` middleware that stamps every response with index age + a staleness warning. All built inside `create_server()`.
 
 - **`laravelgraph/mcp/summarize.py`** — 18-provider LLM registry (`PROVIDER_REGISTRY`). All OpenAI-compatible providers share `_call_openai_compat()`; only Anthropic uses its native SDK. `generate_summary()` returns `(str | None, str)` — never raises.
 
@@ -113,109 +106,54 @@ MySQL/RDS databases
 2. Register it in `orchestrator.py`'s phase list
 3. Use `ctx.db.upsert_node()` / `ctx.db.upsert_edge()` for graph writes
 
-### Adding a new MCP tool
+### Adding / changing an MCP tool
 
-Add a `@mcp.tool()` decorated function to `mcp/server.py`. Update the server instructions string at the top of `create_server()`.
+Prefer extending one of the 12 primary tools (add a `kind`/`mode` branch to the relevant dispatcher near the bottom of `create_server()`) rather than adding a new top-level tool — keeping the surface small is deliberate (too many tools degrade agent tool-selection). If you do add a `@mcp.tool()`, update the **PRIMARY TOOLS** section in the server instructions string. The 8 dispatchers call the legacy implementations directly; legacy tools remain registered as deprecated aliases for one release, then get removed.
 
-### Plugin System
+### MCP tool surface (12 primaries)
 
-```
-Plugin System:
-  plugins/plugin_graph.py  DualDB + PluginGraphDB (writable runtime graph)
-  plugins/meta.py          PluginMetaStore (status, usage, contribution scoring)
-  plugins/generator.py     Domain-anchored generation + 4-layer validation
-  plugins/loader.py        MCP + pipeline plugin loading; scan_plugin_manifests; _ToolCollector
-  plugins/self_improve.py  Proactive self-improvement, drift detection, auto-generation on server startup
-  plugins/suggest.py       Domain recipe detection + Feature node gap detection
-  logging_manager.py       Log reading, filtering, tailing; domain query frequency mining
-```
+| Tool | Covers |
+|------|--------|
+| `search` | hybrid BM25 + vector + fuzzy symbol search |
+| `cypher` | raw Cypher over the core graph |
+| `sql` | read-only SQL against a live DB |
+| `context` | 360° view of one symbol (+ `include_source`) |
+| `feature_context` | one-call feature overview (routes→models→events→jobs) |
+| `impact` | blast radius of a change |
+| `map(kind=…)` | routes / models / events / bindings / api / outbound / config / repos |
+| `trace(kind=…)` | request / job / table_write / git_diff execution paths |
+| `db(mode=…)` | schema / context / column / procedure / connections / procedures / quality / boundary |
+| `risks(kind=…)` | dead_code / security / race / perf / cross_cutting |
+| `tests(mode=…)` | suggest tests / coverage |
+| `status` | providers + indexed repos + index age |
 
-**What plugins are:** Product-specific domain lenses over the graph. Built-in MCP tools give generic Laravel intelligence (routes, models, events, dead code). Plugins give intelligence about a specific product's domain — "what is the order lifecycle?", "how does driver assignment work?" These are questions that require knowing the actual routes, models, and events in that particular app.
+### Evaluation harness (`eval/`)
 
-**How generation works (`plugins/generator.py`):**
+The product's core claim ("real structural knowledge, no hallucination") is measured, not asserted.
 
-1. **Stage 1 — Domain anchor resolution (no LLM):** `_resolve_domain_anchors()` runs pure Python + Cypher to find which Feature nodes, Routes, EloquentModels, Events, and Jobs in the graph implement the requested domain. Uses a two-phase approach:
-   - Phase A: Match against Feature nodes (phase 27 clusters) by token overlap
-   - Phase B fallback: Scan Route URIs, EloquentModel names, Event names by substring
-   - Phase C: Expand events to their listener classes via `LISTENS_TO`
+- `eval/client.py` — drives MCP tools through FastMCP's in-memory `Client` (tools are nested in `create_server()` and not importable directly). `index_app()` copies a fixture to a temp dir and runs the pipeline; `run_calls()` batches tool calls against one server.
+- `eval/run_eval.py` — **structural** mode (deterministic ground-truth fact checks, no LLM, CI gate) and **agent** mode (A/B: an LLM agent answers each question WITH the LaravelGraph tools vs file-access-only, LLM-judged → `accuracy_with` vs `accuracy_without`).
+- `eval/dataset/tiny.yaml` — ground-truth questions for `tests/fixtures/tiny-laravel-app`. `eval/dataset/real.yaml` + `eval/realapp.md` — opt-in real-app eval (live DB) for the DB-intelligence moat.
+- CI gate: `tests/integration/eval/` asserts 100% structural correctness.
 
-2. **Stage 2 — LLM spec generation:** The LLM receives real node names from the graph (not invented) and produces a compact JSON spec: `{ slug, prefix, tools: [{name, description, cypher_query, result_format}] }`. The LLM only chooses query patterns and substitutes real node names.
+### Index-age + staleness middleware
 
-3. **Stage 3 — Deterministic code assembly:** Python is assembled from the spec — the LLM never writes Python. Every plugin gets 3 guaranteed tools:
-   - `{prefix}summary` — hard-coded domain overview from anchors (no LLM, always works)
-   - `{prefix}X` — LLM-specified query tools (Cypher populated from real node names)
-   - `{prefix}store_discoveries` — writes findings to the plugin graph via `db().plugin().upsert_plugin_node()`
+`_make_index_age_middleware()` registers an `on_call_tool` FastMCP middleware that appends an `_Index age: …_` footer to every tool response, plus `⚠️ N source file(s) changed since indexing` when project `.php` mtimes are newer than `Registry.indexed_at`. Middleware is the single boundary hook (there is no shared response formatter — outputs are hand-built in 400+ places), and internal tool-to-tool calls bypass it so footers never embed mid-output. The age/staleness computation is cached ~15s.
 
-4. **Stage 4 — Validation:** 4-layer validation: AST/static → schema → execution sandbox → LLM judge. On judge failure the loop retries (up to `max_iterations`) with critique. On LLM failure after all retries, falls back to a template skeleton the user edits manually.
+### Incremental re-index (`watch/watcher.py`)
 
-**Plugin graph writes:** `db().plugin().upsert_plugin_node(plugin_source, node_id, label, properties)` — plugins accumulate product-specific domain knowledge across sessions. Future agent calls can read these discoveries.
+`laravelgraph serve --watch` (or `laravelgraph watch`) re-runs only the phases a changed file can affect, keeping high-value edges fresh:
 
-**Plugins live in the product:** `.laravelgraph/plugins/` inside the Laravel project — they are specific to that product's domain, not to Laravel in general.
+- any `.php` → `3,4,5,6,7,20,21,22,28,32,33`
+- `app/Models/*` → `+ 13,25,26,31`; `app/Events|Listeners|Jobs/*` → `+ 17`
+- `routes/*.php` → `14,15` (full route rebuild); `database/migrations/*.php` → `19`; `*.blade.php` → `18`
+- whole-graph phases `8,9,10` run on a debounced batch; embeddings (12) refresh only on a full `analyze`.
 
-**Plugin discovery at server startup (`plugins/loader.py`):**
+`GraphDB.build_fqn_index()` / `build_class_map()` rebuild the cross-file maps (otherwise in-memory-only per pipeline run) from the persisted graph. Each handler opens its own `GraphDB`, `close()`s it (KuzuDB write-lock safety), and calls `Registry.touch()` so the index-age footer stays accurate.
 
-`scan_plugin_manifests(plugins_dir)` reads every `.py` file via AST (no import, no side effects) and extracts `PLUGIN_MANIFEST` + tool function names. Called before `FastMCP()` is created so the results can be injected into the server instructions string. This means Claude sees all installed plugin names, descriptions, and tool names at the very start of every conversation — no `laravelgraph_suggest_plugins()` call needed.
+**Pipeline phases 32–33:** Phase 32 (`phase_32_http_clients.py`) detects outbound `Http::`/Guzzle/`curl_*` calls (`HttpClientCall` nodes, `CALLS_EXTERNAL` edges; surfaced by `map(kind="outbound")`). Phase 33 (`phase_33_notifications.py`) parses `via()` on `Notification` subclasses and detects `Mailable` classes.
 
-**Plugin Lifecycle Engine — keeping knowledge current:**
-
-Three-stage engine that makes plugin knowledge self-sustaining:
-
-1. **Stage 1 — Discovery (`plugins/suggest.py: detect_feature_gaps`):** Queries Feature nodes (phase 27 clusters) with `symbol_count > 10` that have no plugin yet. Scores by symbol count. Combined with log mining (`logging_manager.py: get_domain_query_frequencies`) — scans `~/.laravelgraph/logs/` for `laravelgraph_feature_context` / `laravelgraph_explain` calls and boosts score for frequently-queried domains.
-
-2. **Stage 2 — Evolution (`plugins/self_improve.py: check_domain_drift`):** Captures a snapshot of graph counts (route/model/event) at generation time via `take_domain_snapshot()`, stored in `PluginMeta.domain_coverage_snapshot`. On startup, compares current counts to snapshot. Triggers regeneration when routes change >20%, any new model appears, or Feature's `has_changes` flag is set. Uses a 14-day drift cooldown to avoid thrashing.
-
-3. **Stage 3 — Consolidation (`mcp/server.py: laravelgraph_plugin_knowledge`):** MCP tool that queries `plugin_graph.kuzu` for all discoveries accumulated by plugins. Agents call `store_discoveries()` during investigations; `laravelgraph_plugin_knowledge()` makes that institutional knowledge available in every future conversation. Plugins with discoveries show `[N discoveries]` in the LOADED PLUGINS section.
-
-**`store_discoveries` — free-text agent findings:**
-
-Each generated plugin has a `{prefix}store_discoveries(findings: str)` tool. The agent passes a plain-text summary of what it found (e.g. "Users table has soft-deletes. Admin flag is role_id FK not a boolean."). The finding is stored as a `Discovery` node in `plugin_graph.kuzu` with a timestamp. Future agents read it via `laravelgraph_plugin_knowledge()`. The `{prefix}summary` output always ends with a nudge: `→ Call {prefix}store_discoveries(findings)` so agents see the reminder immediately.
-
-**Agent Instruction Installer (`laravelgraph/agent_installer.py`):**
-
-`laravelgraph agent install` writes an optimized agent instruction block to the file your AI tool reads at session start. It teaches the agent the correct tool hierarchy, investigation protocol, plugin workflow, `store_discoveries` protocol, and common pitfalls. Idempotent — run after each LaravelGraph upgrade to refresh. Supported targets: `CLAUDE.md` (Claude Code), `.opencode/instructions.md` (OpenCode), `.cursorrules` (Cursor).
-
-**New pipeline phases:**
-
-- **Phase 32 — External HTTP Client Detection** (`phase_32_http_clients.py`): Detects outbound `Http::`, Guzzle, and `curl_*` calls. Creates `HttpClientCall` nodes linked via `CALLS_EXTERNAL` edges from the calling Method. Exposed by `laravelgraph_outbound_apis()` MCP tool.
-- **Phase 33 — Notification Channel Enrichment** (`phase_33_notifications.py`): Parses `via()` methods on `Notification` subclasses to populate the `channels` field. Also detects `Mailable` classes and adds them as Notification nodes with `channels=["mail"]`.
-
-**New schema nodes:** `HttpClientCall`, `Gate`
-**New schema rels:** `CALLS_EXTERNAL`, `DEFINES_GATE`, `CHECKS_GATE`
-
-**CI/cron integration:**
-
-```bash
-# Run weekly to evolve the plugin library automatically
-laravelgraph plugin evolve . --max-generate 2
-
-# Dry run to see what would be generated
-laravelgraph plugin evolve . --dry-run
-```
-
-```yaml
-# .github/workflows/laravelgraph.yml
-- name: Evolve plugins
-  run: laravelgraph plugin evolve . --max-generate 2
-  schedule:
-    - cron: '0 9 * * 1'  # every Monday morning
-```
-
-**Hot dispatch — using plugins without restart (`laravelgraph_run_plugin_tool`):**
-
-MCP tool lists are sent to the client at connection start. Native plugin tools only appear after the server restarts. `laravelgraph_run_plugin_tool(plugin_name, tool_name)` bypasses this by dynamically loading the plugin file via `_import_plugin_module`, registering its tools into a `_ToolCollector` (a lightweight mock that collects `@mcp.tool()` functions without touching FastMCP), then calling the requested function directly.
-
-This means:
-- Generate a plugin → call it immediately in the **same conversation** via `laravelgraph_run_plugin_tool`
-- Next conversation: native tools are registered at startup AND listed in instructions automatically
-
-```python
-# Typical agent workflow after plugin generation:
-laravelgraph_request_plugin("user management domain")
-# → success message lists tool names
-laravelgraph_run_plugin_tool("user-explorer", "usr_summary")    # immediate
-laravelgraph_run_plugin_tool("user-explorer", "usr_routes")     # immediate
-# Next conversation: usr_summary() / usr_routes() are native tools
-```
+**Agent Instruction Installer (`laravelgraph/agent_installer.py`):** `laravelgraph agent install` writes an agent instruction block teaching the tool hierarchy and investigation protocol. Idempotent. Targets: `CLAUDE.md`, `.opencode/instructions.md`, `.cursorrules`.
 
 ## HTTP Serving (EC2 / Shared Server)
 
@@ -240,7 +178,9 @@ laravelgraph serve /path/to/project --http --host 0.0.0.0 --port 3000 --api-key 
 # Health check (always public, no auth)
 curl http://your-server:3000/health
 
-# Re-index after code changes (requires server to be stopped due to KuzuDB write lock)
+# Full re-index after code changes (requires server stopped due to KuzuDB write lock).
+# For live updates, prefer `serve --watch` — it incrementally re-indexes changed
+# files (including routes/events/models) without a full rebuild.
 laravelgraph analyze /path/to/project
 ```
 

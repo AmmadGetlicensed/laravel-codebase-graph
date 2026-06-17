@@ -17,7 +17,7 @@
 5. [The Analysis Pipeline — 33 Phases](#5-the-analysis-pipeline--33-phases)
 6. [The Knowledge Graph Schema](#6-the-knowledge-graph-schema)
 7. [MCP Server and Tools](#7-mcp-server-and-tools)
-8. [The Plugin System](#8-the-plugin-system)
+8. [Evaluation & Freshness](#8-evaluation--freshness)
 9. [Database Intelligence](#9-database-intelligence)
 10. [LLM Providers and Semantic Summaries](#10-llm-providers-and-semantic-summaries)
 11. [CLI Reference](#11-cli-reference)
@@ -51,11 +51,11 @@ LaravelGraph does four things:
 
 1. **Analyzes** your Laravel project with a 33-phase pipeline and stores the result in a local graph database (KuzuDB). This happens once, in ~10–60 seconds depending on project size. No PHP required — parsing is done with tree-sitter.
 
-2. **Serves** the graph to AI agents through an MCP (Model Context Protocol) server exposing 44 tools and 9 resources. Agents call tools instead of reading files.
+2. **Serves** the graph to AI agents through an MCP (Model Context Protocol) server exposing 12 primary tools (plus deprecated legacy aliases) and 10 resources. Agents call tools instead of reading files.
 
-3. **Generates plugins** — product-specific domain lenses over the graph that answer questions no generic tool can answer. "What is the order lifecycle?" requires knowing your specific app's routes, models, and events. Plugins are auto-generated, validated, and deployed by the system.
+3. **Measures** — an evaluation harness proves the tools answer correctly. A deterministic structural mode runs in CI as a quality gate; an agent mode runs A/B accuracy comparisons (WITH vs WITHOUT LaravelGraph) against real questions.
 
-4. **Learns** — plugins accumulate domain knowledge across conversations. Agents store their findings; the system surfaces them in future sessions. Plugin tools auto-improve when their results degrade.
+4. **Stays fresh** — `serve --watch` incrementally re-indexes changed files, keeping high-value edges current. Every tool response is stamped with its index age plus a staleness warning when source files have changed since the last index.
 
 ### What This Means in Practice
 
@@ -95,7 +95,7 @@ graph.kuzu               summaries.json
         ▼
 ┌─────────────────────────────────────────────────────┐
 │  MCP Server (FastMCP)                                │
-│  44 tools · 9 resources · plugin tools               │
+│  12 primary tools · 10 resources                     │
 └──────────────────┬──────────────────────────────────┘
                    │
         ┌──────────┴──────────┐
@@ -175,7 +175,7 @@ For Claude Code, the MCP server auto-starts when you open a session. Add this to
 }
 ```
 
-After that, your AI agent has access to all 44 tools whenever it opens a session on your project.
+After that, your AI agent has access to all 12 primary tools whenever it opens a session on your project.
 
 ---
 
@@ -354,7 +354,7 @@ Running `laravelgraph analyze` executes 33 phases in sequence. Each phase reads 
 
 **What it does:** Groups routes, models, events, and jobs into domain `Feature` clusters by URI segment analysis and semantic similarity. A feature named "checkout" might contain routes under `/checkout/*`, `Order`, `Cart`, and `Payment` models, `OrderPlaced` and `PaymentProcessed` events. Creates `Feature` nodes and `BELONGS_TO_FEATURE` edges.
 
-**Why it matters:** Features are how humans think about applications — not in terms of individual files, but in terms of business domains. Phase 27 provides the product-level view: "what belongs to checkout?" yields a complete set of related symbols. Features are also the basis for plugin generation gap detection and proactive plugin suggestions.
+**Why it matters:** Features are how humans think about applications — not in terms of individual files, but in terms of business domains. Phase 27 provides the product-level view: "what belongs to checkout?" yields a complete set of related symbols.
 
 ### Phase 28 — Behavioral Contract Extraction
 
@@ -529,9 +529,6 @@ laravelgraph cypher "MATCH (r:Route) RETURN r.uri, r.http_method, r.action_metho
 
 # Or via MCP tool
 laravelgraph_cypher(query="MATCH (m:EloquentModel)-[:HAS_RELATIONSHIP]->(r) RETURN m.name, r.type, r.related_model LIMIT 30")
-
-# Query the plugin graph (agent-written discoveries)
-laravelgraph_cypher(query="MATCH (d:PluginNode {label: 'Discovery'}) RETURN d.data LIMIT 10", graph="plugin")
 ```
 
 ---
@@ -540,11 +537,30 @@ laravelgraph_cypher(query="MATCH (d:PluginNode {label: 'Discovery'}) RETURN d.da
 
 ### How the MCP Server Works
 
-When `laravelgraph serve` runs, it starts a FastMCP server that registers 44 tools and 9 resources. Your AI agent connects to it (via stdio for local use, or HTTP/SSE for remote/team use) and receives the tool list at connection time.
+When `laravelgraph serve` runs, it starts a FastMCP server that registers 12 primary tools and 10 resources. Your AI agent connects to it (via stdio for local use, or HTTP/SSE for remote/team use) and receives the tool list at connection time.
 
-At the top of the tool list, the server injects a `LOADED PLUGINS` section listing every plugin installed for this project — names, descriptions, tool names, and how to call them. This means your agent sees all available domain-specific tools in the very first message of every session, without needing to discover them.
+The server injects the agent instruction block if `laravelgraph agent install` has been run — a condensed protocol guide telling the agent which tools to call first and how to escalate — followed by a `PRIMARY TOOLS` section listing the 12 primary tools so your agent sees them in the very first message of every session.
 
-The server also injects the agent instruction block if `laravelgraph agent install` has been run — a condensed protocol guide telling the agent which tools to call first, how to escalate, and how to use the plugin system.
+### The 12 Primary Tools
+
+The tool surface is consolidated into 12 primary tools. Most use a `kind` or `mode` argument to select a behavior, so one tool covers what used to be a family of single-purpose tools:
+
+| Tool | Purpose |
+|---|---|
+| `search` | Hybrid BM25 + vector + fuzzy search across all symbols |
+| `cypher` | Run a read-only Cypher query against the graph |
+| `sql` | Run a read-only SQL query against a configured live database |
+| `context` | 360° view of a single symbol (source, summary, callers, callees, tests) |
+| `feature_context` | Everything relevant to a named feature in one call |
+| `impact` | Blast radius of a change to a symbol |
+| `map` | `kind=routes\|models\|events\|bindings\|api\|outbound\|config\|repos` |
+| `trace` | `kind=request\|job\|table_write\|git_diff` |
+| `db` | `mode=schema\|context\|column\|procedure\|connections\|procedures\|quality\|boundary` |
+| `risks` | `kind=dead_code\|security\|race\|perf\|cross_cutting` |
+| `tests` | `mode=suggest\|coverage` |
+| `status` | Index status, provider status, and indexed-repo stats |
+
+The older single-purpose tools (`laravelgraph_routes`, `laravelgraph_models`, `laravelgraph_schema`, `laravelgraph_request_flow`, `laravelgraph_dead_code`, and the rest) still work but are **deprecated aliases** that map onto the 12 primary tools. They are kept for one release to ease migration and will be removed afterward. The per-tool descriptions below document the behavior reachable through both the primary tools and their deprecated aliases.
 
 ### Tool Categories
 
@@ -723,28 +739,15 @@ All outbound HTTP calls made by the application (from Phase 32). Shows caller FQ
 
 ---
 
-#### Plugin Management Tools
-
-These tools are covered in depth in [Section 8](#8-the-plugin-system).
-
-- `laravelgraph_request_plugin` — generate a new domain plugin
-- `laravelgraph_run_plugin_tool` — run a plugin tool immediately (hot dispatch)
-- `laravelgraph_update_plugin` — regenerate a plugin with critique
-- `laravelgraph_remove_plugin` — remove an underperforming plugin
-- `laravelgraph_suggest_plugins` — list valuable plugin opportunities
-- `laravelgraph_plugin_knowledge` — recall agent discoveries from past sessions
-
----
-
 #### Utility Tools
 
 **`laravelgraph_intent(query: str)`**
 
 Structured intent analysis. Takes a natural language query and returns a parsed intent with confidence scores, the most likely symbol or feature being asked about, and a recommended tool to call. Useful when an agent isn't sure where to start.
 
-**`laravelgraph_cypher(query: str, graph: str = "core")`**
+**`laravelgraph_cypher(query: str)`**
 
-Execute raw Cypher queries against the graph. Read-only — destructive operations are blocked. Pass `graph="plugin"` to query the plugin knowledge graph.
+Execute raw Cypher queries against the graph. Read-only — destructive operations are blocked.
 
 **`laravelgraph_list_repos()`**
 
@@ -774,172 +777,49 @@ Resources are read-only data endpoints available to agents without tool invocati
 
 ---
 
-## 8. The Plugin System
+## 8. Evaluation & Freshness
 
-### The Problem Plugins Solve
+Two systems keep LaravelGraph honest: an evaluation harness that proves the tools answer correctly, and a freshness layer that keeps the index current and flags staleness in every response.
 
-LaravelGraph's built-in tools give generic Laravel intelligence. But "what is the order lifecycle in this specific app?" requires knowing *your* routes, *your* models, *your* events — not Laravel's in general. No built-in tool can answer that without already knowing your domain.
+### The Evaluation Harness
 
-Plugins are product-specific domain lenses over the graph. Each plugin adds a small set of MCP tools that answer domain-specific questions for your application. A plugin named `order-flow` might expose `ord_summary` (the order domain overview), `ord_state_transitions` (all possible order status changes), and `ord_payment_sequence` (the payment → fulfillment chain for this specific app).
+The harness lives at `eval/` and is driven by `python -m eval.run_eval`. It runs in two modes:
 
-Plugins live in `.laravelgraph/plugins/` inside your project — they belong to the product, not to LaravelGraph.
-
-### How Plugin Generation Works
-
-When you call `laravelgraph_request_plugin("order lifecycle and payment flow")`, the system runs a 4-stage pipeline:
-
-**Stage 1 — Domain Anchor Resolution (no LLM)**
-
-Pure Python + Cypher queries resolve the actual nodes in your graph that correspond to the requested domain:
-- Matches Feature nodes by token overlap (removes stop-words, finds "order" in Feature names)
-- Falls back to scanning Route URIs, EloquentModel names, Event names
-- Expands events to their listener classes via `LISTENS_TO` edges
-- Returns a structured dict of real node names (routes, models, events, jobs) — not invented names
-
-**Stage 2 — LLM Spec Generation (grounded)**
-
-The LLM receives the domain anchors found in Stage 1 — real class names and route URIs from your codebase. It generates a compact JSON spec describing what tools the plugin should have:
-
-```json
-{
-  "slug": "order-flow",
-  "tool_prefix": "ord_",
-  "tools": [
-    {
-      "name": "ord_state_transitions",
-      "description": "All order status transitions and their triggers",
-      "cypher_query": "MATCH (m:Method) WHERE m.fqn CONTAINS 'OrderService' ...",
-      "result_format": "{status}: {trigger}"
-    }
-  ]
-}
-```
-
-The LLM only fills in query patterns and substitutes real names it was given. It cannot invent node names that don't exist in the graph.
-
-**Stage 3 — Deterministic Code Assembly (no LLM)**
-
-Python code is assembled from the spec — the LLM never writes Python directly. Every plugin automatically gets three tools:
-1. `{prefix}summary` — hard-coded domain overview from the anchors (always works, no LLM)
-2. `{prefix}X` — one or more LLM-specified query tools
-3. `{prefix}store_discoveries` — writes agent findings to the plugin knowledge graph
-
-**Stage 4 — 4-Layer Validation Pipeline**
-
-1. **Layer 1 — Static AST**: Syntax check, manifest field presence, tool-name prefix compliance
-2. **Layer 2 — Schema**: All Cypher node labels and relationship types validated against the known schema (no bad `MATCH (x:Ordr)` typos)
-3. **Layer 3 — Execution sandbox**: `register_tools()` is called; tools must register without error
-4. **Layer 4 — LLM Judge**: Quality score ≥ 7/10 required; the LLM reviews the plugin for correctness and usefulness
-
-If a layer fails, the critique is fed back into the loop. The system retries up to 3 times with the previous failure reason in the prompt. If all 3 iterations fail, the request returns a detailed failure message with the last layer number, the reason, and actionable options.
-
-### Skeleton Plugins (Explicit Opt-In)
-
-By default, if generation fails, no file is written. The failure message tells you:
-- Which layer failed (AST / schema / execution / quality-judge)
-- Why it failed
-- What to try next (better description, explore the graph first, stronger LLM)
-
-You can force a skeleton placeholder with `allow_skeleton=True`:
-
-```python
-laravelgraph_request_plugin("order lifecycle", allow_skeleton=True)
-```
-
-A skeleton plugin is generated with:
-- `"status": "skeleton"` in `PLUGIN_MANIFEST` — visible in LOADED PLUGINS as `⚠ SKELETON`
-- Query tools that return "edit me" messages instead of executing Cypher
-- `store_discoveries` tool that works normally
-
-To fix a skeleton: `laravelgraph_update_plugin("order-flow", "describe what the tool should actually query")`.
-
-### Hot Dispatch — Using Plugins Without Restart
-
-MCP tool lists are sent to the client at connection start. Native plugin tools only appear after the MCP server restarts. To use a just-generated plugin in the same conversation:
-
-```python
-# Generate the plugin
-laravelgraph_request_plugin("booking and availability domain")
-# → success message lists tool names: bkn_summary, bkn_availability, bkn_store_discoveries
-
-# Use it immediately — no restart needed
-laravelgraph_run_plugin_tool("booking", "bkn_summary")
-laravelgraph_run_plugin_tool("booking", "bkn_availability")
-
-# Store what you found
-laravelgraph_run_plugin_tool("booking", "bkn_store_discoveries",
-    tool_args={"findings": "Bookings use a soft-lock pattern via Redis for slot reservation..."})
-```
-
-Next conversation: `bkn_summary()` is a native tool registered at startup.
-
-### The `store_discoveries` Protocol
-
-Every plugin has a `{prefix}store_discoveries(findings: str)` tool. After investigating with a plugin, call it with a plain-text summary of what you found:
-
-```python
-bkn_store_discoveries(findings="Booking cancellations within 2 hours are handled by \
-the BookingCancellationJob which dispatches 3 events. The refund path goes through \
-Stripe for card payments and credits wallet for in-app payments.")
-```
-
-The finding is stored as a `Discovery` node in `plugin_graph.kuzu` with a timestamp. In every future conversation, these discoveries are recalled via `laravelgraph_plugin_knowledge()`. The `{prefix}summary` output always ends with a nudge to call `store_discoveries` so agents remember to use it.
-
-This is how LaravelGraph accumulates institutional knowledge over time — insights discovered by agents in one session become available to agents in all future sessions.
-
-### Plugin Lifecycle Engine
-
-Three mechanisms keep plugin knowledge current:
-
-**1. Discovery** — `plugin suggest` and `laravelgraph_suggest_plugins` scan Feature nodes with more than 10 symbols that have no plugin yet. Results are boosted by log mining — features frequently queried via `laravelgraph_feature_context` or `laravelgraph_explain` get higher priority scores.
-
-**2. Self-Improvement** — At server startup, plugins with degraded performance are flagged:
-- `call_count > 20` and `empty_result_count / call_count > 0.25` → too many empty results
-- `call_count > 20` and `error_count / call_count > 0.15` → too many errors
-- `call_count > 30` and `agent_followup_count / call_count > 0.40` → agent always needs another tool after this one
-
-Flagged plugins are regenerated automatically with a critique based on the failure mode. A 48-hour cooldown prevents thrashing.
-
-**3. Domain Drift Detection** — When a plugin is generated, a snapshot of its domain's graph counts (routes, models, events) is stored in `PluginMeta.domain_coverage_snapshot`. On each startup, current counts are compared. If routes changed >20%, new models appeared, or the Feature's `has_changes` flag is set, the plugin is scheduled for regeneration. A 14-day cooldown applies.
-
-### Plugin CLI Commands
+**Structural mode (deterministic, CI gate):**
 
 ```bash
-laravelgraph plugin list .                   # List all plugins — health, call count, contribution score
-laravelgraph plugin suggest .                # Detect feature gaps and suggest new plugins
-laravelgraph plugin scaffold <name> .        # Scaffold a plugin from graph context (no LLM)
-laravelgraph plugin validate <file>          # Validate a plugin file before loading
-laravelgraph plugin enable <name> .          # Re-enable a disabled plugin
-laravelgraph plugin disable <name> .         # Disable a plugin (keeps file, stops loading)
-laravelgraph plugin delete <name> .          # Permanently delete plugin + discoveries + meta
-laravelgraph plugin prompt <name> "..." .    # Attach a system prompt (injected at startup)
-laravelgraph plugin migrate .                # Apply store_discoveries and Cypher property migrations
-laravelgraph plugin evolve . --dry-run       # Show what would be generated without generating
-laravelgraph plugin evolve . -n 2            # Generate up to 2 new plugins from feature gaps
+python -m eval.run_eval --mode structural --app tiny
 ```
 
-### Auto-Migration
+Runs a fixed set of questions against the graph and asserts the tools return the expected structural facts (routes, models, events, edges). It is fully deterministic — no LLM, no network — so it runs as a CI quality gate that fails the build on regression.
 
-When plugins are loaded, two migrations are applied automatically:
+**Agent mode (A/B accuracy):**
 
-1. **store_discoveries migration** — Old plugins (pre-v0.3) had `store_discoveries()` with no parameters. The loader detects the old signature and replaces the function body with the new `store_discoveries(findings: str)` implementation that accepts free-text agent input.
+```bash
+ANTHROPIC_API_KEY=sk-ant-... python -m eval.run_eval --mode agent --app tiny
+```
 
-2. **Cypher property migration** — Old plugins may reference `r.method` (should be `r.http_method`), `r.action` (should be `r.action_method`), `e.model` (should be `e.name`), or `c.class` (should be `c.fqn`). The loader applies regex replacements automatically, using negative lookaheads to avoid touching Python method calls.
+Measures answer accuracy WITH LaravelGraph versus WITHOUT it. The same questions are put to an agent twice — once with the MCP tools available, once without — and the answers are scored. This quantifies how much the tools actually improve correctness. Agent mode needs `ANTHROPIC_API_KEY`.
 
-Run `laravelgraph plugin migrate .` to apply these migrations manually (useful after upgrading).
+Evaluation datasets live in `eval/dataset/*.yaml` (one YAML file per question set). A guide for running the harness against a real application — rather than the bundled `tiny` fixture — is in `eval/realapp.md`.
 
-### Plugin Graph
+### Index Age and Staleness
 
-Plugins write to a separate writable KuzuDB at `.laravelgraph/plugin_graph.kuzu`. The core graph (`.laravelgraph/graph.kuzu`) is read-only for plugins.
+Every MCP tool response is stamped with an **index-age footer** showing how long ago the graph was built. When source files have changed since the last index, the footer is upgraded to a staleness warning:
 
-Every tool in a plugin receives a `DualDB` object:
-- `db()` — proxies to the core graph (read-only, backwards compatible)
-- `db().core()` — explicit core graph access
-- `db().plugin()` — the writable plugin graph
+```
+⚠ N source file(s) changed since indexing
+```
 
-Discoveries stored via `store_discoveries` accumulate in the plugin graph and persist across server restarts and re-analyses. They are never overwritten by `laravelgraph analyze`.
+This means an agent always knows whether it is looking at current data and can prompt for a re-index when answers may be out of date.
 
-If the server is killed without a clean shutdown, the plugin graph file may have a stale lock in its header. LaravelGraph detects this automatically on startup, removes the stale file, and recreates a fresh plugin graph with a warning in the logs.
+### Incremental Re-indexing (`serve --watch`)
+
+```bash
+laravelgraph serve /path/to/project --watch
+```
+
+In watch mode, LaravelGraph re-indexes changed files incrementally rather than rebuilding the whole graph. It keeps high-value edges fresh — routes, the event→listener→job chain, Eloquent relationships, database access, and N+1 risk detection — not just the call graph. This keeps the index (and therefore the index-age footer) accurate during active development without paying the cost of a full re-analysis on every save.
 
 ---
 
@@ -1136,12 +1016,6 @@ export GROQ_API_KEY=gsk_...
 }
 ```
 
-### Plugin Generation Requires an LLM
-
-Semantic summaries are optional. Plugin generation is not — it requires an LLM to generate the plugin spec. Any configured provider works. For cost efficiency, a fast/cheap model (Groq's free tier, `ollama` locally) works well for generation. The quality judge in Layer 4 requires a model that can reason about code quality — a 7B parameter model may score plugins too generously or too harshly.
-
-Recommended for plugin generation: Groq (free tier), Claude Haiku, GPT-4o-mini, or any Ollama model with 13B+ parameters.
-
 ---
 
 ## 11. CLI Reference
@@ -1223,23 +1097,6 @@ laravelgraph db-connections list [PATH]          # Show all configured connectio
 laravelgraph db-connections add [PATH]           # Interactive wizard: host, port, DB, creds
 laravelgraph db-connections remove NAME [PATH]   # Remove connection (with confirmation)
 laravelgraph db-connections test [NAME] [PATH]   # Test connectivity
-```
-
-### Plugin Management
-
-```bash
-laravelgraph plugin list [PATH]                  # List all plugins: health, calls, contribution %
-laravelgraph plugin suggest [PATH]               # Detect feature gaps, suggest plugins to generate
-laravelgraph plugin scaffold NAME [PATH]         # Scaffold plugin from graph context (no LLM needed)
-laravelgraph plugin validate FILE                # Validate a plugin file
-laravelgraph plugin enable NAME [PATH]           # Re-enable a disabled plugin
-laravelgraph plugin disable NAME [PATH]          # Disable (keeps file, stops loading)
-laravelgraph plugin delete NAME [PATH]           # Permanently remove plugin + discoveries + meta
-laravelgraph plugin prompt NAME "PROMPT" [PATH]  # Attach a system prompt to a plugin
-laravelgraph plugin migrate [PATH]               # Apply store_discoveries and Cypher migrations
-laravelgraph plugin evolve [PATH]
-    --dry-run                                    # Show what would be generated without generating
-    -n / --max-generate N                        # Limit plugins generated per run (default 3)
 ```
 
 ### Log Management
@@ -1368,8 +1225,6 @@ This writes an optimized instruction block to `CLAUDE.md` (or `.opencode/instruc
 
 - **Tool hierarchy** — which tool to call first for which type of question
 - **Escalation protocol** — if Tool A returns sparse results, call Tool B next
-- **Plugin workflow** — how to request, run, and update plugins
-- `store_discoveries` protocol — when and how to store findings
 - **Common pitfalls** — what not to do (don't read files when you can query the graph)
 
 The install is idempotent — safe to re-run after upgrades to refresh the instructions.
@@ -1521,19 +1376,14 @@ Config priority: **env vars → project config → global config → defaults**
 
 <project>/.laravelgraph/
   graph.kuzu/           KuzuDB graph database (directory, read-only after analyze)
-  plugin_graph.kuzu     KuzuDB plugin knowledge graph (writable at runtime)
   summaries.json        LLM-generated semantic summaries (mtime-invalidated)
   db_context.json       LLM-generated DB table/column annotations (hash-invalidated)
   config.json           Project-level config overrides
-  plugins/              Plugin Python files (.py) — one per domain plugin
-  plugins/*.py          Each file is a self-contained MCP plugin
 ```
 
-### graph.kuzu vs plugin_graph.kuzu
+### graph.kuzu
 
-`graph.kuzu` is the core analysis graph — written by `laravelgraph analyze`, read by all MCP tools. It is rebuilt from scratch on every full analysis run.
-
-`plugin_graph.kuzu` is the runtime knowledge graph — written by plugin `store_discoveries` calls during agent sessions. It accumulates across sessions and is never cleared by `laravelgraph analyze`. It holds `PluginNode` records (domain discoveries) and `PluginEdge_Node` records (relationships between discoveries).
+`graph.kuzu` is the core analysis graph — written by `laravelgraph analyze`, read by all MCP tools. It is rebuilt from scratch on every full analysis run, and refreshed incrementally by `serve --watch`.
 
 ### summaries.json vs db_context.json
 
@@ -1572,14 +1422,8 @@ Optional Features   ✓  fastembed — vector search available
                     ✓  watchfiles — watch mode available
 Database            ✓  PyMySQL installed
                     !  No DB connections configured
-MCP Tool Signatures ✓  All 23 tool signature scenarios pass
-Plugins             ✓  Plugin 'order-flow' v1.0.0 — valid
-                    !  Plugin 'payment-gateway' — SKELETON (Cypher not configured)
-Plugin System       ✓  plugin_graph init + schema + query — working
-                    ✓  _build_template_fallback — produces status=skeleton
-                    ✓  scan_plugin_manifests — extracts status field
-                    ✓  MCP plugin tools registered — request/update/remove/run/knowledge
-Plugin Generator    ✓  Plugin Generator — generated in 12.3s (score: 8/10)
+MCP Tool Signatures ✓  All primary tool signature scenarios pass
+Evaluation          ✓  Structural eval — all questions pass
 Downloads           ✓  fastembed-bge-small — ready
                     ✓  tree-sitter-php — ready
 ```
