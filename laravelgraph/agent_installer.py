@@ -16,7 +16,7 @@ in place rather than appending a second copy.
 
 The rich agent file (.laravelgraph/agent.md and .claude/agents/laravelgraph.md) is
 fully owned by the installer and rewritten on every run.  It includes both static
-protocol content and dynamic project data (plugins, DB connections, features, stats)
+protocol content and dynamic project data (DB connections, features, stats)
 collected from the graph at install time.
 """
 
@@ -37,7 +37,6 @@ _SECTION_END   = "<!-- laravelgraph-agent-instructions-end -->"
 class DynamicData:
     """Project data collected from the graph at install time."""
     stats: dict[str, int] = field(default_factory=dict)
-    plugins: list[dict] = field(default_factory=list)
     features: list[dict] = field(default_factory=list)
     db_connections: list[dict] = field(default_factory=list)
     graph_available: bool = False
@@ -69,14 +68,6 @@ def _collect_features(project_root: Path) -> list[dict]:
             return []
 
 
-def _collect_plugins(project_root: Path) -> list[dict]:
-    plugins_dir = project_root / ".laravelgraph" / "plugins"
-    if not plugins_dir.exists():
-        return []
-    from laravelgraph.plugins.loader import scan_plugin_manifests
-    return scan_plugin_manifests(plugins_dir)
-
-
 def _collect_db_connections(project_root: Path) -> list[dict]:
     try:
         from laravelgraph.config import Config
@@ -103,9 +94,6 @@ def collect_dynamic_data(project_root: Path) -> DynamicData:
         data.graph_available = bool(data.stats)
     except Exception:
         pass
-
-    with contextlib.suppress(Exception):
-        data.plugins = _collect_plugins(project_root)
 
     with contextlib.suppress(Exception):
         data.db_connections = _collect_db_connections(project_root)
@@ -167,20 +155,6 @@ def _build_dynamic_section(data: DynamicData) -> str:
             lines.append(f"- **{name}**{prefix_part} ({count} symbols)")
         lines.append("")
 
-    # ── Loaded Plugins ────────────────────────────────────────────────────
-    if data.plugins:
-        lines.append("### Loaded Plugins\n")
-        for plugin in data.plugins:
-            name = plugin.get("name", "?")
-            desc = plugin.get("description", "")
-            prefix = plugin.get("tool_prefix", "")
-            tools = plugin.get("tool_names", [])
-            tool_list = ", ".join(f"`{t}`" for t in tools) if tools else "(no tools)"
-            prefix_part = f" (`{prefix}`)" if prefix else ""
-            lines.append(f"- **{name}**{prefix_part} — {desc}")
-            lines.append(f"  Tools: {tool_list}")
-        lines.append("")
-
     return "\n".join(lines)
 
 
@@ -234,12 +208,6 @@ Use this to pick the right tool immediately. No exploration needed.
 - "what external APIs does this call?" → `laravelgraph_outbound_apis()`
 - "what calls Stripe?" → `laravelgraph_outbound_apis(url_contains="stripe")`
 - "what config/env vars are used?" → `laravelgraph_config_usage(key="APP_KEY")`
-
-**Plugins (domain-specific tools):**
-- "suggest plugins" → `laravelgraph_suggest_plugins()`
-- "generate plugin for X" → `laravelgraph_request_plugin("description of X domain")`
-- "call plugin tool immediately" → `laravelgraph_run_plugin_tool("plugin-name", "tool_name")`
-- "read past discoveries" → `laravelgraph_plugin_knowledge()`
 
 ---
 
@@ -403,36 +371,12 @@ Check-then-act patterns that mutate shared counters without transaction or lock 
 Full execution chain from a Job or Artisan Command: Job → Events → Listeners → further Jobs/Events,
 up to `depth` hops. Use for non-HTTP async flows.
 
-#### Plugins
-
-**`laravelgraph_suggest_plugins() → str`**
-Domain-signal detection across 7 built-in recipes (payment, tenant, booking, subscription, RBAC,
-audit, feature-flags). Returns ranked recommendations with evidence.
-
-**`laravelgraph_request_plugin(description: str, allow_skeleton: bool = False) → str`**
-Auto-generate a domain plugin from plain English. Validates through 4 layers. Use after
-`suggest_plugins`. Call `run_plugin_tool` immediately after to use it this session.
-
-**`laravelgraph_run_plugin_tool(plugin_name: str, tool_name: str, tool_args: dict = None) → str`**
-Hot-dispatch: runs any plugin tool without server restart. Use immediately after generating a
-plugin. Pass `tool_args={"findings": "..."}` for store_discoveries.
-
-**`laravelgraph_update_plugin(name: str, critique: str) → str`**
-Regenerate a plugin with a specific critique. Use when plugin output is wrong or shallow.
-
-**`laravelgraph_remove_plugin(name: str, reason: str) → str`**
-Remove a useless plugin and prevent auto-regeneration.
-
-**`laravelgraph_plugin_knowledge(plugin_name: str = "") → str`**
-Return all domain discoveries stored by plugins across past sessions. Read at session start for
-domains that have plugins — avoids re-discovering known facts.
-
 #### Utility
 
-**`laravelgraph_cypher(query: str, graph: str = "core") → str`**
+**`laravelgraph_cypher(query: str) → str`**
 Raw Cypher for anything not covered by built-in tools. Always add LIMIT. Node labels use `_`
 suffix: `Class_`, `Function_`, `Interface_`, `Trait_`. Route nodes use `http_method` (not
-`method`) and `action_method` (not `action`). Use `graph="plugin"` to query plugin discoveries.
+`method`) and `action_method` (not `action`).
 
 **`laravelgraph_provider_status() → str`**
 Which LLM provider is configured for semantic summaries, which API keys are set.
@@ -483,7 +427,6 @@ Which LLM provider is configured for semantic summaries, which API keys are set.
 2. laravelgraph_routes()                      # all HTTP endpoints
 3. laravelgraph_models()                      # data model
 4. laravelgraph_events()                      # async architecture
-5. laravelgraph_plugin_knowledge()            # accumulated team knowledge
 ```
 
 **Recipe: Performance review**
@@ -498,25 +441,20 @@ Which LLM provider is configured for semantic summaries, which API keys are set.
 
 ### Tool Hierarchy (use in this order)
 
-1. **Plugin tools** (e.g. `usr_summary`, `ord_routes`) — start here if a plugin
-   covers the domain.  Plugin tools give pre-built, domain-specific answers.
-   Check the `## LOADED PLUGINS` section at session start for what's available.
-   Call `laravelgraph_plugin_knowledge()` to read accumulated discoveries first.
-
-2. `laravelgraph_feature_context(feature="...")` — single call that returns
+1. `laravelgraph_feature_context(feature="...")` — single call that returns
    routes + controller source + models + events + jobs for a whole feature area.
    Use this as your first call for any feature investigation.
 
-3. `laravelgraph_explain(feature="...")` — semantic search; finds the best
+2. `laravelgraph_explain(feature="...")` — semantic search; finds the best
    anchor class/method when you're not sure where a feature lives.  Phrase it
    like a human question: "how does payment refund work?" not "PaymentRefund".
 
-4. `laravelgraph_context(symbol="Foo::bar", include_source=True)` — 360° view
+3. `laravelgraph_context(symbol="Foo::bar", include_source=True)` — 360° view
    of a single symbol: callers, callees, Eloquent relationships, dispatched
    events/jobs, and the actual PHP source.  Always pass `include_source=True`
    when you need to see business logic (thresholds, hardcoded IDs, conditions).
 
-5. `laravelgraph_request_flow(route="/api/path")` — traces a route from
+4. `laravelgraph_request_flow(route="/api/path")` — traces a route from
    controller through services, events, and jobs (3 hops deep).  Use when you
    need the full request call chain.
 
@@ -551,54 +489,6 @@ Which LLM provider is configured for semantic summaries, which API keys are set.
 - **`laravelgraph_explain` is semantic** — phrase queries as human questions, not class names.
 - **Model→table names are unreliable** — always verify via `laravelgraph_models` or `laravelgraph_db_context`.
 - **`laravelgraph_intent` costs one LLM call** per symbol but is cached forever after.
-
-### Plugin Workflow
-
-When a domain has no plugin yet:
-
-```
-1. laravelgraph_suggest_plugins()          # see what's recommended
-2. laravelgraph_request_plugin("domain")   # generate a plugin (needs LLM)
-3. laravelgraph_run_plugin_tool("slug", "prefix_summary")  # call it immediately
-```
-
-After the next server restart, the plugin's tools are native MCP tools listed
-in `## LOADED PLUGINS` and callable directly without `laravelgraph_run_plugin_tool`.
-
-### store_discoveries Protocol (IMPORTANT)
-
-After any substantive investigation, call the domain plugin's `store_discoveries`
-tool with a plain-text summary of what you found:
-
-```
-usr_store_discoveries(findings="Users table has soft-deletes enabled. Admin flag
-  is set via role_id FK to roles table, not a boolean column. Password reset uses
-  custom token table, not Laravel's built-in password_resets.")
-```
-
-These findings persist across sessions. Future agents read them via
-`laravelgraph_plugin_knowledge()` without re-running the analysis.
-
-**Call `store_discoveries` after every investigation** — even a single insight saves
-the next agent from re-discovering it.
-
-### Plugin Knowledge Recall
-
-At the start of any session involving a feature that has a plugin:
-
-```
-laravelgraph_plugin_knowledge()                    # all accumulated discoveries
-laravelgraph_plugin_knowledge(plugin_name="slug")  # discoveries for one plugin
-```
-
-Read these before doing fresh analysis — the answer may already be stored.
-
-### Keeping Plugin Knowledge Current (CI/cron)
-
-```bash
-laravelgraph plugin evolve . --max-generate 2   # weekly auto-generation
-laravelgraph plugin evolve . --dry-run           # preview what would be generated
-```
 """
 
 
@@ -652,8 +542,6 @@ description: >
   - PR review: what's the impact of these changed files?
   - Onboarding: what are the main features and their routes?
   - Security audit: which routes lack auth? where is sensitive data retained?
-  - Generating or managing domain plugins for a product area
-  - Reading accumulated team discoveries stored by past agents
 
   <example>user: "how does the payment flow work?"</example>
   <example>user: "what calls UserService::createUser?"</example>
@@ -664,7 +552,6 @@ description: >
   <example>user: "find N+1 queries in this codebase"</example>
   <example>user: "what events are dispatched when an order is placed?"</example>
   <example>user: "what's the blast radius of changing Order::calculateTotal?"</example>
-  <example>user: "generate a plugin for the subscription domain"</example>
   <example>user: "what are the main features of this app?"</example>
   <example>user: "review this PR for performance and security issues"</example>
   <example>user: "what does this class actually do?"</example>
@@ -711,12 +598,6 @@ allowedTools:
   - mcp__laravelgraph__laravelgraph_query
   - mcp__laravelgraph__laravelgraph_cypher
   - mcp__laravelgraph__laravelgraph_provider_status
-  - mcp__laravelgraph__laravelgraph_suggest_plugins
-  - mcp__laravelgraph__laravelgraph_request_plugin
-  - mcp__laravelgraph__laravelgraph_run_plugin_tool
-  - mcp__laravelgraph__laravelgraph_update_plugin
-  - mcp__laravelgraph__laravelgraph_remove_plugin
-  - mcp__laravelgraph__laravelgraph_plugin_knowledge
 model: inherit
 ---
 

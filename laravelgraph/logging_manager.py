@@ -32,7 +32,6 @@ class LogManager:
         limit: int = 100,
         level: str = "",
         tool: str = "",
-        plugin: str = "",
         since_hours: float = 0,
         search: str = "",
     ) -> list[dict]:
@@ -57,7 +56,7 @@ class LogManager:
                 entry = self._parse_line(line)
                 if entry is None:
                     continue
-                if self._matches_filters(entry, level, tool, plugin, since_ts, search):
+                if self._matches_filters(entry, level, tool, since_ts, search):
                     entries.append(entry)
 
         return entries
@@ -67,7 +66,6 @@ class LogManager:
         callback: Callable[[dict], None],
         level: str = "",
         tool: str = "",
-        plugin: str = "",
         poll_interval: float = 0.5,
     ) -> None:
         """Tail the most recent log file. Calls callback for each new matching line.
@@ -87,7 +85,7 @@ class LogManager:
                     if line:
                         entry = self._parse_line(line)
                         if entry is not None and self._matches_filters(
-                            entry, level, tool, plugin, since_ts=0.0, search=""
+                            entry, level, tool, since_ts=0.0, search=""
                         ):
                             callback(entry)
                     else:
@@ -176,93 +174,6 @@ class LogManager:
                 pass
         return deleted
 
-    def get_domain_query_frequencies(
-        self,
-        since_hours: int = 168,
-        min_calls: int = 3,
-    ) -> list[dict]:
-        """Scan MCP logs for frequently-queried domains that may need plugins.
-
-        Looks for ``laravelgraph_feature_context`` and ``laravelgraph_explain``
-        tool calls and extracts domain tokens from the ``feature`` parameter.
-        Returns domains with call count >= *min_calls*, sorted by count descending.
-
-        Each returned dict has: slug, count, last_seen (ISO string or "").
-        """
-        import re as _re
-        since_ts: float = 0.0
-        if since_hours > 0:
-            since_ts = time.time() - since_hours * 3600.0
-
-        counts: Counter[str] = Counter()
-        last_seen: dict[str, str] = {}
-        _TARGET_TOOLS = {"laravelgraph_feature_context", "laravelgraph_explain"}
-
-        def _to_slug(text: str) -> str:
-            """Normalize a domain description to a slug for deduplication."""
-            text = text.lower().strip()
-            text = _re.sub(r"[^a-z0-9]+", "-", text)
-            return text.strip("-")[:50]
-
-        for log_file in self.get_log_files():
-            try:
-                lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-
-            for line in lines:
-                entry = self._parse_line(line)
-                if entry is None:
-                    continue
-
-                # Apply since_ts filter
-                if since_ts > 0:
-                    ts_str = (
-                        entry.get("timestamp", "")
-                        or entry.get("ts", "")
-                        or entry.get("time", "")
-                    )
-                    if ts_str:
-                        try:
-                            if _parse_iso_timestamp(str(ts_str)) < since_ts:
-                                continue
-                        except Exception:
-                            pass
-
-                tool_name = str(entry.get("tool", ""))
-                if tool_name not in _TARGET_TOOLS:
-                    continue
-
-                # Extract feature param — may live under "params" or top-level
-                feature: str = ""
-                params = entry.get("params", {})
-                if isinstance(params, dict):
-                    feature = str(params.get("feature", ""))
-                if not feature:
-                    feature = str(entry.get("feature", ""))
-                if not feature:
-                    continue
-
-                slug = _to_slug(feature)
-                if not slug:
-                    continue
-
-                counts[slug] += 1
-                ts_str = (
-                    entry.get("timestamp", "")
-                    or entry.get("ts", "")
-                    or entry.get("time", "")
-                    or ""
-                )
-                last_seen[slug] = str(ts_str)
-
-        results = [
-            {"slug": slug, "count": cnt, "last_seen": last_seen.get(slug, "")}
-            for slug, cnt in counts.most_common()
-            if cnt >= min_calls
-        ]
-        return results
-
     def _parse_line(self, line: str) -> dict | None:
         """Parse a log line. Return dict or None if not parseable."""
         line = line.strip()
@@ -283,7 +194,6 @@ class LogManager:
         entry: dict,
         level: str,
         tool: str,
-        plugin: str,
         since_ts: float,
         search: str,
     ) -> bool:
@@ -298,16 +208,6 @@ class LogManager:
         if tool:
             entry_tool = str(entry.get("tool", ""))
             if tool.lower() not in entry_tool.lower():
-                return False
-
-        # Plugin filter
-        if plugin:
-            entry_plugin = str(entry.get("plugin", ""))
-            if not entry_plugin:
-                params = entry.get("params", {})
-                if isinstance(params, dict):
-                    entry_plugin = str(params.get("plugin", ""))
-            if plugin.lower() not in entry_plugin.lower():
                 return False
 
         # Since timestamp filter
@@ -417,23 +317,3 @@ def format_log_table(entries: list[dict]) -> "Table":
         table.add_row(ts, f"[{style}]{level.upper()}[/{style}]" if style else level.upper(), message, details)
 
     return table
-
-
-def get_domain_query_frequencies(
-    log_dir: Path,
-    since_hours: int = 168,
-    min_calls: int = 3,
-) -> list[dict]:
-    """Module-level convenience wrapper around LogManager.get_domain_query_frequencies.
-
-    Args:
-        log_dir:     Directory containing JSONL log files.
-        since_hours: Look back this many hours (default: 168 = 7 days).
-        min_calls:   Minimum call count to include a domain (default: 3).
-
-    Returns list of {"slug": str, "count": int, "last_seen": str}.
-    """
-    return LogManager(log_dir).get_domain_query_frequencies(
-        since_hours=since_hours,
-        min_calls=min_calls,
-    )

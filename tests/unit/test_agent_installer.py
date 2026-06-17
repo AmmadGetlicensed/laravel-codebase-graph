@@ -41,22 +41,6 @@ class TestBuildAgentBlock:
         block = mod.build_minimal_block()
         assert "laravelgraph_feature_context" in block
 
-    def test_mentions_store_discoveries_protocol(self):
-        mod = _import()
-        block = _full_block(mod)
-        assert "store_discoveries" in block
-        assert "findings persist across sessions" in block
-
-    def test_mentions_plugin_knowledge(self):
-        mod = _import()
-        block = _full_block(mod)
-        assert "laravelgraph_plugin_knowledge" in block
-
-    def test_mentions_plugin_evolve(self):
-        mod = _import()
-        block = _full_block(mod)
-        assert "plugin evolve" in block
-
     def test_lists_common_pitfalls(self):
         mod = _import()
         block = _full_block(mod)

@@ -1,7 +1,7 @@
 """schema_sync — Auto-extend REL_TYPES before GraphDB initialization.
 
-Scans all pipeline phase_*.py files (and optional extra dirs, e.g. project plugins)
-via AST to find every upsert_rel(rel_type, from_label, ..., to_label, ...) call.
+Scans all pipeline phase_*.py files (and optional extra dirs) via AST to find every
+upsert_rel(rel_type, from_label, ..., to_label, ...) call.
 Any (from_label, to_label) pair not already present in schema.REL_TYPES is appended
 to the in-memory list *before* GraphDB._init_schema() runs.
 
@@ -76,17 +76,16 @@ def sync_schema(extra_scan_dirs: list[Path] | None = None) -> int:
 
     Scans:
       - All built-in pipeline phase_*.py files (laravelgraph/pipeline/)
-      - Any directories in *extra_scan_dirs* (e.g. project .laravelgraph/plugins/)
+      - Any directories in *extra_scan_dirs*
 
     Returns the number of pairs added (0 means schema was already complete).
 
-    Raises nothing — if an unknown rel_type is encountered (e.g. from a plugin that
-    creates a brand-new relationship type), a warning is logged and it is skipped.
-    Adding new relationship types requires a manual schema.py edit because the
-    property list cannot be inferred from a call site alone.
+    Raises nothing — if an unknown rel_type is encountered, a warning is logged and
+    it is skipped. Adding new relationship types requires a manual schema.py edit
+    because the property list cannot be inferred from a call site alone.
     """
     # Collect all pairs across all scan targets.
-    # Pipeline phases use the phase_*.py naming convention; plugin files don't.
+    # Pipeline phases use the phase_*.py naming convention.
     used: dict[str, set[tuple[str, str]]] = {}
     for rel_type, pairs in _scan_dir(_PIPELINE_DIR, glob="phase_*.py").items():
         used.setdefault(rel_type, set()).update(pairs)

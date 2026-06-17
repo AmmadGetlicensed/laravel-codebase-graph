@@ -62,7 +62,7 @@ LaravelGraph is a **33-phase analysis pipeline** that indexes a Laravel/PHP code
 
 ```
 Laravel project on disk
-  → Pipeline (26 phases) → .laravelgraph/graph.kuzu  (KuzuDB)
+  → Pipeline (33 phases) → .laravelgraph/graph.kuzu  (KuzuDB)
                          → .laravelgraph/summaries.json (LLM symbol summary cache)
                          → .laravelgraph/db_context.json (LLM DB context cache)
   → MCP server (FastMCP) ← Claude Code / other agents
@@ -72,14 +72,14 @@ MySQL/RDS databases
 
 ### Key packages
 
-- **`laravelgraph/pipeline/`** — 26 sequential phases. Each is a single `.py` file with a `run(ctx: PipelineContext)` function. `PipelineContext` (in `orchestrator.py`) is the shared state object carrying `db`, `config`, parsed file maps, and the FQN index.
+- **`laravelgraph/pipeline/`** — 33 sequential phases (registered in `orchestrator.py`'s `all_phases` list, which controls execution order — note phase 10 runs after 18, so file numbering ≠ run order). Each is a single `.py` file with a `run(ctx: PipelineContext)` function. `PipelineContext` (in `orchestrator.py`) is the shared state object carrying `db`, `config`, parsed file maps, and the FQN index. A phase that raises is caught, recorded in `ctx.errors`, and the pipeline continues.
   - Phases 24–26 handle database intelligence: live DB introspection (PyMySQL), model-table linking, and DB access analysis (static, zero AI cost).
 
-- **`laravelgraph/core/`** — `graph.py` wraps KuzuDB (CRUD + Cypher), `schema.py` defines 50+ node types and 100+ relationship types, `registry.py` manages the global `~/.laravelgraph/repos.json` index.
+- **`laravelgraph/core/`** — `graph.py` wraps KuzuDB (CRUD + Cypher), `schema.py` defines the graph schema as two lists: `NODE_TYPES` (50 node labels) and `REL_TYPES` (55 relationship types, each declared with its allowed `(from_label, to_label)` pairs), `registry.py` manages the global `~/.laravelgraph/repos.json` index.
 
 - **`laravelgraph/parsers/`** — PHP (tree-sitter + regex fallback), Blade templates, and Composer JSON parsing.
 
-- **`laravelgraph/mcp/server.py`** — The FastMCP server. All 23 MCP tools and 9 resources live here as `@mcp.tool()` / `@mcp.resource()` decorated functions.
+- **`laravelgraph/mcp/server.py`** — The FastMCP server (~6700 lines). All 44 MCP tools and 10 resources live here as `@mcp.tool()` / `@mcp.resource()` decorated functions, built inside `create_server()`.
 
 - **`laravelgraph/mcp/summarize.py`** — 18-provider LLM registry (`PROVIDER_REGISTRY`). All OpenAI-compatible providers share `_call_openai_compat()`; only Anthropic uses its native SDK. `generate_summary()` returns `(str | None, str)` — never raises.
 

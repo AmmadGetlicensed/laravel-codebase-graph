@@ -101,13 +101,10 @@ class Pipeline:
                         logger.warning("Could not clear cache file", file=cache_file, error=str(_e))
 
         # Auto-extend REL_TYPES in memory with any (from_label, to_label) pairs that
-        # pipeline phases or project plugins use in upsert_rel() calls but that are
-        # not yet declared in schema.py.  Must run before GraphDB init so the DDL
-        # that creates KuzuDB relationship tables includes every needed pair.
-        plugins_dir = self.project_root / ".laravelgraph" / "plugins"
-        _pairs_added = sync_schema(
-            extra_scan_dirs=[plugins_dir] if plugins_dir.exists() else []
-        )
+        # pipeline phases use in upsert_rel() calls but that are not yet declared in
+        # schema.py.  Must run before GraphDB init so the DDL that creates KuzuDB
+        # relationship tables includes every needed pair.
+        _pairs_added = sync_schema()
         if _pairs_added:
             logger.info("schema_sync: extended schema before DB init", pairs_added=_pairs_added)
 
@@ -266,14 +263,6 @@ class Pipeline:
 
             if on_phase_done:
                 on_phase_done(idx, phase_name, elapsed)
-
-        # Load project-specific pipeline plugins
-        from laravelgraph.plugins.loader import load_pipeline_plugins
-        _plugins_dir = self.project_root / ".laravelgraph" / "plugins"
-        if _plugins_dir.exists():
-            _loaded = load_pipeline_plugins(_plugins_dir, ctx, logger)
-            if _loaded:
-                logger.info("Pipeline plugins loaded", plugins=_loaded)
 
         # Register in global registry
         registry = Registry()
