@@ -274,7 +274,9 @@ class TestPipelineContext:
 
     def test_context_has_composer_info(self, pipeline_ctx):
         assert pipeline_ctx.composer is not None
-        assert pipeline_ctx.composer.laravel_version == "11.x"
+        # `_extract_version` normalizes the constraint's lower bound to major.minor
+        # ("^11.0" → "11.0"); matches tests/unit/parsing/test_composer_parser.py.
+        assert pipeline_ctx.composer.laravel_version == "11.0"
 
     def test_context_has_db(self, pipeline_ctx):
         assert pipeline_ctx.db is not None

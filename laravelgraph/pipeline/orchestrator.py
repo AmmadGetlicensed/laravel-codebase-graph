@@ -223,10 +223,12 @@ class Pipeline:
         # After these phase numbers complete, release large in-memory caches
         # that are no longer needed by subsequent phases, to reduce peak RSS.
         #
-        # parsed_php  — used by phases 5, 13, 17; safe to clear after 17
+        # parsed_php  — used by phases 5, 13, 17, AND 18 (Blade RENDERS_TEMPLATE
+        #               needs the parsed ASTs to resolve view() call sites to the
+        #               enclosing Method). Must NOT be cleared before phase 18.
         # parsed_blade — used by phase 18; safe to clear after 18
         # php_files / blade_files / route_files — paths only, low cost, kept
-        _CLEAR_PARSED_PHP_AFTER   = 17   # Event/Listener/Job Graph (last user)
+        _CLEAR_PARSED_PHP_AFTER   = 18   # Blade Template Graph (last user in run order)
         _CLEAR_PARSED_BLADE_AFTER = 18   # Blade Template Graph (last user)
         _GC_AFTER_PHASES          = {10, 12, 18}  # Dead Code, Embeddings, Blade
 

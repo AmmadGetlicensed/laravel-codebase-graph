@@ -202,26 +202,25 @@ def run(ctx: PipelineContext) -> None:
         logger.error("Failed to fetch model classes", error=str(exc))
         return
 
-    # Build a short-name → FQN map for resolving related models
+    # ── Pass 1 ── create every EloquentModel node and build resolution maps.
+    # fqn_to_nid maps to the EloquentModel node_id (make_node_id("model", fqn)),
+    # NOT the Class_ node_id — HAS_RELATIONSHIP links EloquentModel→EloquentModel,
+    # so using the Class_ id here would make every edge MATCH (and silently fail).
     short_to_fqn: dict[str, str] = {}
     fqn_to_nid: dict[str, str] = {}
-    for row in model_rows:
-        fqn = row.get("fqn") or ""
-        nid = row.get("nid") or ""
-        name = row.get("name") or ""
-        if fqn and nid:
-            fqn_to_nid[fqn] = nid
-            if name:
-                short_to_fqn[name] = fqn
+    model_sources: dict[str, str] = {}  # model fqn → source text (for pass 2)
 
     for row in model_rows:
-        class_nid = row.get("nid") or ""
         class_name = row.get("name") or ""
         class_fqn = row.get("fqn") or ""
         file_path = row.get("fp") or ""
-
         if not class_fqn or not file_path:
             continue
+
+        model_node_id = make_node_id("model", class_fqn)
+        fqn_to_nid[class_fqn] = model_node_id
+        if class_name:
+            short_to_fqn[class_name] = class_fqn
 
         try:
             source = Path(file_path).read_text(encoding="utf-8", errors="replace")
@@ -243,8 +242,6 @@ def run(ctx: PipelineContext) -> None:
                 "eager_loads": "[]",
             }
 
-        # Create or update EloquentModel node
-        model_node_id = make_node_id("model", class_fqn)
         try:
             db.upsert_node("EloquentModel", {
                 "node_id": model_node_id,
@@ -262,7 +259,12 @@ def run(ctx: PipelineContext) -> None:
         except Exception as exc:
             logger.debug("EloquentModel upsert failed", fqn=class_fqn, error=str(exc))
 
-        # Parse relationships
+        model_sources[class_fqn] = source
+        models_analyzed += 1
+
+    # ── Pass 2 ── every model node now exists; create relationship edges.
+    for class_fqn, source in model_sources.items():
+        model_node_id = fqn_to_nid[class_fqn]
         try:
             rels = _parse_relationships(source)
         except Exception as exc:
@@ -272,14 +274,11 @@ def run(ctx: PipelineContext) -> None:
         for rel in rels:
             try:
                 related_short = rel["related_short"]
-                related_fqn = (
-                    short_to_fqn.get(related_short)
-                    or rel["related_class"]
-                )
+                related_fqn = short_to_fqn.get(related_short) or rel["related_class"]
                 related_model_nid = fqn_to_nid.get(related_fqn)
 
                 if not related_model_nid:
-                    # Create a placeholder EloquentModel node for the related class
+                    # Related class isn't a parsed model — create a placeholder node.
                     related_model_nid = make_node_id("model", related_fqn)
                     try:
                         db._insert_node("EloquentModel", {
@@ -324,8 +323,6 @@ def run(ctx: PipelineContext) -> None:
                     method=rel.get("method_name"),
                     error=str(exc),
                 )
-
-        models_analyzed += 1
 
     ctx.stats["models_analyzed"] = models_analyzed
     ctx.stats["relationships_detected"] = relationships_detected

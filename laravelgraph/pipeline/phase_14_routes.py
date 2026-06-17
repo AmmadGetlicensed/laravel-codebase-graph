@@ -743,6 +743,33 @@ def run(ctx: PipelineContext) -> None:
     except Exception as exc:
         logger.debug("Failed to reset Route nodes", error=str(exc))
 
+    # Create a Controller node for every controller-role class (whether or not a
+    # route references it). The schema links Route/FormRequest/Resource/Blade to
+    # these; without this step those Controller-anchored edges have nowhere to go.
+    try:
+        controller_rows = db.execute(
+            "MATCH (c:Class_) WHERE c.laravel_role = 'controller' "
+            "RETURN c.name AS name, c.fqn AS fqn, c.file_path AS fp"
+        )
+    except Exception:
+        controller_rows = []
+    for crow in controller_rows:
+        cfqn = crow.get("fqn") or ""
+        if not cfqn:
+            continue
+        cfp = crow.get("fp") or ""
+        ctype = "api" if "\\Api\\" in cfqn or "/Api/" in cfp else "plain"
+        try:
+            db.upsert_node("Controller", {
+                "node_id": make_node_id("controller", cfqn),
+                "name": crow.get("name") or "",
+                "fqn": cfqn,
+                "file_path": cfp,
+                "controller_type": ctype,
+            })
+        except Exception as exc:
+            logger.debug("Controller node upsert failed", fqn=cfqn, error=str(exc))
+
     routes_parsed = 0
     all_routes: list[dict[str, Any]] = []
 
