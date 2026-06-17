@@ -1,0 +1,37 @@
+# Real-app eval dataset (TEMPLATE — customize for YOUR Laravel app).
+#
+# This is where you prove the differentiator: live-DB ground truth, N+1
+# detection, model<->table linking, and deep event/job chains that a
+# file-reading agent cannot reconstruct. The tiny fixture cannot exercise these
+# because it has no live database.
+#
+# Setup (see eval/realapp.md):
+#   1. export LARAVELGRAPH_EVAL_REAL_APP=/path/to/your/laravel/app
+#   2. add a READ-ONLY database connection to that app's
+#      .laravelgraph/config.json so phases 24-26 can introspect it
+#   3. replace the examples below with questions whose answers you KNOW
+#   4. python -m eval.run_eval --mode structural --app real
+#      python -m eval.run_eval --mode agent --app real    # needs ANTHROPIC_API_KEY
+#
+# The examples below are illustrative; the names will not exist in your app.
+
+- id: example-live-schema
+  category: db-intelligence
+  question: "What columns does the orders table actually have in the live database?"
+  tool: laravelgraph_db_context
+  args: {table: "orders"}
+  expect_all: ["orders"]            # replace with real column names you expect
+
+- id: example-model-table-link
+  category: db-intelligence
+  question: "Which Eloquent model maps to the orders table?"
+  tool: laravelgraph_schema
+  args: {table_name: "orders"}
+  expect_all: ["Order"]             # replace with the real model name
+
+- id: example-nplus1
+  category: performance
+  question: "Are there N+1 query risks in the order listing code path?"
+  tool: laravelgraph_performance_risks
+  args: {}
+  expect_all: []                    # add the method/file you know is flagged

@@ -1,0 +1,4 @@
+# Eval run artifacts are reproducible — don't commit them.
+*.json
+*.md
+!.gitignore

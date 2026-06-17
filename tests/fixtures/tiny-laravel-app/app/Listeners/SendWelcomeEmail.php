@@ -2,6 +2,7 @@
 namespace App\Listeners;
 
 use App\Events\UserRegistered;
+use App\Jobs\SyncUserToCrm;
 use App\Notifications\WelcomeNotification;
 use Illuminate\Contracts\Queue\ShouldQueue;
 
@@ -17,5 +18,6 @@ class SendWelcomeEmail implements ShouldQueue
     public function handle(UserRegistered $event): void
     {
         $event->user->notify(new WelcomeNotification());
+        SyncUserToCrm::dispatch($event->user);
     }
 }

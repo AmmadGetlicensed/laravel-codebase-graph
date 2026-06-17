@@ -1,0 +1,133 @@
+# Ground-truth eval questions for tests/fixtures/tiny-laravel-app.
+#
+# Each item maps a natural-language question to the tool an agent should call
+# and the facts that MUST appear in the answer. `expect_all` substrings are
+# matched case-insensitively. Tool names use the pre-consolidation surface;
+# after WS3 they resolve through deprecation aliases, so this file keeps working.
+#
+# Fields:
+#   id          stable identifier
+#   category    grouping for the scorecard
+#   question    what a developer would ask (used verbatim in agent mode)
+#   tool        MCP tool the structural check calls
+#   args        arguments for that tool
+#   expect_all  every substring must be present in the response
+
+- id: route-posts-handler
+  category: routes
+  question: "Which controller and action handle GET /posts?"
+  tool: laravelgraph_routes
+  args: {}
+  expect_all: ["/posts", "PostController", "index"]
+
+- id: route-posts-show
+  category: routes
+  question: "What handles the GET /posts/{post} route and what is its route name?"
+  tool: laravelgraph_routes
+  args: {}
+  expect_all: ["posts/{post}", "show", "posts.show"]
+
+- id: route-apiresource-users
+  category: routes
+  question: "What routes does the users apiResource expose?"
+  tool: laravelgraph_routes
+  args: {}
+  expect_all: ["UserController", "users.store", "users.destroy", "users.update"]
+
+- id: model-user-table
+  category: models
+  question: "What database table does the User model map to and what is fillable?"
+  tool: laravelgraph_models
+  args: {model_name: "User"}
+  expect_all: ["users", "name", "email", "password"]
+
+- id: model-user-softdeletes
+  category: models
+  question: "Does the User model use soft deletes?"
+  tool: laravelgraph_models
+  args: {model_name: "User"}
+  expect_all: ["Soft Deletes", "Yes"]
+
+- id: model-post-fillable
+  category: models
+  question: "What columns are fillable on the Post model?"
+  tool: laravelgraph_models
+  args: {model_name: "Post"}
+  expect_all: ["posts", "title", "user_id", "published_at"]
+
+- id: rel-user-relationships
+  category: relationships
+  question: "What Eloquent relationships does the User model define?"
+  tool: laravelgraph_context
+  args: {symbol: "User"}
+  expect_all: ["hasMany(Post", "hasOne(Profile"]
+
+- id: rel-post-relationships
+  category: relationships
+  question: "What relationships does the Post model define?"
+  tool: laravelgraph_context
+  args: {symbol: "Post"}
+  expect_all: ["belongsTo(User", "belongsToMany(Tag"]
+
+- id: rel-user-scopes
+  category: relationships
+  question: "What query scopes does the User model define?"
+  tool: laravelgraph_context
+  args: {symbol: "User"}
+  expect_all: ["scopeActive"]
+
+- id: event-listener-wiring
+  category: events
+  question: "What listens to the UserRegistered event?"
+  tool: laravelgraph_events
+  args: {}
+  expect_all: ["UserRegistered", "SendWelcomeEmail"]
+
+- id: event-listener-queued
+  category: events
+  question: "Is the UserRegistered listener queued?"
+  tool: laravelgraph_events
+  args: {}
+  expect_all: ["SendWelcomeEmail", "queued"]
+
+- id: event-job-chain
+  category: events
+  question: "What job does the UserRegistered listener dispatch?"
+  tool: laravelgraph_events
+  args: {}
+  expect_all: ["SendWelcomeEmail", "SyncUserToCrm"]
+
+- id: deadcode-unusedmethod
+  category: dead_code
+  question: "Is there any dead code in the controllers?"
+  tool: laravelgraph_dead_code
+  args: {}
+  expect_all: ["unusedMethod"]
+
+- id: flow-posts-index
+  category: flow
+  question: "Trace the request flow for GET /posts."
+  tool: laravelgraph_request_flow
+  args: {route: "/posts"}
+  expect_all: ["PostController", "index", "Post"]
+
+- id: schema-users-columns
+  category: schema
+  question: "What columns does the users table have?"
+  tool: laravelgraph_schema
+  args: {table_name: "users"}
+  expect_all: ["users", "email", "password", "deleted_at"]
+
+- id: schema-posts-fk
+  category: schema
+  question: "What columns does the posts table have, including foreign keys?"
+  tool: laravelgraph_schema
+  args: {table_name: "posts"}
+  expect_all: ["posts", "user_id", "title"]
+
+- id: event-source-emitter
+  category: flow
+  question: "Where is the UserRegistered event dispatched from?"
+  tool: laravelgraph_context
+  args: {symbol: "UserService"}
+  expect_all: ["UserRegistered", "create"]
