@@ -131,3 +131,40 @@
   tool: laravelgraph_context
   args: {symbol: "UserService"}
   expect_all: ["UserRegistered", "create"]
+
+# ── Consolidated (v0.3) primary-surface coverage ──────────────────────────────
+
+- id: v3-map-routes
+  category: consolidated
+  question: "Map the routes via the consolidated tool."
+  tool: laravelgraph_map
+  args: {kind: "routes"}
+  expect_all: ["PostController", "posts.index"]
+
+- id: v3-map-events
+  category: consolidated
+  question: "Map the event chain via the consolidated tool."
+  tool: laravelgraph_map
+  args: {kind: "events"}
+  expect_all: ["UserRegistered", "SyncUserToCrm"]
+
+- id: v3-db-schema
+  category: consolidated
+  question: "Inspect the users table schema via the consolidated db tool."
+  tool: laravelgraph_db
+  args: {mode: "schema", table: "users"}
+  expect_all: ["users", "deleted_at"]
+
+- id: v3-trace-request
+  category: consolidated
+  question: "Trace the GET /posts request via the consolidated trace tool."
+  tool: laravelgraph_trace
+  args: {kind: "request", target: "/posts"}
+  expect_all: ["PostController", "index"]
+
+- id: v3-risks-deadcode
+  category: consolidated
+  question: "Find dead code via the consolidated risks tool."
+  tool: laravelgraph_risks
+  args: {kind: "dead_code"}
+  expect_all: ["unusedMethod"]

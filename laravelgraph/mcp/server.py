@@ -60,6 +60,28 @@ When a result shows "AMBIGUOUS NAME" warning, it means multiple classes share th
 Use the full FQN shown in the warning to target the exact class you need.
 
 ═══════════════════════════════════════════════════════════
+PRIMARY TOOLS (use these — twelve cover everything)
+═══════════════════════════════════════════════════════════
+
+  laravelgraph_search(q)                  find a symbol when you don't know its name
+  laravelgraph_feature_context(feature)   one-call feature overview (routes→models→events→jobs)
+  laravelgraph_context(symbol)            360° view of one symbol (+ include_source=True)
+  laravelgraph_map(kind=…)                list: routes|models|events|bindings|api|outbound|config|repos
+  laravelgraph_trace(kind=…, target)      execution path: request|job|table_write|git_diff
+  laravelgraph_db(mode=…, table/name)     DB: schema|context|column|procedure|connections|procedures|quality|boundary
+  laravelgraph_sql(sql)                   read-only SQL against the live database
+  laravelgraph_impact(symbol)             blast radius of a change
+  laravelgraph_risks(kind=…)              dead_code|security|race|perf|cross_cutting
+  laravelgraph_tests(symbol, mode=…)      suggest tests | coverage
+  laravelgraph_cypher(query)              raw Cypher over the graph (power tool)
+  laravelgraph_status()                   providers + indexed repos + index age
+
+Other laravelgraph_* tools (laravelgraph_routes, _models, _schema, _request_flow,
+_dead_code, …) still work but are DEPRECATED aliases folded into the twelve above —
+prefer the primary tool. The HOW-TO sections below name legacy tools; the mapping is
+direct (e.g. laravelgraph_routes → laravelgraph_map(kind="routes")).
+
+═══════════════════════════════════════════════════════════
 HOW TO UNDERSTAND ANY FEATURE
 ═══════════════════════════════════════════════════════════
 
@@ -5969,6 +5991,167 @@ MANDATORY RULES
             lines.append(f"- **Providers used:** {', '.join(cache_stats['models_used'])}")
 
         return "\n".join(lines)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # CONSOLIDATED TOOL SURFACE (v0.3)
+    # Twelve primary tools are the documented surface: search, cypher, sql,
+    # context, feature_context, impact, map, trace, db, risks, tests, status.
+    # cypher/context/feature_context/impact already exist above; the eight
+    # dispatchers below route by kind/mode into the legacy single-purpose
+    # tools, which remain registered as deprecated aliases for one release.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @mcp.tool()
+    def laravelgraph_search(
+        q: str = "", limit: int = 20, role_filter: str = "", file_filter: str = ""
+    ) -> str:
+        """Hybrid search (BM25 + semantic + fuzzy) across all indexed symbols.
+
+        Start here when you don't yet know the exact symbol name.
+        """
+        return laravelgraph_query(
+            query=q, limit=limit, role_filter=role_filter, file_filter=file_filter
+        )
+
+    @mcp.tool()
+    def laravelgraph_sql(
+        sql: str, connection: str = "", limit: int = 50, bypass_cache: bool = False
+    ) -> str:
+        """Run a read-only SQL query against a configured live database."""
+        return laravelgraph_db_query(
+            sql=sql, connection=connection, limit=limit, bypass_cache=bypass_cache
+        )
+
+    @mcp.tool()
+    def laravelgraph_map(kind: str = "routes", filter: str = "", limit: int = 50) -> str:
+        """Structural map of the application by KIND.
+
+        kind = routes | models | events | bindings | api | outbound | config | repos
+        `filter` narrows results (route URI, model name, binding abstract, config
+        key, outbound URL substring) where the underlying view supports it.
+        """
+        k = (kind or "routes").lower()
+        if k == "routes":
+            return laravelgraph_routes(filter=filter, limit=limit)
+        if k == "models":
+            return laravelgraph_models(model_name=filter)
+        if k == "events":
+            return laravelgraph_events()
+        if k == "bindings":
+            return laravelgraph_bindings(abstract_filter=filter)
+        if k == "api":
+            return laravelgraph_api_surface(route=filter)
+        if k == "outbound":
+            return laravelgraph_outbound_apis(url_contains=filter)
+        if k == "config":
+            return laravelgraph_config_usage(key=filter)
+        if k == "repos":
+            return laravelgraph_list_repos()
+        return _error_response(
+            "LOW",
+            f"Unknown map kind '{kind}'. Use: routes, models, events, bindings, "
+            "api, outbound, config, repos.",
+        )
+
+    @mcp.tool()
+    def laravelgraph_db(
+        mode: str = "schema",
+        table: str = "",
+        column: str = "",
+        name: str = "",
+        connection: str = "",
+    ) -> str:
+        """Database intelligence by MODE.
+
+        mode = schema | context | column | procedure | connections | procedures
+               | quality | boundary
+        schema/context/quality/boundary use `table`; column adds `column`;
+        procedure/procedures use `name`; connections takes no arguments.
+        """
+        m = (mode or "schema").lower()
+        if m == "schema":
+            return laravelgraph_schema(table_name=table, connection=connection)
+        if m == "context":
+            return laravelgraph_db_context(table=table, connection=connection)
+        if m == "column":
+            return laravelgraph_resolve_column(table=table, column=column, connection=connection)
+        if m == "procedure":
+            return laravelgraph_procedure_context(name=name, connection=connection)
+        if m == "connections":
+            return laravelgraph_connection_map()
+        if m == "procedures":
+            return laravelgraph_list_procedures(keyword=name, connection=connection)
+        if m == "quality":
+            return laravelgraph_data_quality_report(connection=connection, table_filter=table)
+        if m == "boundary":
+            return laravelgraph_boundary_map(table=table)
+        return _error_response(
+            "LOW",
+            f"Unknown db mode '{mode}'. Use: schema, context, column, procedure, "
+            "connections, procedures, quality, boundary.",
+        )
+
+    @mcp.tool()
+    def laravelgraph_trace(kind: str = "request", target: str = "", depth: int = 5) -> str:
+        """Trace an execution path by KIND.
+
+        kind = request | job | table_write | git_diff
+        request: `target` = route URI/name; job: `target` = job/command;
+        table_write: `target` = table name; git_diff: `target` = optional raw diff.
+        """
+        k = (kind or "request").lower()
+        if k == "request":
+            return laravelgraph_request_flow(route=target)
+        if k == "job":
+            return laravelgraph_job_chain(job=target, depth=depth)
+        if k == "table_write":
+            return laravelgraph_db_impact(table=target, operation="write")
+        if k == "git_diff":
+            return laravelgraph_detect_changes(diff=target)
+        return _error_response(
+            "LOW",
+            f"Unknown trace kind '{kind}'. Use: request, job, table_write, git_diff.",
+        )
+
+    @mcp.tool()
+    def laravelgraph_risks(kind: str = "perf", symbol: str = "", severity: str = "") -> str:
+        """Static risk analysis by KIND.
+
+        kind = dead_code | security | race | perf | cross_cutting
+        """
+        k = (kind or "perf").lower()
+        if k == "dead_code":
+            return laravelgraph_dead_code(file_filter=symbol)
+        if k == "security":
+            return laravelgraph_security_surface()
+        if k == "race":
+            return laravelgraph_race_conditions()
+        if k == "perf":
+            return laravelgraph_performance_risks(severity=severity, symbol=symbol)
+        if k == "cross_cutting":
+            return laravelgraph_cross_cutting_concerns()
+        return _error_response(
+            "LOW",
+            f"Unknown risks kind '{kind}'. Use: dead_code, security, race, perf, "
+            "cross_cutting.",
+        )
+
+    @mcp.tool()
+    def laravelgraph_tests(symbol: str = "", mode: str = "suggest") -> str:
+        """Testing lens. mode = suggest (tests to run for a change) | coverage."""
+        if (mode or "suggest").lower() == "coverage":
+            return laravelgraph_test_coverage(symbol=symbol)
+        return laravelgraph_suggest_tests(symbol=symbol)
+
+    @mcp.tool()
+    def laravelgraph_status() -> str:
+        """Index + provider status: configured LLM providers plus indexed repos."""
+        parts = [laravelgraph_provider_status()]
+        try:
+            parts.append(laravelgraph_list_repos())
+        except Exception:
+            parts.append("_(repo registry unavailable)_")
+        return "\n\n---\n\n".join(parts)
 
     @mcp.resource("laravelgraph://summaries")
     def resource_summaries() -> str:
