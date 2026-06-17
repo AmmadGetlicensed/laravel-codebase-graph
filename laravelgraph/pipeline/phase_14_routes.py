@@ -344,6 +344,22 @@ def _extract_middleware_list(raw: str) -> list[str]:
     return items
 
 
+def _dedupe_ordered(items: list[str]) -> list[str]:
+    """Drop duplicate middleware while preserving first-seen order.
+
+    Nested route groups each re-contribute their middleware, so a route inside
+    three `auth:sanctum` groups would otherwise stack it 3×. Laravel applies
+    each middleware once, so the deduped list is the faithful representation.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def _resolve_controller_fqn(
     short_name: str,
     use_map: dict[str, str],
@@ -633,7 +649,7 @@ def _parse_routes_from_file(
         for mw_m in _MIDDLEWARE_PATTERN.finditer(after_chunk):
             inline_mw_list.extend(_extract_middleware_list(mw_m.group(1)))
 
-        middleware_stack = group_mw + inline_mw_list
+        middleware_stack = _dedupe_ordered(group_mw + inline_mw_list)
 
         node_id_val = (
             make_node_id("route", route_name)
@@ -676,7 +692,7 @@ def _parse_routes_from_file(
         inline_mw_list = []
         for mw_m in _MIDDLEWARE_PATTERN.finditer(after_chunk):
             inline_mw_list.extend(_extract_middleware_list(mw_m.group(1)))
-        middleware_stack = group_mw + inline_mw_list
+        middleware_stack = _dedupe_ordered(group_mw + inline_mw_list)
 
         actions = _API_RESOURCE_ACTIONS if resource_type == "apiresource" else _RESOURCE_ACTIONS
 

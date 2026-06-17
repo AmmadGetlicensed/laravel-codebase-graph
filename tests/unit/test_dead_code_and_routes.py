@@ -74,11 +74,29 @@ class TestExemptRoles:
 
 from laravelgraph.pipeline.phase_14_routes import (
     _ROUTE_RESOURCE_PATTERN,
+    _dedupe_ordered,
     _parse_routes_from_file,
     _parse_route_group_context,
     _get_group_context_for_pos,
     _find_brace_end,
 )
+
+
+class TestMiddlewareDedupe:
+    """Nested route groups must not stack the same middleware multiple times."""
+
+    def test_dedupe_preserves_order_and_removes_repeats(self):
+        assert _dedupe_ordered(
+            ["auth:sanctum", "auth:sanctum", "auth:sanctum"]
+        ) == ["auth:sanctum"]
+
+    def test_dedupe_keeps_distinct_and_first_seen_order(self):
+        assert _dedupe_ordered(
+            ["web", "auth", "web", "throttle:60", "auth"]
+        ) == ["web", "auth", "throttle:60"]
+
+    def test_dedupe_empty(self):
+        assert _dedupe_ordered([]) == []
 
 
 class TestResourceRoutePattern:

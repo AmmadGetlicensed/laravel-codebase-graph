@@ -83,3 +83,6 @@ cython_debug/
 # Test artifacts
 .benchmark/
 benchmark.json
+
+# App-specific eval datasets (contain private domain facts — keep local)
+/eval/dataset/qualhub.yaml

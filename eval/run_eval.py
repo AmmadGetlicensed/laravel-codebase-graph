@@ -44,12 +44,19 @@ def _check(response: str, expect_all: list[str]) -> list[str]:
     return [fact for fact in expect_all if str(fact).lower() not in low]
 
 
-def run_structural(app: str, dataset: Path) -> dict:
+def run_structural(app: str, dataset: Path, no_reindex: bool = False) -> dict:
     questions = load_dataset(dataset)
     source, into, cleanup = resolve_app_paths(app)
 
     t0 = time.time()
-    indexed = index_app(source, into=into)
+    if no_reindex:
+        # Query the existing index in place — no pipeline rebuild, no DB connect.
+        from eval.client import IndexedApp
+
+        indexed = IndexedApp(root=source, is_temp=False)
+        cleanup = False
+    else:
+        indexed = index_app(source, into=into)
     index_secs = time.time() - t0
 
     calls = [(q["tool"], q.get("args") or {}) for q in questions]
@@ -135,6 +142,11 @@ def main() -> int:
     ap.add_argument("--mode", choices=["structural", "agent"], default="structural")
     ap.add_argument("--app", choices=["tiny", "real"], default="tiny")
     ap.add_argument("--dataset", type=Path, default=None, help="override dataset path")
+    ap.add_argument(
+        "--no-reindex",
+        action="store_true",
+        help="query the existing index in place (skip the pipeline rebuild + DB connect)",
+    )
     args = ap.parse_args()
 
     dataset = args.dataset or (DATASET_DIR / f"{args.app}.yaml")
@@ -143,7 +155,7 @@ def main() -> int:
         return 2
 
     if args.mode == "structural":
-        report = run_structural(args.app, dataset)
+        report = run_structural(args.app, dataset, no_reindex=args.no_reindex)
     else:
         from eval.agent_eval import run_agent_ab
 
