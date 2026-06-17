@@ -87,6 +87,21 @@ class Registry:
         self._save(data)
         logger.info("Repository registered", path=key, name=project_root.name)
 
+    def touch(self, project_root: Path) -> bool:
+        """Bump only ``indexed_at`` for an existing entry (incremental re-index).
+
+        Unlike ``register`` this preserves laravel_version/php_version/stats.
+        Returns False if the project isn't registered yet.
+        """
+        data = self._load()
+        key = str(project_root.resolve())
+        entry = data["repos"].get(key)
+        if not entry:
+            return False
+        entry["indexed_at"] = time.time()
+        self._save(data)
+        return True
+
     def unregister(self, project_root: Path) -> bool:
         data = self._load()
         key = str(project_root.resolve())

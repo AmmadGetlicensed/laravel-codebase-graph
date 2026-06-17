@@ -254,7 +254,12 @@ class GraphDB:
     # ── Bulk operations ───────────────────────────────────────────────────
 
     def delete_file_symbols(self, file_path: str) -> None:
-        """Remove all symbols defined in a given file (for incremental updates)."""
+        """Remove all symbols defined in a given file (for incremental updates).
+
+        Also removes Route nodes whose ``route_file`` is this path, since routes
+        are keyed by URI, not ``file_path``, and would otherwise survive an edit
+        to their defining route file.
+        """
         for label, _ in NODE_TYPES:
             if label in ("Folder", "File", "Community", "Process", "ScheduledTask"):
                 continue
@@ -265,6 +270,52 @@ class GraphDB:
                 )
             except Exception:
                 pass
+        try:
+            self._conn.execute(
+                "MATCH (r:Route {route_file: $fp}) DETACH DELETE r",
+                parameters={"fp": file_path},
+            )
+        except Exception:
+            pass
+
+    def build_fqn_index(self) -> dict[str, str]:
+        """Reconstruct the FQN → node_id map from the persisted graph.
+
+        ``ctx.fqn_index`` is built in phase 3 and lives only for one pipeline
+        run. Incremental re-indexing of a single file needs the cross-file map,
+        so rebuild it cheaply from existing symbol nodes.
+        """
+        index: dict[str, str] = {}
+        for label in ("Class_", "Interface_", "Trait_", "Enum_", "Method", "Function_"):
+            try:
+                rows = self.execute(
+                    f"MATCH (n:{label}) WHERE n.fqn IS NOT NULL "
+                    f"RETURN n.fqn AS fqn, n.node_id AS nid"
+                )
+            except Exception:
+                continue
+            for r in rows:
+                if r.get("fqn"):
+                    index[r["fqn"]] = r["nid"]
+        return index
+
+    def build_class_map(self) -> dict[str, Any]:
+        """Reconstruct the FQN → file Path map (used by route controller
+        resolution) from persisted Class_ nodes."""
+        from pathlib import Path as _Path
+
+        cmap: dict[str, Any] = {}
+        try:
+            rows = self.execute(
+                "MATCH (c:Class_) WHERE c.fqn IS NOT NULL AND c.file_path IS NOT NULL "
+                "RETURN c.fqn AS fqn, c.file_path AS fp"
+            )
+        except Exception:
+            return cmap
+        for r in rows:
+            if r.get("fqn") and r.get("fp"):
+                cmap[r["fqn"]] = _Path(r["fp"])
+        return cmap
 
     def clear_all(self) -> None:
         """Wipe all data — used before a full re-index."""
