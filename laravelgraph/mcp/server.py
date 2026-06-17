@@ -31,6 +31,103 @@ def _load_db(project_root: Path) -> GraphDB | None:
     return GraphDB(db_path)
 
 
+def _humanize_age(seconds: float) -> str:
+    if seconds < 10:
+        return "just now"
+    if seconds < 90:
+        return f"{int(seconds)}s ago"
+    if seconds < 5400:
+        return f"{int(seconds / 60)}m ago"
+    if seconds < 36 * 3600:
+        return f"{int(seconds / 3600)}h ago"
+    return f"{int(seconds / 86400)}d ago"
+
+
+def _count_changed_since(project_root: Path, since: float, limit: int = 5000) -> int:
+    """Count project .php files modified after `since` (cheap, pruned, bounded)."""
+    import os
+
+    skip = {".laravelgraph", "vendor", "node_modules", ".git", "storage", ".venv"}
+    count = 0
+    seen = 0
+    for root, dirs, files in os.walk(project_root):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for f in files:
+            if not f.endswith(".php"):
+                continue
+            seen += 1
+            if seen > limit:
+                return count
+            try:
+                if os.path.getmtime(os.path.join(root, f)) > since:
+                    count += 1
+            except OSError:
+                continue
+    return count
+
+
+def _make_index_age_middleware(project_root: Path):
+    """Middleware that stamps every tool response with index age + a staleness
+    warning when source files changed after the last index. A single boundary
+    hook — internal tool-to-tool calls bypass it, so footers never embed
+    mid-output. The (age, staleness) computation is cached briefly to keep the
+    per-call cost near zero.
+    """
+    from fastmcp.server.middleware import Middleware
+
+    class _IndexAgeMiddleware(Middleware):
+        _TTL = 15.0
+
+        def __init__(self) -> None:
+            self._cache_at = 0.0
+            self._cache_footer = ""
+
+        def _footer(self) -> str:
+            now = time.time()
+            if now - self._cache_at < self._TTL:
+                return self._cache_footer
+            footer = ""
+            try:
+                from laravelgraph.core.registry import Registry
+
+                entry = Registry().get(project_root)
+                indexed_at = getattr(entry, "indexed_at", None) if entry else None
+                if indexed_at:
+                    footer = f"\n\n---\n_Index age: {_humanize_age(now - indexed_at)}._"
+                    stale = _count_changed_since(project_root, indexed_at)
+                    if stale:
+                        footer += (
+                            f" ⚠️ **{stale} source file(s) changed since indexing — "
+                            "results may be stale; re-run `laravelgraph analyze`.**"
+                        )
+            except Exception:
+                footer = ""
+            self._cache_at = now
+            self._cache_footer = footer
+            return footer
+
+        async def on_call_tool(self, context, call_next):
+            result = await call_next(context)
+            footer = self._footer()
+            content = getattr(result, "content", None)
+            if footer and content:
+                try:
+                    from mcp.types import TextContent
+
+                    for i in range(len(content) - 1, -1, -1):
+                        if isinstance(content[i], TextContent):
+                            content[i] = TextContent(
+                                type="text", text=content[i].text + footer
+                            )
+                            result.content = content
+                            break
+                except Exception:
+                    pass
+            return result
+
+    return _IndexAgeMiddleware()
+
+
 def create_server(project_root: Path, config: Config | None = None) -> Any:
     """Create and configure the FastMCP server with all tools and resources."""
     try:
@@ -256,6 +353,10 @@ MANDATORY RULES
 """
         + _loaded_plugins_section,
     )
+
+    # Stamp every tool response with index age + a staleness warning when the
+    # source has changed since the last index (honest freshness signaling).
+    mcp.add_middleware(_make_index_age_middleware(project_root))
 
     # Lazy semantic summary cache — stored in .laravelgraph/summaries.json
     _summary_cache = SummaryCache(index_dir_path(project_root))
